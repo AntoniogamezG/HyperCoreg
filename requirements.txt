@@ -1,0 +1,25 @@
+# HyperCoreg Requirements
+# =======================
+# WARNING: GDAL must be installed separately via conda or system package manager.
+# Using pip to install GDAL often fails or causes issues.
+#
+# Recommended installation:
+#   conda env create -f environment.yml
+#
+# If using pip directly, ensure GDAL is already installed:
+#   conda install -c conda-forge gdal>=3.4
+#   pip install -r requirements.txt
+
+numpy>=1.20
+h5py>=3.0
+rasterio>=1.3
+geoarray>=0.15
+arosics>=1.8
+shapely>=2.0
+pyproj>=3.0
+requests>=2.25
+matplotlib>=3.5
+openpyxl>=3.0
+scipy>=1.7
+pandas>=1.3
+geopandas>=0.10
