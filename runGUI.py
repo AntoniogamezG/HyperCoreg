@@ -11,7 +11,7 @@ Usage:
 The GUI will guide you through:
 1. Selecting single file or batch mode
 2. Choosing input file/folder and output directory
-3. Configuring processing parameters
+3. Configuring processing parameters    
 4. Running the coregistration
 
 For command-line usage, see runCLI.py

@@ -43,9 +43,6 @@ def detect_hyp_type(file_path: str) -> str:
     if basename.endswith(".HE5"):
         return "PRISMA"
 
-    if "SPECTRAL_IMAGE" in basename or basename.startswith("ENMAP"):
-        return "ENMAP"
-
     # Check file extension and content hints
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -53,11 +50,16 @@ def detect_hyp_type(file_path: str) -> str:
         return "PRISMA"
 
     if ext in (".tif", ".tiff", ".bsq"):
-        # Could be EnMAP - check for metadata files
-        parent_dir = os.path.dirname(file_path)
-        xml_files = [f for f in os.listdir(parent_dir) if f.lower().endswith("-metadata.xml")]
-        if xml_files:
+        try:
+            from hypercoreg.readers.enmap import find_enmap_metadata_for_spectral_image
+
+            find_enmap_metadata_for_spectral_image(file_path)
             return "ENMAP"
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot determine sensor type for: {file_path}. "
+                "Expected a matching EnMAP metadata pair for TIFF/BSQ input."
+            ) from exc
 
     raise ValueError(
         f"Cannot determine sensor type for: {file_path}. "

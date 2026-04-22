@@ -24,6 +24,7 @@ from hypercoreg.logging_config import log_section_header
 from hypercoreg.utils import resolve_gdalwarp_exe
 
 logger = logging.getLogger("COREG_PROCESSING")
+_ENMAP_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _local_tag_name(tag: str) -> str:
@@ -267,7 +268,10 @@ def find_enmap_metadata_for_spectral_image(spectral_image_path: str) -> Optional
         spectral_image_path: Path to EnMAP SPECTRAL_IMAGE raster (.tif/.tiff/.bsq)
 
     Returns:
-        str: Path to metadata XML file, or None if not found
+        str: Path to metadata XML file
+
+    Raises:
+        ValueError: If the metadata pair is missing or ambiguous.
     """
     parent_dir = os.path.dirname(spectral_image_path)
     basename = os.path.basename(spectral_image_path)
@@ -288,12 +292,10 @@ def find_enmap_metadata_for_spectral_image(spectral_image_path: str) -> Optional
             if name_l.endswith("-metadata.xml"):
                 metadata_files.append(name)
     except Exception as e:
-        logger.warning(f"Could not list EnMAP directory for metadata discovery: {e}")
-        return None
+        raise ValueError(f"Could not list EnMAP directory for metadata discovery: {e}") from e
 
     if not metadata_files:
-        logger.warning(f"Could not find EnMAP metadata XML for {spectral_image_path}")
-        return None
+        raise ValueError(f"Could not find EnMAP metadata XML for {spectral_image_path}")
 
     exact_matches = []
     for name in metadata_files:
@@ -302,6 +304,11 @@ def find_enmap_metadata_for_spectral_image(spectral_image_path: str) -> Optional
             exact_matches.append(name)
     if exact_matches:
         exact_matches.sort()
+        if len(exact_matches) > 1:
+            raise ValueError(
+                f"Ambiguous EnMAP metadata match for {spectral_image_path}: "
+                f"{', '.join(exact_matches)}"
+            )
         return os.path.join(parent_dir, exact_matches[0])
 
     prefix_matches = []
@@ -311,6 +318,11 @@ def find_enmap_metadata_for_spectral_image(spectral_image_path: str) -> Optional
             prefix_matches.append(name)
     if prefix_matches:
         prefix_matches.sort()
+        if len(prefix_matches) > 1:
+            raise ValueError(
+                f"Ambiguous EnMAP metadata prefix match for {spectral_image_path}: "
+                f"{', '.join(prefix_matches)}"
+            )
         chosen = prefix_matches[0]
         logger.warning(
             f"Using prefix metadata match for {basename}: {chosen}. "
@@ -318,13 +330,10 @@ def find_enmap_metadata_for_spectral_image(spectral_image_path: str) -> Optional
         )
         return os.path.join(parent_dir, chosen)
 
-    metadata_files.sort()
-    chosen = metadata_files[0]
-    logger.warning(
-        f"Falling back to first metadata XML for {basename}: {chosen}. "
-        "Multiple scenes in one folder may require manual metadata pairing."
+    raise ValueError(
+        f"Could not find a matching EnMAP metadata XML for {spectral_image_path}. "
+        "Expected an exact or unambiguous prefix match."
     )
-    return os.path.join(parent_dir, chosen)
 
 
 def _extract_center_value(parent_node: Optional[ET.Element]) -> Optional[float]:
@@ -797,12 +806,11 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
 
 def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Inject parsed EnMAP metadata into a raster GDAL header using rasterio.
+    Stage parsed EnMAP metadata without mutating the source raster.
 
-    This writes:
-    - band descriptions (band IDs)
-    - per-band tags: wavelength, fwhm
-    - dataset tags: acquisition/geometry/cloud metadata
+    The refactored pipeline keeps the source raster immutable. Metadata is staged
+    in an in-memory cache so immediate readback can still recover the parsed
+    values without mutating the user input file.
     """
     out: Dict[str, Any] = {
         "ok": False,
@@ -827,80 +835,75 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
         if isinstance(band_names_raw, (list, tuple, np.ndarray)):
             band_names = [str(v).strip() for v in list(band_names_raw) if str(v).strip()]
 
-        with rasterio.open(raster_path, "r+") as src:
-            count = int(src.count)
+        try:
+            with rasterio.open(raster_path) as src:
+                count = int(src.count)
+                for bidx in range(1, count + 1):
+                    has_metadata = False
+                    if bidx <= len(band_names):
+                        has_metadata = True
+                    if bidx <= wavelengths.size and np.isfinite(float(wavelengths[bidx - 1])):
+                        has_metadata = True
+                    if bidx <= fwhm_vals.size and np.isfinite(float(fwhm_vals[bidx - 1])):
+                        has_metadata = True
+                    if has_metadata:
+                        out["bands_updated"] += 1
+        except Exception as exc:
+            out["error"] = str(exc)
+            return out
 
-            for bidx in range(1, count + 1):
-                if bidx <= len(band_names):
-                    src.set_band_description(bidx, str(band_names[bidx - 1]))
+        global_tags: Dict[str, str] = {}
+        acq_time = metadata.get("acquisition_time")
+        if isinstance(acq_time, datetime):
+            global_tags["acquisition_time"] = acq_time.isoformat()
+        elif acq_time is not None and str(acq_time).strip():
+            global_tags["acquisition_time"] = str(acq_time).strip()
 
-                band_tag_kwargs: Dict[str, str] = {}
-                if bidx <= wavelengths.size:
-                    wl = float(wavelengths[bidx - 1])
-                    if np.isfinite(wl):
-                        band_tag_kwargs["wavelength"] = f"{wl:.8f}"
-                if bidx <= fwhm_vals.size:
-                    fw = float(fwhm_vals[bidx - 1])
-                    if np.isfinite(fw):
-                        band_tag_kwargs["fwhm"] = f"{fw:.8f}"
-                if band_tag_kwargs:
-                    src.update_tags(bidx, **band_tag_kwargs)
-                    out["bands_updated"] += 1
+        bbox_val = metadata.get("bbox")
+        if isinstance(bbox_val, (list, tuple)) and len(bbox_val) == 4:
+            try:
+                west, south, east, north = [float(v) for v in bbox_val]
+                global_tags["bbox_wgs84"] = f"{west:.10f},{south:.10f},{east:.10f},{north:.10f}"
+            except Exception:
+                pass
 
-            global_tags: Dict[str, str] = {}
-            acq_time = metadata.get("acquisition_time")
-            if isinstance(acq_time, datetime):
-                global_tags["acquisition_time"] = acq_time.isoformat()
-            elif acq_time is not None and str(acq_time).strip():
-                global_tags["acquisition_time"] = str(acq_time).strip()
-
-            bbox_val = metadata.get("bbox")
-            if isinstance(bbox_val, (list, tuple)) and len(bbox_val) == 4:
-                try:
-                    west, south, east, north = [float(v) for v in bbox_val]
-                    global_tags["bbox_wgs84"] = f"{west:.10f},{south:.10f},{east:.10f},{north:.10f}"
-                except Exception:
-                    pass
-
-            scalar_keys = [
-                "crs",
-                "n_rows",
-                "n_cols",
-                "n_bands",
-                "enmap_id",
-                "enmap_date",
-                "enmap_processing_version",
-                "prisma_cloud_pct",
-                "enmap_cloud_pct",
-                "enmap_haze_pct",
-                "enmap_cirrus_pct",
-                "enmap_snow_pct",
-                "enmap_water_pct",
-                "sun_azimuth_angle",
-                "sun_elevation_angle",
-                "sun_zenith_angle",
-                "across_offnadir_angle",
-                "along_offnadir_angle",
-                "scene_azimuth_angle",
-                "observation_angle",
-            ]
-            for key in scalar_keys:
-                val = metadata.get(key)
-                if val is None:
+        scalar_keys = [
+            "crs",
+            "n_rows",
+            "n_cols",
+            "n_bands",
+            "enmap_id",
+            "enmap_date",
+            "enmap_processing_version",
+            "prisma_cloud_pct",
+            "enmap_cloud_pct",
+            "enmap_haze_pct",
+            "enmap_cirrus_pct",
+            "enmap_snow_pct",
+            "enmap_water_pct",
+            "sun_azimuth_angle",
+            "sun_elevation_angle",
+            "sun_zenith_angle",
+            "across_offnadir_angle",
+            "along_offnadir_angle",
+            "scene_azimuth_angle",
+            "observation_angle",
+        ]
+        for key in scalar_keys:
+            val = metadata.get(key)
+            if val is None:
+                continue
+            if isinstance(val, float):
+                if not np.isfinite(float(val)):
                     continue
-                if isinstance(val, float):
-                    if not np.isfinite(float(val)):
-                        continue
-                    global_tags[key] = f"{float(val):.10f}"
-                else:
-                    txt = str(val).strip()
-                    if txt:
-                        global_tags[key] = txt
+                global_tags[key] = f"{float(val):.10f}"
+            else:
+                txt = str(val).strip()
+                if txt:
+                    global_tags[key] = txt
 
-            if global_tags:
-                src.update_tags(**global_tags)
-                out["dataset_tags_updated"] = len(global_tags)
-
+        out["dataset_tags_updated"] = len(global_tags)
+        _ENMAP_METADATA_CACHE[os.path.abspath(raster_path)] = dict(metadata)
         out["ok"] = True
         return out
     except Exception as e:
@@ -938,6 +941,9 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
         'observation_angle': None,
     }
     try:
+        abs_raster_path = os.path.abspath(raster_path)
+        cached = _ENMAP_METADATA_CACHE.get(abs_raster_path)
+
         with rasterio.open(raster_path) as src:
             out['n_rows'] = int(src.height)
             out['n_cols'] = int(src.width)
@@ -945,6 +951,14 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
             if src.crs is not None:
                 epsg = src.crs.to_epsg()
                 out['crs'] = f"EPSG:{int(epsg)}" if epsg is not None else str(src.crs)
+
+            if cached is not None:
+                for key, value in cached.items():
+                    if key in out and value is not None:
+                        out[key] = value
+                if out.get("bbox") is not None and isinstance(out["bbox"], (list, tuple)) and len(out["bbox"]) == 4:
+                    out["bbox"] = tuple(float(v) for v in out["bbox"])
+                return out
 
             ds_tags = src.tags()
             acq_txt = ds_tags.get("acquisition_time")
@@ -1032,6 +1046,20 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
                 out['fwhm'] = np.array(fwhm_vals, dtype=float)
             if band_names and wl_vals and len(band_names) == len(wl_vals):
                 out['band_names'] = band_names
+
+        if out["wavelengths"] is None:
+            try:
+                metadata_xml = find_enmap_metadata_for_spectral_image(raster_path)
+                xml_meta = read_enmap_metadata(metadata_xml, spectral_image_path=raster_path)
+                for key, value in xml_meta.items():
+                    if key in out and out[key] is None and value is not None:
+                        out[key] = value
+            except Exception as exc:
+                logger.debug(
+                    "Could not fall back to EnMAP XML metadata for %s: %s",
+                    raster_path,
+                    exc,
+                )
 
         return out
     except Exception as e:
@@ -1134,9 +1162,8 @@ def extract_enmap_extended_metadata(
     if metadata_xml is None:
         metadata_xml = find_enmap_metadata_for_spectral_image(enmap_file)
 
-    if metadata_xml is None or not os.path.exists(metadata_xml):
-        logger.warning("EnMAP metadata XML not found - limited metadata extraction")
-        return result
+    if not os.path.exists(metadata_xml):
+        raise FileNotFoundError(f"EnMAP metadata XML not found for {enmap_file}: {metadata_xml}")
 
     try:
         tree = ET.parse(metadata_xml)

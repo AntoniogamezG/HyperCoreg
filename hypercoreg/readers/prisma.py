@@ -543,21 +543,17 @@ def extract_prisma_extended_metadata(prisma_file: str) -> Dict[str, Any]:
 
             # Cloud cover percentage
             for key in ['Cloudy_pixels_percentage', 'CloudCover', 'Cloud_Cover', 'CloudPercentage']:
-                if key in attrs:
-                    try:
-                        result['prisma_cloud_pct'] = float(attrs[key])
-                        break
-                    except Exception:
-                        pass
+                value = _get_attr(key)
+                if value is not None:
+                    result['prisma_cloud_pct'] = value
+                    break
 
             # Sea pixels percentage
             for key in ['Sea_pixels_percentage', 'Sea_pixels_pct', 'SeaPixels']:
-                if key in attrs:
-                    try:
-                        result['prisma_sea_pct'] = float(attrs[key])
-                        break
-                    except Exception:
-                        pass
+                value = _get_attr(key)
+                if value is not None:
+                    result['prisma_sea_pct'] = value
+                    break
 
             # View Zenith Angle
             try:

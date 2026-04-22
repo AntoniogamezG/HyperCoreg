@@ -1,4 +1,4 @@
-"""
+﻿"""
 Configuration constants for HyperCoreg.
 
 This module contains default parameters and shared constants
@@ -200,11 +200,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Output options
     'save_pre': False,
     'gen_tiepoint_pngs': False,
-    'save_displacement_vectors': True,
+    'save_displacement_vectors': False,
     'use_inmemory': True,
     'keep_temp_files': False,
-    'save_pan': True,
-    'save_quality_mask': True,
+    'save_pan': False,
+    'save_quality_mask': False,
+    'arosics_cpus': 0,
+    'gdalwarp_multi': True,
+    'gdalwarp_num_threads': 'ALL_CPUS',
     'allow_gui_prompt': False,
     'remove_detector_overlap_bands': False,
     'normalization_mode': "none",
@@ -219,18 +222,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'build_overviews': False,
     'strict_metadata': True,
     'metadata_extension_level': "stats",
-    'metadata_stats_mode': "exact",
+    'metadata_stats_mode': "approx",
     'enmap_metadata_stats_mode': "none",
-    'metadata_stats_sample_windows': 128,
+    'metadata_stats_sample_windows': 32,
     'metadata_stats_seed': 1337,
     'metadata_histogram_buckets': 64,
     'metadata_label_precision': 2,
-    'validation_max_windows': 0,
-    'quicklook_max_dim': 1800,
+    'validation_max_windows': 64,
+    'quicklook_max_dim': 1200,
     'quicklook_rgb_targets_nm': (660.0, 550.0, 480.0),
     'quicklook_percentiles': (2.0, 98.0),
     'quicklook_gamma': 1.0,
-    'quicklook_dpi': 220,
+    'quicklook_dpi': 140,
     'quicklook_crop_to_valid': False,
     'quicklook_scalebar': True,
     'quicklook_rgb_source_path': None,
@@ -249,6 +252,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'pan_residual_max_dim': 1024,
     'defer_temp_cleanup_gui': False,
     'timing_logs': True,
+    # Migration controls (legacy -> pipeline-native runtime switch).
+    # Keep conservative defaults for safety-first rollout.
+    'use_pipeline_native': False,
+    'enable_legacy_fallback': True,
+    'assert_legacy_parity': False,
 }
 
 
@@ -313,11 +321,14 @@ class CoregConfig:
     # Output options
     save_pre: bool = False
     gen_tiepoint_pngs: bool = False
-    save_displacement_vectors: bool = True
+    save_displacement_vectors: bool = False
     use_inmemory: bool = True
     keep_temp_files: bool = False
-    save_pan: bool = True
-    save_quality_mask: bool = True
+    save_pan: bool = False
+    save_quality_mask: bool = False
+    arosics_cpus: int = 0
+    gdalwarp_multi: bool = True
+    gdalwarp_num_threads: str = 'ALL_CPUS'
     allow_gui_prompt: bool = False
     remove_detector_overlap_bands: bool = False
     normalization_mode: str = "none"
@@ -332,18 +343,18 @@ class CoregConfig:
     build_overviews: bool = False
     strict_metadata: bool = True
     metadata_extension_level: str = "stats"
-    metadata_stats_mode: str = "exact"
+    metadata_stats_mode: str = "approx"
     enmap_metadata_stats_mode: str = "none"
-    metadata_stats_sample_windows: int = 128
+    metadata_stats_sample_windows: int = 32
     metadata_stats_seed: int = 1337
     metadata_histogram_buckets: int = 64
     metadata_label_precision: int = 2
-    validation_max_windows: int = 0
-    quicklook_max_dim: int = 1800
+    validation_max_windows: int = 64
+    quicklook_max_dim: int = 1200
     quicklook_rgb_targets_nm: Tuple[float, float, float] = (660.0, 550.0, 480.0)
     quicklook_percentiles: Tuple[float, float] = (2.0, 98.0)
     quicklook_gamma: float = 1.0
-    quicklook_dpi: int = 220
+    quicklook_dpi: int = 140
     quicklook_crop_to_valid: bool = False
     quicklook_scalebar: bool = True
     quicklook_rgb_source_path: Optional[str] = None
@@ -362,6 +373,9 @@ class CoregConfig:
     pan_residual_max_dim: int = 1024
     defer_temp_cleanup_gui: bool = False
     timing_logs: bool = True
+    use_pipeline_native: bool = False
+    enable_legacy_fallback: bool = True
+    assert_legacy_parity: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -424,6 +438,9 @@ class CoregConfig:
             'keep_temp_files': self.keep_temp_files,
             'save_pan': self.save_pan,
             'save_quality_mask': self.save_quality_mask,
+            'arosics_cpus': self.arosics_cpus,
+            'gdalwarp_multi': self.gdalwarp_multi,
+            'gdalwarp_num_threads': self.gdalwarp_num_threads,
             'allow_gui_prompt': self.allow_gui_prompt,
             'remove_detector_overlap_bands': self.remove_detector_overlap_bands,
             'normalization_mode': self.normalization_mode,
@@ -468,9 +485,14 @@ class CoregConfig:
             'pan_residual_max_dim': self.pan_residual_max_dim,
             'defer_temp_cleanup_gui': self.defer_temp_cleanup_gui,
             'timing_logs': self.timing_logs,
+            'use_pipeline_native': self.use_pipeline_native,
+            'enable_legacy_fallback': self.enable_legacy_fallback,
+            'assert_legacy_parity': self.assert_legacy_parity,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CoregConfig':
         """Create from dictionary, using defaults for missing keys."""
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+

@@ -514,23 +514,38 @@ def build_enmap_band_table(
     Returns:
         tuple: (SpectralBandTable, sort_indices or None if no reordering needed)
     """
-    bands = []
-    wl_array = np.asarray(wl_list, dtype=float)
-    original_indices = np.arange(len(wl_array), dtype=int)
+    bands: List[SpectralBandInfo] = []
+    wl_array = np.asarray(wl_list, dtype=float).reshape(-1)
+    valid_mask = np.isfinite(wl_array) & (wl_array > 0)
+    valid_indices = np.flatnonzero(valid_mask)
+    invalid_count = int(wl_array.size - valid_indices.size)
+    if invalid_count > 0:
+        logger.info(
+            "Filtered invalid EnMAP wavelengths: %d of %d values were non-finite or non-physical.",
+            invalid_count,
+            int(wl_array.size),
+        )
+
+    wl_valid = wl_array[valid_mask]
+    original_indices = valid_indices.astype(int, copy=True)
     detectors, detector_stats = _map_enmap_detectors_from_reference(
-        wl_array,
+        wl_valid,
         tolerance_nm=ENMAP_DETECTOR_MATCH_TOLERANCE_NM,
     )
 
     # Determine detector based on bundled EnMAP reference table.
-    for i, wl in enumerate(wl_array):
-        fwhm_val = float(fwhm_list[i]) if fwhm_list is not None and i < len(fwhm_list) else np.nan
-        name = band_names_list[i] if band_names_list is not None and i < len(band_names_list) else f"EnMAP_{i + 1:03d}"
+    for i, orig_idx in enumerate(valid_indices):
+        fwhm_val = float(fwhm_list[orig_idx]) if fwhm_list is not None and orig_idx < len(fwhm_list) else np.nan
+        name = (
+            band_names_list[orig_idx]
+            if band_names_list is not None and orig_idx < len(band_names_list)
+            else f"EnMAP_{i + 1:03d}"
+        )
         detector = detectors[i] if i < len(detectors) else "UNKNOWN"
 
         bands.append(SpectralBandInfo(
             index=i + 1,
-            wavelength=float(wl),
+            wavelength=float(wl_valid[i]),
             fwhm=fwhm_val,
             name=name,
             detector=detector

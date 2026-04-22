@@ -529,8 +529,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--save-pan",
         action="store_true",
-        default=True,
-        help="Save panchromatic band (PRISMA only, default: True)"
+        default=DEFAULT_CONFIG["save_pan"],
+        help="Save panchromatic band (PRISMA only, default: False)"
     )
     output_group.add_argument(
         "--no-save-pan",
@@ -541,14 +541,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--save-quality-mask",
         action="store_true",
-        default=True,
-        help="Save quality mask (PRISMA only, default: True)"
+        default=DEFAULT_CONFIG["save_quality_mask"],
+        help="Save ancillary quality outputs (PRISMA masks + EnMAP QL auxiliaries, default: False)"
     )
     output_group.add_argument(
         "--no-save-quality-mask",
         action="store_false",
         dest="save_quality_mask",
-        help="Do not save quality mask"
+        help="Do not save ancillary quality outputs"
     )
     output_group.add_argument(
         "--pan-gcp-mode",
@@ -765,6 +765,34 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "-q", "--quiet",
         action="store_true",
         help="Suppress output (WARNING level only)"
+    )
+    general_group.add_argument(
+        "--use-pipeline-native",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Enable pipeline-native backend path during migration rollout. "
+            "When omitted, HYPERCOREG_USE_PIPELINE_NATIVE may supply the value."
+        ),
+    )
+    general_group.add_argument(
+        "--disable-legacy-fallback",
+        action="store_false",
+        dest="enable_legacy_fallback",
+        default=argparse.SUPPRESS,
+        help=(
+            "Disable fallback to legacy backend when native backend fails. "
+            "When omitted, HYPERCOREG_ENABLE_LEGACY_FALLBACK may supply the value."
+        ),
+    )
+    general_group.add_argument(
+        "--assert-legacy-parity",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Run optional parity shadow-check against legacy backend for selected output fields. "
+            "When omitted, HYPERCOREG_ASSERT_LEGACY_PARITY may supply the value."
+        ),
     )
 
 
@@ -991,6 +1019,13 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         'defer_temp_cleanup_gui': False,
         'timing_logs': True,
     }
+
+    if hasattr(args, "use_pipeline_native"):
+        config["use_pipeline_native"] = bool(getattr(args, "use_pipeline_native"))
+    if hasattr(args, "enable_legacy_fallback"):
+        config["enable_legacy_fallback"] = bool(getattr(args, "enable_legacy_fallback"))
+    if hasattr(args, "assert_legacy_parity"):
+        config["assert_legacy_parity"] = bool(getattr(args, "assert_legacy_parity"))
 
     return config
 

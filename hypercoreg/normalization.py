@@ -16,6 +16,8 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 
+from hypercoreg.pipeline.raster_io import _sanitize_raster_nonfinite_inplace
+
 ALLOWED_NORMALIZATION_MODES = {"none", "minmax", "percentile"}
 
 
@@ -161,6 +163,7 @@ def _prepare_output_profile_for_stream_write(
     src: rasterio.io.DatasetReader,
     out_profile: Dict[str, Any],
     result_warnings: List[str],
+    output_profile_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Ensure streamed outputs use a concrete writable driver.
@@ -172,6 +175,61 @@ def _prepare_output_profile_for_stream_write(
     if src_driver == "VRT":
         out_profile["driver"] = "GTiff"
         result_warnings.append("Source driver is VRT; forcing GTiff output writer.")
+    if str(out_profile.get("driver", "")).upper() == "GTIFF":
+        # Avoid emitting BigTIFF unless the dataset size actually requires it.
+        out_profile.pop("bigtiff", None)
+        out_profile["BIGTIFF"] = "IF_NEEDED"
+    if output_profile_overrides:
+        out_profile = _apply_output_profile_overrides(out_profile, output_profile_overrides)
+    return out_profile
+
+
+def _normalize_output_compression(value: Any) -> Optional[str]:
+    """Normalize output compression token for rasterio profile writes."""
+    if value is None:
+        return None
+    token = str(value).strip()
+    if not token:
+        return None
+    return token.upper()
+
+
+def _apply_output_profile_overrides(
+    out_profile: Dict[str, Any],
+    output_profile_overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply explicit writer-profile overrides for streamed output compatibility."""
+    overrides = dict(output_profile_overrides or {})
+    if not overrides:
+        return out_profile
+
+    if overrides.get("driver") is not None:
+        out_profile["driver"] = str(overrides["driver"])
+
+    if overrides.get("interleave") is not None:
+        out_profile["interleave"] = str(overrides["interleave"]).strip().lower()
+
+    if overrides.get("tiled") is not None:
+        tiled = bool(overrides["tiled"])
+        out_profile["tiled"] = tiled
+        if not tiled:
+            out_profile.pop("blockxsize", None)
+            out_profile.pop("blockysize", None)
+
+    if "compress" in overrides:
+        compression = _normalize_output_compression(overrides.get("compress"))
+        if compression is None:
+            out_profile.pop("compress", None)
+        else:
+            out_profile["compress"] = compression
+            if compression == "NONE":
+                out_profile.pop("predictor", None)
+
+    if str(out_profile.get("driver", "")).upper() == "GTIFF":
+        out_profile.pop("bigtiff", None)
+        if overrides.get("BIGTIFF") is not None:
+            out_profile["BIGTIFF"] = str(overrides["BIGTIFF"]).strip().upper()
+
     return out_profile
 
 
@@ -181,6 +239,13 @@ def _is_valid_mask(block: np.ndarray, nodata_value: Optional[float]) -> np.ndarr
     if nodata_value is not None and np.isfinite(float(nodata_value)):
         valid &= (block != float(nodata_value))
     return valid
+
+
+def _sanitize_block_for_write(block: np.ndarray, valid_mask: np.ndarray, nodata_value: float) -> None:
+    """Replace invalid pixels in a write block with the raster nodata marker."""
+    if not np.any(~valid_mask):
+        return
+    block[~valid_mask] = float(nodata_value)
 
 
 def _update_reservoir_vectorized(
@@ -386,6 +451,7 @@ def stream_copy_raster_to_path(
     source_bands_1based: Optional[Sequence[int]] = None,
     tile_size: int = 256,
     collect_band_stats: bool = True,
+    output_profile_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Copy raster to output in one streaming pass.
@@ -478,7 +544,12 @@ def stream_copy_raster_to_path(
             out_valid_counts = np.zeros(keep_bands, dtype=np.int64)
 
             out_profile = src.profile.copy()
-            out_profile = _prepare_output_profile_for_stream_write(src, out_profile, result["warnings"])
+            out_profile = _prepare_output_profile_for_stream_write(
+                src,
+                out_profile,
+                result["warnings"],
+                output_profile_overrides=output_profile_overrides,
+            )
             out_profile.update(count=int(keep_bands))
             if np.isfinite(nodata_val):
                 out_profile["nodata"] = float(nodata_val)
@@ -503,8 +574,9 @@ def stream_copy_raster_to_path(
                 for window in window_iter:
                     window_count += 1
                     block = src.read(indexes=read_indexes, window=window).astype(np.float32, copy=False)
-                    dst.write(block, window=window)
                     valid = _is_valid_mask(block, nodata_val)
+                    _sanitize_block_for_write(block, valid, nodata_val)
+                    dst.write(block, window=window)
                     for b in range(keep_bands):
                         vb = valid[b]
                         if not np.any(vb):
@@ -524,6 +596,8 @@ def stream_copy_raster_to_path(
                 result["window_count"] = int(window_count)
 
             result["timings"]["copy_s"] = perf_counter() - t0_copy
+
+        _sanitize_raster_nonfinite_inplace(temp_output_path, nodata=float(nodata_val))
 
         os.replace(temp_output_path, output_path)
         temp_output_path = None
@@ -574,6 +648,7 @@ def normalize_raster_to_path(
     nodata_fallback: float,
     expected_band_count: Optional[int] = None,
     source_bands_1based: Optional[Sequence[int]] = None,
+    output_profile_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Normalize raster from source to output using a two-pass total-I/O design.
@@ -754,7 +829,12 @@ def normalize_raster_to_path(
             out_valid_counts = np.zeros(n_bands, dtype=np.int64)
 
             out_profile = src.profile.copy()
-            out_profile = _prepare_output_profile_for_stream_write(src, out_profile, result["warnings"])
+            out_profile = _prepare_output_profile_for_stream_write(
+                src,
+                out_profile,
+                result["warnings"],
+                output_profile_overrides=output_profile_overrides,
+            )
             out_profile.update(dtype=np.float32, count=int(n_bands))
             if np.isfinite(nodata_val):
                 out_profile["nodata"] = float(nodata_val)
@@ -812,9 +892,12 @@ def normalize_raster_to_path(
                         out_sum[b] += float(np.sum(vals_out, dtype=np.float64))
                         out_sum_sq[b] += float(np.sum(vals_out * vals_out, dtype=np.float64))
 
+                    _sanitize_block_for_write(block, valid, nodata_val)
                     dst.write(block, window=window)
                 result["window_count_estimate_pass2"] = int(apply_count)
             result["timings"]["apply_s"] = perf_counter() - t0_apply
+
+        _sanitize_raster_nonfinite_inplace(temp_output_path, nodata=float(nodata_val))
 
         os.replace(temp_output_path, output_path)
         temp_output_path = None

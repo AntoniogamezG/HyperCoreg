@@ -27,23 +27,129 @@ from hypercoreg.utils import detect_hyp_type
 logger = logging.getLogger("COREG_PROCESSING")
 GUI_PROMPT_WAIT_TIMEOUT_S = 120
 GUI_METADATA_EXTENSION_LEVEL = DEFAULT_CONFIG["metadata_extension_level"]
-GUI_METADATA_LABEL_PRECISION = 3
-GUI_METADATA_EXTENSION_CHOICES = ("none", "stats", "full")
-GUI_METADATA_STATS_MODE_CHOICES = ("none", "approx", "exact")
+GUI_METADATA_LABEL_PRECISION = int(DEFAULT_CONFIG["metadata_label_precision"])
+GUI_METADATA_EXTENSION_CHOICES = ("none", "stats")
 
 
-def _normalize_gui_metadata_settings(extension_level: Any, histogram_buckets: Any) -> tuple[str, int]:
-    """Normalize GUI metadata controls to valid runtime config values."""
+def _normalize_gui_metadata_level(extension_level: Any) -> str:
+    """Normalize the simplified GUI metadata level control."""
     ext = str(extension_level or "").strip().lower()
     if ext not in GUI_METADATA_EXTENSION_CHOICES:
         ext = str(DEFAULT_CONFIG["metadata_extension_level"]).strip().lower()
+    return ext
 
-    try:
-        buckets = int(histogram_buckets)
-    except (TypeError, ValueError):
-        buckets = int(DEFAULT_CONFIG["metadata_histogram_buckets"])
-    buckets = min(4096, max(2, buckets))
-    return ext, buckets
+
+def _resolve_gui_metadata_runtime_settings(extension_level: Any) -> Dict[str, Any]:
+    """Map the simplified GUI metadata level onto the full runtime config surface."""
+    ext = _normalize_gui_metadata_level(extension_level)
+    settings = {
+        "metadata_extension_level": ext,
+        "metadata_stats_mode": str(DEFAULT_CONFIG["metadata_stats_mode"]).strip().lower(),
+        "metadata_stats_sample_windows": int(DEFAULT_CONFIG["metadata_stats_sample_windows"]),
+        "metadata_stats_seed": int(DEFAULT_CONFIG["metadata_stats_seed"]),
+        "metadata_histogram_buckets": int(DEFAULT_CONFIG["metadata_histogram_buckets"]),
+        "metadata_label_precision": int(DEFAULT_CONFIG["metadata_label_precision"]),
+        "validation_max_windows": int(DEFAULT_CONFIG["validation_max_windows"]),
+        "enmap_metadata_stats_mode": str(DEFAULT_CONFIG["enmap_metadata_stats_mode"]).strip().lower(),
+    }
+    if ext == "none":
+        settings["metadata_stats_mode"] = "none"
+        settings["enmap_metadata_stats_mode"] = "none"
+    return settings
+
+
+def _build_gui_runtime_config(
+    *,
+    input_path: str,
+    output_dir: str,
+    batch_mode: bool,
+    config_vars: Dict[str, Any],
+    strict_metadata: bool,
+    metadata_extension_level: str,
+    metadata_stats_mode: str,
+    metadata_stats_sample_windows: int,
+    metadata_stats_seed: int,
+    metadata_histogram_buckets: int,
+    metadata_label_precision: int,
+    validation_max_windows: int,
+) -> Dict[str, Any]:
+    """Build runtime config from GUI state using shared defaults as source of truth."""
+    return {
+        'input_path': input_path,
+        'output_dir': output_dir,
+        'batch_mode': batch_mode,
+        'days_window': config_vars['days_window'].get(),
+        'min_overlap': config_vars['min_overlap'].get(),
+        'max_cloud': config_vars['max_cloud'].get(),
+        'max_input_cloud_cover': config_vars['max_input_cloud_cover'].get(),
+        'min_accuracy': config_vars['min_accuracy'].get(),
+        'max_displacement': config_vars['max_displacement'].get(),
+        'residual_threshold': config_vars['residual_threshold'].get(),
+        'min_tie_points': config_vars['min_tie_points'].get(),
+        'max_s2_candidates': config_vars['max_s2_candidates'].get(),
+        'residual_mad_factor': config_vars['residual_mad_factor'].get(),
+        's2_ref_band': config_vars['s2_ref_band'].get(),
+        'prefer_fixed_band_pairs': DEFAULT_CONFIG['prefer_fixed_band_pairs'],
+        'fixed_band_pairs_by_sensor': DEFAULT_CONFIG['fixed_band_pairs_by_sensor'],
+        'bandpair_wavelength_window_nm': DEFAULT_CONFIG['bandpair_wavelength_window_nm'],
+        'min_band_support': DEFAULT_CONFIG['min_band_support'],
+        'allow_single_band_fallback': DEFAULT_CONFIG['allow_single_band_fallback'],
+        'consensus_group_rounding_px': DEFAULT_CONFIG['consensus_group_rounding_px'],
+        'spatial_stratification_grid_rows': DEFAULT_CONFIG['spatial_stratification_grid_rows'],
+        'spatial_stratification_grid_cols': DEFAULT_CONFIG['spatial_stratification_grid_cols'],
+        'max_points_per_cell': DEFAULT_CONFIG['max_points_per_cell'],
+        'preferred_polynomial_order': DEFAULT_CONFIG['preferred_polynomial_order'],
+        'auto_downgrade_polynomial_order': DEFAULT_CONFIG['auto_downgrade_polynomial_order'],
+        'min_gcps_order2': DEFAULT_CONFIG['min_gcps_order2'],
+        'min_cells_order2': DEFAULT_CONFIG['min_cells_order2'],
+        'local_coreg_grid_res': DEFAULT_CONFIG['local_coreg_grid_res'],
+        'local_coreg_window_size': DEFAULT_CONFIG['local_coreg_window_size'],
+        'local_coreg_tieP_filter_level': DEFAULT_CONFIG['local_coreg_tieP_filter_level'],
+        'local_coreg_max_iter': DEFAULT_CONFIG['local_coreg_max_iter'],
+        'global_coreg_profiles_by_sensor': DEFAULT_CONFIG['global_coreg_profiles_by_sensor'],
+        'local_max_shift_by_sensor': DEFAULT_CONFIG['local_max_shift_by_sensor'],
+        'global_coreg_attempt_ladder': DEFAULT_CONFIG['global_coreg_attempt_ladder'],
+        'postwarp_phasecorr_check': DEFAULT_CONFIG['postwarp_phasecorr_check'],
+        'postwarp_phasecorr_warn_threshold_px': DEFAULT_CONFIG['postwarp_phasecorr_warn_threshold_px'],
+        'postwarp_phasecorr_reject_threshold_px': DEFAULT_CONFIG['postwarp_phasecorr_reject_threshold_px'],
+        'postwarp_phasecorr_reject_bad': DEFAULT_CONFIG['postwarp_phasecorr_reject_bad'],
+        'postwarp_phasecorr_max_dim': DEFAULT_CONFIG['postwarp_phasecorr_max_dim'],
+        'use_geolocation_mesh_affine': DEFAULT_CONFIG['use_geolocation_mesh_affine'],
+        'geolocation_mesh_stride': DEFAULT_CONFIG['geolocation_mesh_stride'],
+        'save_pre': config_vars['save_pre'].get(),
+        'gen_tiepoint_pngs': config_vars['gen_tiepoint_pngs'].get(),
+        'save_displacement_vectors': config_vars['save_displacement_vectors'].get(),
+        'use_inmemory': config_vars['use_inmemory'].get(),
+        'keep_temp_files': config_vars['keep_temp_files'].get(),
+        'save_pan': config_vars['save_pan'].get(),
+        'save_quality_mask': config_vars['save_quality_mask'].get(),
+        'remove_detector_overlap_bands': config_vars['remove_detector_overlap_bands'].get(),
+        'normalization_mode': str(config_vars['normalization_mode'].get()).strip().lower(),
+        'norm_p_low': DEFAULT_CONFIG['norm_p_low'],
+        'norm_p_high': DEFAULT_CONFIG['norm_p_high'],
+        'norm_clip': DEFAULT_CONFIG['norm_clip'],
+        'norm_eps': DEFAULT_CONFIG['norm_eps'],
+        'norm_min_valid_pixels': DEFAULT_CONFIG['norm_min_valid_pixels'],
+        'norm_reservoir_size': DEFAULT_CONFIG['norm_reservoir_size'],
+        'norm_seed': DEFAULT_CONFIG['norm_seed'],
+        'norm_tile_size': DEFAULT_CONFIG['norm_tile_size'],
+        'build_overviews': config_vars['build_overviews'].get(),
+        'strict_metadata': bool(strict_metadata),
+        'metadata_extension_level': metadata_extension_level,
+        'metadata_stats_mode': metadata_stats_mode,
+        'enmap_metadata_stats_mode': str(config_vars['enmap_metadata_stats_mode'].get()).strip().lower(),
+        'metadata_stats_sample_windows': int(metadata_stats_sample_windows),
+        'metadata_stats_seed': int(metadata_stats_seed),
+        'metadata_histogram_buckets': metadata_histogram_buckets,
+        'metadata_label_precision': int(metadata_label_precision),
+        'validation_max_windows': int(validation_max_windows),
+        'allow_gui_prompt': True,
+        'defer_temp_cleanup_gui': True,
+        'timing_logs': True,
+        'use_pipeline_native': DEFAULT_CONFIG['use_pipeline_native'],
+        'enable_legacy_fallback': DEFAULT_CONFIG['enable_legacy_fallback'],
+        'assert_legacy_parity': DEFAULT_CONFIG['assert_legacy_parity'],
+    }
 
 
 class _PipelineProgressWindow:
@@ -376,7 +482,14 @@ def _show_parameter_dialog(
         'remove_detector_overlap_bands': tk.BooleanVar(value=DEFAULT_CONFIG['remove_detector_overlap_bands']),
         'normalization_mode': tk.StringVar(value=DEFAULT_CONFIG['normalization_mode']),
         'build_overviews': tk.BooleanVar(value=DEFAULT_CONFIG['build_overviews']),
+        'strict_metadata': tk.BooleanVar(value=DEFAULT_CONFIG['strict_metadata']),
         'metadata_extension_level': tk.StringVar(value=GUI_METADATA_EXTENSION_LEVEL),
+        'metadata_stats_mode': tk.StringVar(value=DEFAULT_CONFIG['metadata_stats_mode']),
+        'metadata_stats_sample_windows': tk.IntVar(value=DEFAULT_CONFIG['metadata_stats_sample_windows']),
+        'metadata_stats_seed': tk.IntVar(value=DEFAULT_CONFIG['metadata_stats_seed']),
+        'metadata_histogram_buckets': tk.IntVar(value=DEFAULT_CONFIG['metadata_histogram_buckets']),
+        'metadata_label_precision': tk.IntVar(value=DEFAULT_CONFIG['metadata_label_precision']),
+        'validation_max_windows': tk.IntVar(value=DEFAULT_CONFIG['validation_max_windows']),
         'enmap_metadata_stats_mode': tk.StringVar(value=DEFAULT_CONFIG['enmap_metadata_stats_mode']),
     }
 
@@ -507,10 +620,11 @@ def _show_parameter_dialog(
         ("Keep temporary files", config_vars['keep_temp_files']),
     ]
     if has_prisma_input:
-        checkboxes.extend([
-            ("Save PAN band (PRISMA)", config_vars['save_pan']),
-            ("Save quality mask (PRISMA)", config_vars['save_quality_mask']),
-        ])
+        checkboxes.append(("Save PAN band (PRISMA)", config_vars['save_pan']))
+    if has_prisma_input or has_enmap_input:
+        checkboxes.append(
+            ("Save quality auxiliaries (PRISMA masks / EnMAP QL)", config_vars['save_quality_mask'])
+        )
     checkboxes.extend([
         ("Remove VNIR/SWIR overlap bands", config_vars['remove_detector_overlap_bands']),
         ("Build internal overviews (QGIS/ENVI)", config_vars['build_overviews']),
@@ -533,7 +647,15 @@ def _show_parameter_dialog(
     )
     norm_mode_combo.grid(row=norm_row, column=1, sticky='w', padx=5, pady=(10, 2))
 
-    metadata_row = norm_row + 1
+    strict_row = norm_row + 1
+    tk.Checkbutton(
+        out_frame,
+        text="Strict metadata writes",
+        variable=config_vars['strict_metadata'],
+        anchor='w',
+    ).grid(row=strict_row, column=0, columnspan=3, sticky='w', pady=(6, 2))
+
+    metadata_row = strict_row + 1
     tk.Label(out_frame, text="Metadata extension level:", anchor='w').grid(
         row=metadata_row, column=0, sticky='w', pady=(10, 2)
     )
@@ -545,31 +667,6 @@ def _show_parameter_dialog(
         width=12,
     )
     metadata_combo.grid(row=metadata_row, column=1, sticky='w', padx=5, pady=(10, 2))
-
-    enmap_stats_row = metadata_row + 1
-    enmap_stats_label = tk.Label(out_frame, text="EnMAP metadata stats:", anchor='w')
-    enmap_stats_combo = ttk.Combobox(
-        out_frame,
-        state="readonly",
-        values=list(GUI_METADATA_STATS_MODE_CHOICES),
-        textvariable=config_vars['enmap_metadata_stats_mode'],
-        width=12,
-    )
-
-    def _update_enmap_stats_visibility(*_args: Any) -> None:
-        ext = str(config_vars['metadata_extension_level'].get()).strip().lower()
-        show_enmap_stats = bool(has_enmap_input) and ext in ("stats", "full")
-
-        if show_enmap_stats:
-            enmap_stats_label.grid(row=enmap_stats_row, column=0, sticky='w', pady=(10, 2))
-            enmap_stats_combo.grid(row=enmap_stats_row, column=1, sticky='w', padx=5, pady=(10, 2))
-        else:
-            enmap_stats_label.grid_remove()
-            enmap_stats_combo.grid_remove()
-
-    metadata_combo.bind('<<ComboboxSelected>>', _update_enmap_stats_visibility)
-    config_vars['metadata_extension_level'].trace_add("write", _update_enmap_stats_visibility)
-    _update_enmap_stats_visibility()
 
     # Buttons
     button_frame = tk.Frame(param_root)
@@ -606,87 +703,66 @@ def _show_parameter_dialog(
     if result_config['cancelled']:
         sys.exit("User cancelled")
 
-    metadata_extension_level, metadata_histogram_buckets = _normalize_gui_metadata_settings(
-        config_vars['metadata_extension_level'].get(),
-        DEFAULT_CONFIG['metadata_histogram_buckets'],
+    metadata_settings = _resolve_gui_metadata_runtime_settings(
+        config_vars['metadata_extension_level'].get()
+    )
+    config_vars['metadata_stats_mode'].set(metadata_settings['metadata_stats_mode'])
+    config_vars['metadata_stats_sample_windows'].set(metadata_settings['metadata_stats_sample_windows'])
+    config_vars['metadata_stats_seed'].set(metadata_settings['metadata_stats_seed'])
+    config_vars['metadata_histogram_buckets'].set(metadata_settings['metadata_histogram_buckets'])
+    config_vars['metadata_label_precision'].set(metadata_settings['metadata_label_precision'])
+    config_vars['validation_max_windows'].set(metadata_settings['validation_max_windows'])
+    config_vars['enmap_metadata_stats_mode'].set(metadata_settings['enmap_metadata_stats_mode'])
+
+    config = _build_gui_runtime_config(
+        input_path=input_path,
+        output_dir=output_dir,
+        batch_mode=batch_mode,
+        config_vars=config_vars,
+        strict_metadata=bool(config_vars['strict_metadata'].get()),
+        metadata_extension_level=metadata_settings['metadata_extension_level'],
+        metadata_stats_mode=metadata_settings['metadata_stats_mode'],
+        metadata_stats_sample_windows=metadata_settings['metadata_stats_sample_windows'],
+        metadata_stats_seed=metadata_settings['metadata_stats_seed'],
+        metadata_histogram_buckets=metadata_settings['metadata_histogram_buckets'],
+        metadata_label_precision=metadata_settings['metadata_label_precision'],
+        validation_max_windows=metadata_settings['validation_max_windows'],
     )
 
-    # Build config from variables
-    config = {
-        'input_path': input_path,
-        'output_dir': output_dir,
-        'batch_mode': batch_mode,
-        'days_window': config_vars['days_window'].get(),
-        'min_overlap': config_vars['min_overlap'].get(),
-        'max_cloud': config_vars['max_cloud'].get(),
-        'max_input_cloud_cover': config_vars['max_input_cloud_cover'].get(),
-        'min_accuracy': config_vars['min_accuracy'].get(),
-        'max_displacement': config_vars['max_displacement'].get(),
-        'residual_threshold': config_vars['residual_threshold'].get(),
-        'min_tie_points': config_vars['min_tie_points'].get(),
-        'max_s2_candidates': config_vars['max_s2_candidates'].get(),
-        'residual_mad_factor': config_vars['residual_mad_factor'].get(),
-        's2_ref_band': config_vars['s2_ref_band'].get(),
-        'prefer_fixed_band_pairs': DEFAULT_CONFIG['prefer_fixed_band_pairs'],
-        'fixed_band_pairs_by_sensor': DEFAULT_CONFIG['fixed_band_pairs_by_sensor'],
-        'bandpair_wavelength_window_nm': DEFAULT_CONFIG['bandpair_wavelength_window_nm'],
-        'min_band_support': DEFAULT_CONFIG['min_band_support'],
-        'allow_single_band_fallback': DEFAULT_CONFIG['allow_single_band_fallback'],
-        'consensus_group_rounding_px': DEFAULT_CONFIG['consensus_group_rounding_px'],
-        'spatial_stratification_grid_rows': DEFAULT_CONFIG['spatial_stratification_grid_rows'],
-        'spatial_stratification_grid_cols': DEFAULT_CONFIG['spatial_stratification_grid_cols'],
-        'max_points_per_cell': DEFAULT_CONFIG['max_points_per_cell'],
-        'preferred_polynomial_order': DEFAULT_CONFIG['preferred_polynomial_order'],
-        'auto_downgrade_polynomial_order': DEFAULT_CONFIG['auto_downgrade_polynomial_order'],
-        'min_gcps_order2': DEFAULT_CONFIG['min_gcps_order2'],
-        'min_cells_order2': DEFAULT_CONFIG['min_cells_order2'],
-        'local_coreg_grid_res': DEFAULT_CONFIG['local_coreg_grid_res'],
-        'local_coreg_window_size': DEFAULT_CONFIG['local_coreg_window_size'],
-        'local_coreg_tieP_filter_level': DEFAULT_CONFIG['local_coreg_tieP_filter_level'],
-        'local_coreg_max_iter': DEFAULT_CONFIG['local_coreg_max_iter'],
-        'global_coreg_profiles_by_sensor': DEFAULT_CONFIG['global_coreg_profiles_by_sensor'],
-        'local_max_shift_by_sensor': DEFAULT_CONFIG['local_max_shift_by_sensor'],
-        'global_coreg_attempt_ladder': DEFAULT_CONFIG['global_coreg_attempt_ladder'],
-        'postwarp_phasecorr_check': DEFAULT_CONFIG['postwarp_phasecorr_check'],
-        'postwarp_phasecorr_warn_threshold_px': DEFAULT_CONFIG['postwarp_phasecorr_warn_threshold_px'],
-        'postwarp_phasecorr_reject_threshold_px': DEFAULT_CONFIG['postwarp_phasecorr_reject_threshold_px'],
-        'postwarp_phasecorr_reject_bad': DEFAULT_CONFIG['postwarp_phasecorr_reject_bad'],
-        'postwarp_phasecorr_max_dim': DEFAULT_CONFIG['postwarp_phasecorr_max_dim'],
-        'use_geolocation_mesh_affine': DEFAULT_CONFIG['use_geolocation_mesh_affine'],
-        'geolocation_mesh_stride': DEFAULT_CONFIG['geolocation_mesh_stride'],
-        'save_pre': config_vars['save_pre'].get(),
-        'gen_tiepoint_pngs': config_vars['gen_tiepoint_pngs'].get(),
-        'save_displacement_vectors': config_vars['save_displacement_vectors'].get(),
-        'use_inmemory': config_vars['use_inmemory'].get(),
-        'keep_temp_files': config_vars['keep_temp_files'].get(),
-        'save_pan': config_vars['save_pan'].get(),
-        'save_quality_mask': config_vars['save_quality_mask'].get(),
-        'remove_detector_overlap_bands': config_vars['remove_detector_overlap_bands'].get(),
-        'normalization_mode': str(config_vars['normalization_mode'].get()).strip().lower(),
-        'norm_p_low': DEFAULT_CONFIG['norm_p_low'],
-        'norm_p_high': DEFAULT_CONFIG['norm_p_high'],
-        'norm_clip': DEFAULT_CONFIG['norm_clip'],
-        'norm_eps': DEFAULT_CONFIG['norm_eps'],
-        'norm_min_valid_pixels': DEFAULT_CONFIG['norm_min_valid_pixels'],
-        'norm_reservoir_size': DEFAULT_CONFIG['norm_reservoir_size'],
-        'norm_seed': DEFAULT_CONFIG['norm_seed'],
-        'norm_tile_size': DEFAULT_CONFIG['norm_tile_size'],
-        'build_overviews': config_vars['build_overviews'].get(),
-        'strict_metadata': True,
-        'metadata_extension_level': metadata_extension_level,
-        'metadata_stats_mode': DEFAULT_CONFIG['metadata_stats_mode'],
-        'enmap_metadata_stats_mode': str(config_vars['enmap_metadata_stats_mode'].get()).strip().lower(),
-        'metadata_stats_sample_windows': DEFAULT_CONFIG['metadata_stats_sample_windows'],
-        'metadata_stats_seed': DEFAULT_CONFIG['metadata_stats_seed'],
-        'metadata_histogram_buckets': metadata_histogram_buckets,
-        'metadata_label_precision': GUI_METADATA_LABEL_PRECISION,
-        'validation_max_windows': DEFAULT_CONFIG['validation_max_windows'],
-        'allow_gui_prompt': True,
-        'defer_temp_cleanup_gui': True,
-        'timing_logs': True,
-    }
-
     return config
+
+
+def run_gui_worker_pipeline(
+    *,
+    config: Dict[str, Any],
+    progress_callback: Any,
+    request_userpass_fn: Any,
+    run_coregistration: Any,
+    run_batch_coregistration: Any,
+    detect_hyp_type: Any,
+) -> None:
+    """Execute the GUI worker pipeline without UI event-loop concerns."""
+    worker_config = dict(config)
+    worker_config["prompt_userpass_fn"] = request_userpass_fn
+    if config["batch_mode"]:
+        run_batch_coregistration(
+            config["input_path"],
+            config["output_dir"],
+            worker_config,
+            progress_callback=progress_callback,
+        )
+        return
+
+    hyp_type = detect_hyp_type(config["input_path"])
+    run_coregistration(
+        config["input_path"],
+        hyp_type,
+        config["output_dir"],
+        worker_config,
+        progress_callback=progress_callback,
+        scene_idx=1,
+        scene_total=1,
+    )
 
 
 def main() -> int:
@@ -771,26 +847,14 @@ def main() -> int:
 
         def worker() -> None:
             try:
-                worker_config = dict(config)
-                worker_config["prompt_userpass_fn"] = _request_userpass_on_main_thread
-                if config['batch_mode']:
-                    run_batch_coregistration(
-                        config['input_path'],
-                        config['output_dir'],
-                        worker_config,
-                        progress_callback=progress_callback,
-                    )
-                else:
-                    hyp_type = detect_hyp_type(config['input_path'])
-                    run_coregistration(
-                        config['input_path'],
-                        hyp_type,
-                        config['output_dir'],
-                        worker_config,
-                        progress_callback=progress_callback,
-                        scene_idx=1,
-                        scene_total=1,
-                    )
+                run_gui_worker_pipeline(
+                    config=config,
+                    progress_callback=progress_callback,
+                    request_userpass_fn=_request_userpass_on_main_thread,
+                    run_coregistration=run_coregistration,
+                    run_batch_coregistration=run_batch_coregistration,
+                    detect_hyp_type=detect_hyp_type,
+                )
                 event_queue.put(("done", None))
             except KeyboardInterrupt:
                 event_queue.put(("interrupt", None))
