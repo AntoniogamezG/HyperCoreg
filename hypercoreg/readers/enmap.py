@@ -86,6 +86,49 @@ def _collect_float_values(node: ET.Element, local_name: str) -> List[float]:
     return values
 
 
+def _parse_float_list_text(text: Optional[str]) -> List[float]:
+    """Parse a scalar or ENVI-style numeric list into finite floats."""
+    if text is None:
+        return []
+    cleaned = str(text).replace("{", " ").replace("}", " ").replace(";", ",")
+    values: List[float] = []
+    for part in re.split(r"[,\s]+", cleaned):
+        if not part:
+            continue
+        try:
+            val = float(part)
+        except Exception:
+            continue
+        if np.isfinite(val):
+            values.append(val)
+    return values
+
+
+def _align_band_float_values(
+    values: List[float],
+    band_count: int,
+    label: str,
+) -> Optional[np.ndarray]:
+    """Return per-band values, accepting exact arrays or one scalar repeated."""
+    vals = [float(v) for v in values if np.isfinite(float(v))]
+    if not vals:
+        return None
+    if band_count > 0:
+        if len(vals) == band_count:
+            return np.asarray(vals, dtype=float)
+        if len(vals) == 1:
+            return np.full(int(band_count), float(vals[0]), dtype=float)
+        logger.warning(
+            "EnMAP metadata %s length mismatch (%d vs bands %d); ignoring %s.",
+            label,
+            len(vals),
+            int(band_count),
+            label,
+        )
+        return None
+    return np.asarray(vals, dtype=float)
+
+
 def _iter_children_local(node: ET.Element, name: str):
     """Iterate direct children with matching local-name."""
     target = str(name)
@@ -602,6 +645,9 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
         'n_rows': None,
         'n_cols': None,
         'n_bands': None,
+        'data_gain_values': None,
+        'data_offset_values': None,
+        'background_value': None,
         'enmap_id': None,
         'enmap_date': None,
         'enmap_processing_version': None,
@@ -628,10 +674,12 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
         wavelengths: List[float] = []
         fwhm_list: List[float] = []
         band_names: List[str] = []
+        data_gain_values: List[float] = []
+        data_offset_values: List[float] = []
 
-        band_blocks: List[List[Tuple[float, Optional[float], Optional[str]]]] = []
+        band_blocks: List[List[Tuple[float, Optional[float], Optional[str], Optional[float], Optional[float]]]] = []
         for band_char in _iter_local(root, "bandCharacterisation"):
-            block_entries: List[Tuple[float, Optional[float], Optional[str]]] = []
+            block_entries: List[Tuple[float, Optional[float], Optional[str], Optional[float], Optional[float]]] = []
             band_nodes = list(_iter_children_local(band_char, "bandID"))
 
             if band_nodes:
@@ -653,7 +701,18 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
                     elif band_node.text and band_node.text.strip():
                         name_val = band_node.text.strip()
 
-                    block_entries.append((float(wl_val), None if fwhm_val is None else float(fwhm_val), name_val))
+                    gain_val = _find_first_float(band_node, "GainOfBand")
+                    offset_val = _find_first_float(band_node, "OffsetOfBand")
+
+                    block_entries.append(
+                        (
+                            float(wl_val),
+                            None if fwhm_val is None else float(fwhm_val),
+                            name_val,
+                            None if gain_val is None else float(gain_val),
+                            None if offset_val is None else float(offset_val),
+                        )
+                    )
             else:
                 wl_val = _find_first_float(band_char, "wavelengthCenterOfBand")
                 if wl_val is None:
@@ -663,7 +722,17 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
                     if fwhm_val is None:
                         fwhm_val = _find_first_float(band_char, "FWHM")
                     name_val = _find_first_text(band_char, "bandID")
-                    block_entries.append((float(wl_val), None if fwhm_val is None else float(fwhm_val), name_val))
+                    gain_val = _find_first_float(band_char, "GainOfBand")
+                    offset_val = _find_first_float(band_char, "OffsetOfBand")
+                    block_entries.append(
+                        (
+                            float(wl_val),
+                            None if fwhm_val is None else float(fwhm_val),
+                            name_val,
+                            None if gain_val is None else float(gain_val),
+                            None if offset_val is None else float(offset_val),
+                        )
+                    )
 
             if block_entries:
                 band_blocks.append(block_entries)
@@ -677,12 +746,16 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
                     len(selected_entries),
                 )
 
-            for wl_val, fwhm_val, name_val in selected_entries:
+            for wl_val, fwhm_val, name_val, gain_val, offset_val in selected_entries:
                 wavelengths.append(float(wl_val))
                 if fwhm_val is not None:
                     fwhm_list.append(float(fwhm_val))
                 if name_val is not None and str(name_val).strip():
                     band_names.append(str(name_val).strip())
+                if gain_val is not None:
+                    data_gain_values.append(float(gain_val))
+                if offset_val is not None:
+                    data_offset_values.append(float(offset_val))
 
         # Alternative structure
         if not wavelengths:
@@ -690,6 +763,13 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
                 band_names.extend(_collect_text_values(spec, "bandID"))
                 wavelengths.extend(_collect_float_values(spec, "centralWavelength"))
                 fwhm_list.extend(_collect_float_values(spec, "FWHM"))
+                data_gain_values.extend(_collect_float_values(spec, "GainOfBand"))
+                data_offset_values.extend(_collect_float_values(spec, "OffsetOfBand"))
+
+        if not data_gain_values:
+            data_gain_values = _collect_float_values(root, "GainOfBand")
+        if not data_offset_values:
+            data_offset_values = _collect_float_values(root, "OffsetOfBand")
 
         n_wl = len(wavelengths)
         n_fwhm = len(fwhm_list)
@@ -711,6 +791,18 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
                 logger.warning(
                     f"EnMAP metadata band-name length mismatch ({n_names} vs wavelengths {n_wl}); ignoring band names."
                 )
+        gains_arr = _align_band_float_values(data_gain_values, n_wl, "data gain values")
+        offsets_arr = _align_band_float_values(data_offset_values, n_wl, "data offset values")
+        if gains_arr is not None:
+            result['data_gain_values'] = gains_arr
+        if offsets_arr is not None:
+            result['data_offset_values'] = offsets_arr
+
+        background_value = _find_first_float(root, "backgroundValue")
+        if background_value is None:
+            background_value = _find_first_float(root, "dataIgnoreValue")
+        if background_value is not None and np.isfinite(float(background_value)):
+            result['background_value'] = float(background_value)
 
         # Extract acquisition time
         for time_elem in _iter_local(root, 'startTime'):
@@ -804,7 +896,7 @@ def read_enmap_metadata(metadata_xml: str, spectral_image_path: Optional[str] = 
     return result
 
 
-def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+def stage_enmap_metadata_for_session(raster_path: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stage parsed EnMAP metadata without mutating the source raster.
 
@@ -817,6 +909,10 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
         "error": None,
         "bands_updated": 0,
         "dataset_tags_updated": 0,
+        "metadata_staged": False,
+        "source_mutated": False,
+        "staging_mode": "memory_cache",
+        "cache_scope": "process",
     }
     try:
         if not raster_path or not os.path.exists(raster_path):
@@ -830,6 +926,10 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
             if metadata.get("wavelengths") is not None else np.array([], dtype=float)
         fwhm_vals = np.asarray(metadata.get("fwhm"), dtype=float).reshape(-1) \
             if metadata.get("fwhm") is not None else np.array([], dtype=float)
+        gain_vals = np.asarray(metadata.get("data_gain_values"), dtype=float).reshape(-1) \
+            if metadata.get("data_gain_values") is not None else np.array([], dtype=float)
+        offset_vals = np.asarray(metadata.get("data_offset_values"), dtype=float).reshape(-1) \
+            if metadata.get("data_offset_values") is not None else np.array([], dtype=float)
         band_names_raw = metadata.get("band_names")
         band_names: List[str] = []
         if isinstance(band_names_raw, (list, tuple, np.ndarray)):
@@ -845,6 +945,10 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
                     if bidx <= wavelengths.size and np.isfinite(float(wavelengths[bidx - 1])):
                         has_metadata = True
                     if bidx <= fwhm_vals.size and np.isfinite(float(fwhm_vals[bidx - 1])):
+                        has_metadata = True
+                    if bidx <= gain_vals.size and np.isfinite(float(gain_vals[bidx - 1])):
+                        has_metadata = True
+                    if bidx <= offset_vals.size and np.isfinite(float(offset_vals[bidx - 1])):
                         has_metadata = True
                     if has_metadata:
                         out["bands_updated"] += 1
@@ -872,6 +976,7 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
             "n_rows",
             "n_cols",
             "n_bands",
+            "background_value",
             "enmap_id",
             "enmap_date",
             "enmap_processing_version",
@@ -904,6 +1009,7 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
 
         out["dataset_tags_updated"] = len(global_tags)
         _ENMAP_METADATA_CACHE[os.path.abspath(raster_path)] = dict(metadata)
+        out["metadata_staged"] = True
         out["ok"] = True
         return out
     except Exception as e:
@@ -912,7 +1018,7 @@ def inject_metadata_into_raster(raster_path: str, metadata: Dict[str, Any]) -> D
 
 
 def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
-    """Read EnMAP metadata directly from injected raster tags."""
+    """Read EnMAP metadata from staged cache first, then from raster tags."""
     out: Dict[str, Any] = {
         'wavelengths': None,
         'fwhm': None,
@@ -923,6 +1029,9 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
         'n_rows': None,
         'n_cols': None,
         'n_bands': None,
+        'data_gain_values': None,
+        'data_offset_values': None,
+        'background_value': None,
         'enmap_id': None,
         'enmap_date': None,
         'enmap_processing_version': None,
@@ -961,6 +1070,24 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
                 return out
 
             ds_tags = src.tags()
+            try:
+                envi_tags = src.tags(ns="ENVI")
+            except Exception:
+                envi_tags = {}
+            all_ds_tags = dict(ds_tags)
+            all_ds_tags.update({str(k): v for k, v in envi_tags.items()})
+
+            def _tag_key(value: Any) -> str:
+                return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+            def _get_tag(*names: str) -> Optional[str]:
+                lookup = {_tag_key(k): v for k, v in all_ds_tags.items()}
+                for name in names:
+                    val = lookup.get(_tag_key(name))
+                    if val is not None:
+                        return str(val)
+                return None
+
             acq_txt = ds_tags.get("acquisition_time")
             if acq_txt:
                 try:
@@ -978,16 +1105,32 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
                     pass
 
             def _parse_float_tag(key: str) -> Optional[float]:
-                raw = ds_tags.get(key)
+                raw = _get_tag(key)
                 if raw is None:
                     return None
+                text = str(raw).strip().strip("{}[]()").strip().strip("'\"")
                 try:
-                    val = float(str(raw).strip())
+                    val = float(text)
                     if np.isfinite(val):
                         return val
                 except Exception:
                     return None
                 return None
+
+            out["background_value"] = _parse_float_tag("background_value")
+            if out["background_value"] is None:
+                out["background_value"] = _parse_float_tag("backgroundValue")
+            if out["background_value"] is None:
+                out["background_value"] = _parse_float_tag("data_ignore_value")
+            if out["background_value"] is None:
+                out["background_value"] = _parse_float_tag("data ignore value")
+            if out["background_value"] is None and src.nodata is not None:
+                try:
+                    nodata_val = float(src.nodata)
+                    if np.isfinite(nodata_val):
+                        out["background_value"] = nodata_val
+                except Exception:
+                    pass
 
             for key in (
                 "prisma_cloud_pct",
@@ -1015,17 +1158,20 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
                     else:
                         out[key] = str(raw).strip()
 
-            wl_vals: List[float] = []
-            fwhm_vals: List[float] = []
-            band_names: List[str] = []
-            for bidx in range(1, int(src.count) + 1):
+            band_count = int(src.count)
+            wl_by_band = np.full(band_count, np.nan, dtype=float)
+            fwhm_by_band = np.full(band_count, np.nan, dtype=float)
+            gain_vals: List[float] = []
+            offset_vals: List[float] = []
+            band_names_by_band: List[Optional[str]] = [None] * band_count
+            for bidx in range(1, band_count + 1):
                 btags = src.tags(bidx)
                 wl_txt = btags.get("wavelength")
                 if wl_txt is not None:
                     try:
                         wl = float(str(wl_txt).strip())
                         if np.isfinite(wl):
-                            wl_vals.append(wl)
+                            wl_by_band[bidx - 1] = wl
                     except Exception:
                         pass
                 fw_txt = btags.get("fwhm")
@@ -1033,19 +1179,57 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
                     try:
                         fw = float(str(fw_txt).strip())
                         if np.isfinite(fw):
-                            fwhm_vals.append(fw)
+                            fwhm_by_band[bidx - 1] = fw
+                    except Exception:
+                        pass
+                gain_txt = btags.get("data_gain") or btags.get("gain")
+                if gain_txt is not None:
+                    try:
+                        gain = float(str(gain_txt).strip())
+                        if np.isfinite(gain):
+                            gain_vals.append(gain)
+                    except Exception:
+                        pass
+                offset_txt = btags.get("data_offset") or btags.get("offset")
+                if offset_txt is not None:
+                    try:
+                        offset = float(str(offset_txt).strip())
+                        if np.isfinite(offset):
+                            offset_vals.append(offset)
                     except Exception:
                         pass
                 desc = src.descriptions[bidx - 1]
                 if desc is not None and str(desc).strip():
-                    band_names.append(str(desc).strip())
+                    band_names_by_band[bidx - 1] = str(desc).strip()
 
-            if wl_vals:
-                out['wavelengths'] = np.array(wl_vals, dtype=float)
-            if fwhm_vals and wl_vals and len(fwhm_vals) == len(wl_vals):
-                out['fwhm'] = np.array(fwhm_vals, dtype=float)
-            if band_names and wl_vals and len(band_names) == len(wl_vals):
-                out['band_names'] = band_names
+            if not gain_vals:
+                gain_vals = _parse_float_list_text(
+                    _get_tag("data_gain_values", "data gain values", "GainOfBand")
+                )
+            if not offset_vals:
+                offset_vals = _parse_float_list_text(
+                    _get_tag("data_offset_values", "data offset values", "OffsetOfBand")
+                )
+
+            wl_valid_mask = np.isfinite(wl_by_band)
+            if bool(np.all(wl_valid_mask)) and band_count > 0:
+                out['wavelengths'] = np.array(wl_by_band, dtype=float)
+            elif bool(np.any(wl_valid_mask)):
+                logger.warning(
+                    "Sparse EnMAP raster wavelength tags (%d/%d bands); ignoring raster tags and trying XML fallback.",
+                    int(np.count_nonzero(wl_valid_mask)),
+                    band_count,
+                )
+            if out['wavelengths'] is not None and bool(np.all(np.isfinite(fwhm_by_band))):
+                out['fwhm'] = np.array(fwhm_by_band, dtype=float)
+            if out['wavelengths'] is not None and all(name for name in band_names_by_band):
+                out['band_names'] = [str(name) for name in band_names_by_band]
+            gains_arr = _align_band_float_values(gain_vals, band_count, "data gain values")
+            offsets_arr = _align_band_float_values(offset_vals, band_count, "data offset values")
+            if gains_arr is not None:
+                out['data_gain_values'] = gains_arr
+            if offsets_arr is not None:
+                out['data_offset_values'] = offsets_arr
 
         if out["wavelengths"] is None:
             try:
@@ -1063,7 +1247,7 @@ def read_enmap_metadata_from_raster(raster_path: str) -> Dict[str, Any]:
 
         return out
     except Exception as e:
-        logger.debug("Could not read injected EnMAP raster metadata from %s: %s", raster_path, e)
+        logger.debug("Could not read staged EnMAP raster metadata from %s: %s", raster_path, e)
         return out
 
 

@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Callable, Dict, Optional
+import csv
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 
-from hypercoreg.config import DEFAULT_CONFIG, LOCAL_GRID_RES_M, PRISMA_FIXED_BAND_PAIRS
+from hypercoreg.config import (
+    DEFAULT_CONFIG,
+    LOCAL_GRID_RES_M,
+    MULTIBAND_S2_WAVELENGTHS,
+    PRISMA_FIXED_BAND_PAIRS,
+    S2_APPROX_FWHM_NM,
+)
 
 SCENE_CLUSTER_SPREAD_THRESHOLD = 0.35
 SCENE_CLUSTER_HULL_RATIO_THRESHOLD = 0.20
@@ -238,7 +246,12 @@ def _resolve_fixed_band_pair(
     prefer_fixed_band_pairs: bool = True,
     fixed_band_pairs_by_sensor: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Dict[str, Any]:
-    sensor_key = str(sensor_type or "").strip().upper() or "DEFAULT"
+    sensor_key = str(sensor_type or "").strip().upper()
+    for suffix in ("_VNIR", "_SWIR"):
+        if sensor_key.endswith(suffix):
+            sensor_key = sensor_key[: -len(suffix)]
+            break
+    sensor_key = sensor_key or "DEFAULT"
     fixed_map = fixed_band_pairs_by_sensor or {}
     sensor_map: Dict[str, int] = {}
     if isinstance(fixed_map, dict):
@@ -294,6 +307,110 @@ def _resolve_band_indices_for_matching(
     out["mode"] = "nearest"
     out["indices"] = [nearest + 1]
     out["reason"] = out.get("reason") or "window match unavailable; using nearest wavelength"
+    return out
+
+
+_S2_SRF_TABLE_CACHE: Optional[Dict[str, list[tuple[float, float]]]] = None
+
+
+def _load_sentinel2_srf_table() -> Dict[str, list[tuple[float, float]]]:
+    global _S2_SRF_TABLE_CACHE
+    if _S2_SRF_TABLE_CACHE is not None:
+        return _S2_SRF_TABLE_CACHE
+    path = Path(__file__).resolve().parents[1] / "data" / "sentinel2_msi_srf.csv"
+    table: Dict[str, list[tuple[float, float]]] = {}
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(row for row in f if not row.lstrip().startswith("#"))
+            for row in reader:
+                platform = str(row.get("platform", "S2A")).strip().upper() or "S2A"
+                band = str(row.get("band", "")).strip().upper()
+                if not band:
+                    continue
+                wl = float(row.get("wavelength_nm", "nan"))
+                response = float(row.get("response", "nan"))
+                if np.isfinite(wl) and np.isfinite(response):
+                    table.setdefault(f"{platform}:{band}", []).append((wl, max(0.0, response)))
+    except Exception:
+        table = {}
+    for key in list(table.keys()):
+        table[key] = sorted(table[key], key=lambda item: item[0])
+    _S2_SRF_TABLE_CACHE = table
+    return table
+
+
+def _compute_srf_weights(
+    hs_wavelengths: Sequence[float],
+    hs_fwhm: Optional[Sequence[float]],
+    band_label: str,
+    platform: str = "S2A",
+) -> Dict[str, Any]:
+    hs_wl = np.asarray(hs_wavelengths, dtype=float).reshape(-1)
+    out: Dict[str, Any] = {
+        "resolved": False,
+        "mode": "srf_weighted",
+        "indices": [],
+        "weights": [],
+        "band_label": str(band_label),
+        "platform": str(platform or "S2A").upper(),
+        "reason": None,
+    }
+    finite = np.isfinite(hs_wl)
+    if not np.any(finite):
+        out["reason"] = "no finite hyperspectral wavelengths"
+        return out
+    if hs_fwhm is not None:
+        fwhm = np.asarray(hs_fwhm, dtype=float).reshape(-1)
+        if fwhm.size != hs_wl.size:
+            fwhm = None
+    else:
+        fwhm = None
+    if fwhm is None:
+        finite_wl = np.sort(hs_wl[finite])
+        spacing = float(np.nanmedian(np.diff(finite_wl))) if finite_wl.size > 1 else 10.0
+        if not np.isfinite(spacing) or spacing <= 0:
+            spacing = 10.0
+        fwhm = np.full(hs_wl.shape, spacing, dtype=float)
+    valid_fwhm = np.isfinite(fwhm) & (fwhm > 0)
+    fallback_width = float(np.nanmedian(fwhm[valid_fwhm])) if np.any(valid_fwhm) else 10.0
+    fwhm = np.where(valid_fwhm, fwhm, fallback_width)
+
+    band_key = str(band_label).upper()
+    table = _load_sentinel2_srf_table()
+    samples = table.get(f"{str(platform or 'S2A').upper()}:{band_key}") or table.get(f"S2A:{band_key}")
+    if not samples:
+        center = MULTIBAND_S2_WAVELENGTHS.get(band_key, {}).get("wavelength")
+        approx_fwhm = S2_APPROX_FWHM_NM.get(band_key, 20.0)
+        if center is None:
+            out["reason"] = f"no SRF samples for {band_label}"
+            return out
+        grid = np.arange(float(center) - 2.0 * approx_fwhm, float(center) + 2.0 * approx_fwhm + 1.0, 1.0)
+        sigma = float(approx_fwhm) / 2.355
+        response = np.exp(-0.5 * ((grid - float(center)) / sigma) ** 2)
+        samples = list(zip(grid.astype(float).tolist(), response.astype(float).tolist()))
+        out["reason"] = "using approximate Gaussian SRF fallback"
+    srf_wl = np.asarray([item[0] for item in samples], dtype=float)
+    srf_resp = np.asarray([item[1] for item in samples], dtype=float)
+    raw_weights = np.zeros(hs_wl.size, dtype=float)
+    for idx, (center_wl, width) in enumerate(zip(hs_wl, fwhm)):
+        if not np.isfinite(center_wl) or not np.isfinite(width) or width <= 0:
+            continue
+        lo = float(center_wl) - float(width) / 2.0
+        hi = float(center_wl) + float(width) / 2.0
+        if hi < float(np.nanmin(srf_wl)) or lo > float(np.nanmax(srf_wl)):
+            continue
+        mask = (srf_wl >= lo) & (srf_wl <= hi)
+        if np.count_nonzero(mask) >= 2:
+            raw_weights[idx] = float(np.trapz(srf_resp[mask], srf_wl[mask]))
+        else:
+            raw_weights[idx] = max(0.0, float(np.interp(float(center_wl), srf_wl, srf_resp, left=0.0, right=0.0))) * float(width)
+    positive = raw_weights > 0
+    if not np.any(positive):
+        out["reason"] = f"SRF {band_label} has no overlap with hyperspectral bands"
+        return out
+    out["resolved"] = True
+    out["indices"] = (np.where(positive)[0] + 1).astype(int).tolist()
+    out["weights"] = (raw_weights[positive] / float(np.sum(raw_weights[positive]))).astype(float).tolist()
     return out
 
 
@@ -387,6 +504,7 @@ def _count_occupied_cells(
     grid_cols: int,
     x_col: str = "X_IM",
     y_col: str = "Y_IM",
+    extent: Optional[Sequence[float]] = None,
 ) -> int:
     if df is None or len(df) == 0 or x_col not in df.columns or y_col not in df.columns:
         return 0
@@ -399,8 +517,14 @@ def _count_occupied_cells(
     y = y[valid]
     gx = max(1, int(grid_cols))
     gy = max(1, int(grid_rows))
-    x_min, x_max = float(np.min(x)), float(np.max(x))
-    y_min, y_max = float(np.min(y)), float(np.max(y))
+    if extent is not None and len(extent) >= 4:
+        x_min = float(min(float(extent[0]), float(extent[2])))
+        x_max = float(max(float(extent[0]), float(extent[2])))
+        y_min = float(min(float(extent[1]), float(extent[3])))
+        y_max = float(max(float(extent[1]), float(extent[3])))
+    else:
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        y_min, y_max = float(np.min(y)), float(np.max(y))
     x_span = max(1e-6, x_max - x_min)
     y_span = max(1e-6, y_max - y_min)
     cx = np.floor((x - x_min) / x_span * gx).astype(int)
@@ -410,7 +534,12 @@ def _count_occupied_cells(
     return int(len(np.unique(cy * gx + cx)))
 
 
-def _summarize_scene_tiepoint_quality(tie_points_df: Any, grid_rows: int, grid_cols: int) -> Dict[str, Any]:
+def _summarize_scene_tiepoint_quality(
+    tie_points_df: Any,
+    grid_rows: int,
+    grid_cols: int,
+    stratification_extent: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
     from shapely.geometry import MultiPoint
 
     summary = {"quality_score": None, "quality_tier": None, "spatial_spread_score": None, "hull_bbox_ratio": None, "is_clustered": None}
@@ -431,7 +560,12 @@ def _summarize_scene_tiepoint_quality(tie_points_df: Any, grid_rows: int, grid_c
         quality_score = float(np.clip(quality_score, 0.0, 1.0))
         summary["quality_score"] = quality_score
         summary["quality_tier"] = _quality_tier_from_score(quality_score)
-    occupied_cells = _count_occupied_cells(tie_points_df, grid_rows=max(1, int(grid_rows)), grid_cols=max(1, int(grid_cols)))
+    occupied_cells = _count_occupied_cells(
+        tie_points_df,
+        grid_rows=max(1, int(grid_rows)),
+        grid_cols=max(1, int(grid_cols)),
+        extent=stratification_extent,
+    )
     total_cells = max(1, int(max(1, int(grid_rows)) * max(1, int(grid_cols))))
     summary["spatial_spread_score"] = float(np.clip(float(occupied_cells) / float(total_cells), 0.0, 1.0))
     x_vals, y_vals = _extract_finite_xy(tie_points_df, x_col="X_IM", y_col="Y_IM")
@@ -501,10 +635,16 @@ def _decide_polynomial_order(
     min_cells_order2: int = 6,
     grid_rows: int = 4,
     grid_cols: int = 4,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     order_target = 1 if int(preferred_order) <= 1 else 2
     n_gcps = int(len(merged_df)) if merged_df is not None else 0
-    occupied_cells = _count_occupied_cells(merged_df, grid_rows=max(1, int(grid_rows)), grid_cols=max(1, int(grid_cols)))
+    occupied_cells = _count_occupied_cells(
+        merged_df,
+        grid_rows=max(1, int(grid_rows)),
+        grid_cols=max(1, int(grid_cols)),
+        extent=stratification_extent,
+    )
     geom = _assess_gcp_geometry_for_order2(merged_df)
     decision = {
         "preferred_order": order_target,
@@ -614,8 +754,18 @@ def _estimate_translation_phasecorr(
         py = int(peak_idx[0])
         px = int(peak_idx[1])
 
-        shift_y = py if py <= (h // 2) else py - h
-        shift_x = px if px <= (w // 2) else px - w
+        def _parabolic_delta(center: float, before: float, after: float) -> float:
+            denom = float(before) - 2.0 * float(center) + float(after)
+            if abs(denom) < 1e-12:
+                return 0.0
+            return float(np.clip(0.5 * (float(before) - float(after)) / denom, -1.0, 1.0))
+
+        dx_sub = _parabolic_delta(corr_abs[py, px], corr_abs[py, (px - 1) % w], corr_abs[py, (px + 1) % w])
+        dy_sub = _parabolic_delta(corr_abs[py, px], corr_abs[(py - 1) % h, px], corr_abs[(py + 1) % h, px])
+        peak_x = float(px) + float(dx_sub)
+        peak_y = float(py) + float(dy_sub)
+        shift_y = peak_y if peak_y <= (h / 2.0) else peak_y - float(h)
+        shift_x = peak_x if peak_x <= (w / 2.0) else peak_x - float(w)
         out["ok"] = True
         out["shift_x_px"] = float(shift_x)
         out["shift_y_px"] = float(shift_y)
@@ -715,12 +865,12 @@ def _compute_quality_score(df):
         return out if higher_is_better else (1.0 - out)
 
     metric_specs = [
-        ("RELIABILITY", 0.40, True),
-        ("SSIM_IMPRO", 0.20, True),
-        ("SSIM_AFTER", 0.15, True),
-        ("LAST_ERR", 0.15, False),
-        ("ABS_SHIFT", 0.05, False),
-        ("ABS_SHIFT_M", 0.05, False),
+        ("RELIABILITY", 0.45, True),
+        ("SSIM_IMPRO", 0.25, True),
+        ("SSIM_AFTER", 0.20, True),
+        ("LAST_ERR", 0.10, False),
+        ("ABS_SHIFT", 0.01, False),
+        ("ABS_SHIFT_M", 0.01, False),
     ]
     score = np.zeros(len(work), dtype=float)
     weight_sum = 0.0
@@ -742,6 +892,265 @@ def _compute_quality_score(df):
     return work
 
 
+def _tiepoint_model_residuals(df: Any, order: int = 1) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": False, "residuals": None, "valid_mask": None, "order": int(1 if int(order) <= 1 else 2), "error": None}
+    required = ("X_IM", "Y_IM", "X_MAP", "Y_MAP", "X_SHIFT_M", "Y_SHIFT_M")
+    if df is None or not hasattr(df, "columns"):
+        out["error"] = "missing dataframe"
+        return out
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        out["error"] = f"missing columns: {missing}"
+        return out
+    try:
+        x = np.asarray(df["X_IM"], dtype=float).reshape(-1)
+        y = np.asarray(df["Y_IM"], dtype=float).reshape(-1)
+        dst_x = np.asarray(df["X_MAP"], dtype=float).reshape(-1) + np.asarray(df["X_SHIFT_M"], dtype=float).reshape(-1)
+        dst_y = np.asarray(df["Y_MAP"], dtype=float).reshape(-1) + np.asarray(df["Y_SHIFT_M"], dtype=float).reshape(-1)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(dst_x) & np.isfinite(dst_y)
+        if int(np.count_nonzero(valid)) < 4:
+            out["error"] = "insufficient finite tiepoints for model residuals"
+            return out
+        xv = x[valid]
+        yv = y[valid]
+        if int(out["order"]) <= 1:
+            design = np.column_stack([np.ones_like(xv), xv, yv])
+        else:
+            if int(np.count_nonzero(valid)) < 7:
+                out["order"] = 1
+                design = np.column_stack([np.ones_like(xv), xv, yv])
+            else:
+                design = np.column_stack([np.ones_like(xv), xv, yv, xv * yv, xv * xv, yv * yv])
+        if int(np.count_nonzero(valid)) <= int(design.shape[1]):
+            out["error"] = "not enough tiepoints for overdetermined model fit"
+            return out
+        coef_x, *_ = np.linalg.lstsq(design, dst_x[valid], rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y[valid], rcond=None)
+        pred_x = design @ coef_x
+        pred_y = design @ coef_y
+        residual_valid = np.hypot(pred_x - dst_x[valid], pred_y - dst_y[valid])
+        residuals = np.full(len(x), np.nan, dtype=float)
+        residuals[valid] = residual_valid
+        out["ok"] = True
+        out["residuals"] = residuals
+        out["valid_mask"] = valid
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
+def _extract_tiepoint_model_arrays(df: Any) -> Dict[str, Any]:
+    required = ("X_IM", "Y_IM", "X_MAP", "Y_MAP", "X_SHIFT_M", "Y_SHIFT_M")
+    out: Dict[str, Any] = {"ok": False, "error": None}
+    if df is None or not hasattr(df, "columns"):
+        out["error"] = "missing dataframe"
+        return out
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        out["error"] = f"missing columns: {missing}"
+        return out
+    try:
+        x = np.asarray(df["X_IM"], dtype=float).reshape(-1)
+        y = np.asarray(df["Y_IM"], dtype=float).reshape(-1)
+        dst_x = np.asarray(df["X_MAP"], dtype=float).reshape(-1) + np.asarray(df["X_SHIFT_M"], dtype=float).reshape(-1)
+        dst_y = np.asarray(df["Y_MAP"], dtype=float).reshape(-1) + np.asarray(df["Y_SHIFT_M"], dtype=float).reshape(-1)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(dst_x) & np.isfinite(dst_y)
+        if int(np.count_nonzero(valid)) < 4:
+            out["error"] = "insufficient finite tiepoints"
+            return out
+        out.update({"ok": True, "x": x[valid], "y": y[valid], "dst_x": dst_x[valid], "dst_y": dst_y[valid]})
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
+def _poly_design_matrix(x: np.ndarray, y: np.ndarray, order: int) -> np.ndarray:
+    if int(order) <= 1:
+        return np.column_stack([np.ones_like(x), x, y])
+    return np.column_stack([np.ones_like(x), x, y, x * y, x * x, y * y])
+
+
+def _fit_transform_model(kind: str, x: np.ndarray, y: np.ndarray, dst_x: np.ndarray, dst_y: np.ndarray) -> Dict[str, Any]:
+    if kind == "affine":
+        design = _poly_design_matrix(x, y, 1)
+        if x.size <= design.shape[1]:
+            return {"ok": False, "error": "insufficient affine train points"}
+        coef_x, *_ = np.linalg.lstsq(design, dst_x, rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y, rcond=None)
+        return {"ok": True, "kind": kind, "coef_x": coef_x, "coef_y": coef_y, "order": 1}
+    if kind == "order2":
+        design = _poly_design_matrix(x, y, 2)
+        if x.size <= design.shape[1]:
+            return {"ok": False, "error": "insufficient order2 train points"}
+        coef_x, *_ = np.linalg.lstsq(design, dst_x, rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y, rcond=None)
+        return {"ok": True, "kind": kind, "coef_x": coef_x, "coef_y": coef_y, "order": 2}
+    if kind == "tps":
+        try:
+            from scipy.interpolate import Rbf
+
+            return {
+                "ok": True,
+                "kind": kind,
+                "rbf_x": Rbf(x, y, dst_x, function="thin_plate", smooth=0.0),
+                "rbf_y": Rbf(x, y, dst_y, function="thin_plate", smooth=0.0),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": f"unknown model kind {kind}"}
+
+
+def _predict_transform_model(model: Dict[str, Any], x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    kind = str(model.get("kind"))
+    if kind in {"affine", "order2"}:
+        design = _poly_design_matrix(np.asarray(x, dtype=float), np.asarray(y, dtype=float), int(model.get("order", 1)))
+        return design @ np.asarray(model["coef_x"], dtype=float), design @ np.asarray(model["coef_y"], dtype=float)
+    if kind == "tps":
+        return np.asarray(model["rbf_x"](x, y), dtype=float), np.asarray(model["rbf_y"](x, y), dtype=float)
+    raise ValueError(f"Unknown transform model kind: {kind}")
+
+
+def _model_edge_stability_ok(
+    model: Dict[str, Any],
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    dst_x: np.ndarray,
+    dst_y: np.ndarray,
+    factor: float,
+) -> tuple[bool, str]:
+    corners_x = np.asarray([np.nanmin(x), np.nanmin(x), np.nanmax(x), np.nanmax(x)], dtype=float)
+    corners_y = np.asarray([np.nanmin(y), np.nanmax(y), np.nanmin(y), np.nanmax(y)], dtype=float)
+    try:
+        pred_x, pred_y = _predict_transform_model(model, corners_x, corners_y)
+    except Exception as exc:
+        return False, f"edge prediction failed: {exc}"
+    if not (np.all(np.isfinite(pred_x)) and np.all(np.isfinite(pred_y))):
+        return False, "non-finite edge prediction"
+    diag = float(np.hypot(np.nanmax(dst_x) - np.nanmin(dst_x), np.nanmax(dst_y) - np.nanmin(dst_y)))
+    if not np.isfinite(diag) or diag <= 0:
+        diag = 1.0
+    margin = max(100.0, float(factor) * diag)
+    if (
+        np.nanmin(pred_x) < np.nanmin(dst_x) - margin
+        or np.nanmax(pred_x) > np.nanmax(dst_x) + margin
+        or np.nanmin(pred_y) < np.nanmin(dst_y) - margin
+        or np.nanmax(pred_y) > np.nanmax(dst_y) + margin
+    ):
+        return False, "edge prediction outside expanded target extent"
+    return True, "stable"
+
+
+def _select_transform_model_cv(
+    tiepoints_df: Any,
+    *,
+    grid_rows: int = 4,
+    grid_cols: int = 4,
+    stratification_extent: Optional[Sequence[float]] = None,
+    folds: int = 5,
+    repeats: int = 3,
+    holdout_fraction: float = 0.25,
+    seed: int = 1337,
+    min_tps_gcps: int = 20,
+    min_tps_cells: int = 8,
+    tps_min_p90_improvement_m: float = 1.0,
+    edge_instability_factor: float = 2.5,
+) -> Dict[str, Any]:
+    arrays = _extract_tiepoint_model_arrays(tiepoints_df)
+    if not arrays.get("ok", False):
+        return {"ok": False, "model": "rule_based", "order_used": 1, "use_tps": False, "reason": arrays.get("error")}
+    x = np.asarray(arrays["x"], dtype=float)
+    y = np.asarray(arrays["y"], dtype=float)
+    dst_x = np.asarray(arrays["dst_x"], dtype=float)
+    dst_y = np.asarray(arrays["dst_y"], dtype=float)
+    n = int(x.size)
+    occupied = _count_occupied_cells(tiepoints_df, grid_rows=max(1, int(grid_rows)), grid_cols=max(1, int(grid_cols)), extent=stratification_extent)
+    candidates = ["affine"]
+    if n >= 8:
+        candidates.append("order2")
+    if n >= int(min_tps_gcps) and occupied >= int(min_tps_cells):
+        candidates.append("tps")
+    rng = np.random.default_rng(int(seed))
+    holdout_n = int(max(3, round(float(np.clip(holdout_fraction, 0.05, 0.5)) * n)))
+    holdout_n = min(max(1, holdout_n), max(1, n - 4))
+    split_count = max(1, int(folds)) * max(1, int(repeats))
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for kind in candidates:
+        residuals: list[float] = []
+        errors: list[str] = []
+        for _split in range(split_count):
+            perm = rng.permutation(n)
+            test_idx = perm[:holdout_n]
+            train_idx = perm[holdout_n:]
+            min_train = 4 if kind == "affine" else (8 if kind == "order2" else max(8, int(min_tps_gcps // 2)))
+            if int(train_idx.size) < min_train:
+                errors.append("insufficient train points")
+                continue
+            fit = _fit_transform_model(kind, x[train_idx], y[train_idx], dst_x[train_idx], dst_y[train_idx])
+            if not fit.get("ok", False):
+                errors.append(str(fit.get("error", "fit failed")))
+                continue
+            try:
+                pred_x, pred_y = _predict_transform_model(fit, x[test_idx], y[test_idx])
+                res = np.hypot(pred_x - dst_x[test_idx], pred_y - dst_y[test_idx])
+                residuals.extend([float(v) for v in res if np.isfinite(v)])
+            except Exception as exc:
+                errors.append(str(exc))
+        full_fit = _fit_transform_model(kind, x, y, dst_x, dst_y)
+        stable, stable_reason = (
+            _model_edge_stability_ok(full_fit, x=x, y=y, dst_x=dst_x, dst_y=dst_y, factor=float(edge_instability_factor))
+            if full_fit.get("ok", False)
+            else (False, str(full_fit.get("error", "full fit failed")))
+        )
+        if residuals:
+            arr = np.asarray(residuals, dtype=float)
+            metrics[kind] = {
+                "ok": bool(stable),
+                "median_residual_m": float(np.median(arr)),
+                "p90_residual_m": float(np.percentile(arr, 90)),
+                "n_residuals": int(arr.size),
+                "edge_stable": bool(stable),
+                "edge_reason": stable_reason,
+                "errors": errors[:5],
+            }
+        else:
+            metrics[kind] = {
+                "ok": False,
+                "median_residual_m": None,
+                "p90_residual_m": None,
+                "n_residuals": 0,
+                "edge_stable": bool(stable),
+                "edge_reason": stable_reason,
+                "errors": errors[:5] or ["no held-out residuals"],
+            }
+    valid_metrics = {k: v for k, v in metrics.items() if v.get("ok") and v.get("p90_residual_m") is not None}
+    if not valid_metrics:
+        return {"ok": False, "model": "rule_based", "order_used": 1, "use_tps": False, "reason": "no stable CV model", "cv_metrics": metrics, "n_gcps": n, "occupied_cells": int(occupied)}
+    non_tps = {k: v for k, v in valid_metrics.items() if k != "tps"}
+    best_non_tps_name = min(non_tps, key=lambda k: float(non_tps[k]["p90_residual_m"])) if non_tps else None
+    best_name = min(valid_metrics, key=lambda k: float(valid_metrics[k]["p90_residual_m"]))
+    if "tps" in valid_metrics and best_non_tps_name is not None:
+        tps_p90 = float(valid_metrics["tps"]["p90_residual_m"])
+        non_p90 = float(valid_metrics[best_non_tps_name]["p90_residual_m"])
+        if (non_p90 - tps_p90) >= float(tps_min_p90_improvement_m):
+            best_name = "tps"
+        elif best_name == "tps":
+            best_name = best_non_tps_name
+    model_label = {"affine": "affine", "order2": "polynomial_order2", "tps": "tps"}[best_name]
+    return {
+        "ok": True,
+        "model": model_label,
+        "order_used": 1 if best_name == "affine" else 2,
+        "use_tps": bool(best_name == "tps"),
+        "reason": f"selected {model_label} by held-out P90 residual",
+        "cv_metrics": metrics,
+        "n_gcps": n,
+        "occupied_cells": int(occupied),
+    }
+
+
 def _apply_spatial_stratification(
     df,
     grid_rows: int,
@@ -749,6 +1158,7 @@ def _apply_spatial_stratification(
     max_points_per_cell: int,
     min_points_required: int,
     min_distance: float = 60.0,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     import pandas as pd
 
@@ -781,8 +1191,14 @@ def _apply_spatial_stratification(
     gy = max(1, int(grid_rows))
     x_valid = x[valid]
     y_valid = y[valid]
-    x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
-    y_min, y_max = float(np.min(y_valid)), float(np.max(y_valid))
+    if stratification_extent is not None and len(stratification_extent) >= 4:
+        x_min = float(min(float(stratification_extent[0]), float(stratification_extent[2])))
+        x_max = float(max(float(stratification_extent[0]), float(stratification_extent[2])))
+        y_min = float(min(float(stratification_extent[1]), float(stratification_extent[3])))
+        y_max = float(max(float(stratification_extent[1]), float(stratification_extent[3])))
+    else:
+        x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
+        y_min, y_max = float(np.min(y_valid)), float(np.max(y_valid))
     x_span = max(1e-6, x_max - x_min)
     y_span = max(1e-6, y_max - y_min)
     cell_x = np.floor((x - x_min) / x_span * gx).astype(int)
@@ -860,7 +1276,7 @@ def _apply_spatial_stratification(
         selected = selected.drop(columns=["_STRAT_CELL"])
     result["quota_used"] = quota
     result["selected_df"] = selected
-    result["occupied_cells_selected"] = _count_occupied_cells(selected, gy, gx)
+    result["occupied_cells_selected"] = _count_occupied_cells(selected, gy, gx, extent=stratification_extent)
     return result
 
 
@@ -877,6 +1293,7 @@ def _merge_tiepoints(
     max_points_per_cell: int = 3,
     min_points_required: int = MIN_TIE_POINTS_FOR_POLYNOMIAL,
     spatial_fallback_min_distance: float = 60.0,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     import pandas as pd
 
@@ -890,6 +1307,7 @@ def _merge_tiepoints(
         "n_after_residual_trim": 0,
         "reliability_threshold_used": None,
         "residual_threshold_m": None,
+        "residual_basis": None,
         "error_message": None,
         "stage_counts": {},
         "fallback_notes": [],
@@ -902,6 +1320,8 @@ def _merge_tiepoints(
         return result
     try:
         combined_df = pd.concat(tiepoint_dfs, ignore_index=True)
+        result["n_total_before_merge"] = int(len(combined_df))
+        result["stage_counts"]["01_concat_sanitize"] = int(len(combined_df))
         if len(combined_df) == 0:
             result["error_message"] = "No tiepoints after concatenation"
             return result
@@ -913,12 +1333,18 @@ def _merge_tiepoints(
             combined_df = combined_df[combined_df["RELIABILITY"].notna() & (combined_df["RELIABILITY"] > -9990)]
             if len(combined_df) > 0 and float(combined_df["RELIABILITY"].max()) <= 1.0:
                 combined_df["RELIABILITY"] = combined_df["RELIABILITY"] * 100.0
+        result["stage_counts"]["01_concat_sanitize"] = int(len(combined_df))
+        if len(combined_df) == 0:
+            result["error_message"] = "All tie points removed during sanitation"
+            return result
         for col in ("L1_OUTLIER", "L2_OUTLIER", "L3_OUTLIER"):
             if col in combined_df.columns:
                 outlier_mask = combined_df[col].astype("boolean").fillna(False).to_numpy(dtype=bool)
                 combined_df = combined_df[~outlier_mask]
+        result["n_after_outlier_filter"] = int(len(combined_df))
+        result["stage_counts"]["02_remove_outliers"] = int(len(combined_df))
         if len(combined_df) == 0:
-            result["error_message"] = "All tie points removed by sanitation/outlier filtering"
+            result["error_message"] = "All tie points removed by outlier filter"
             return result
         combined_df = combined_df.copy()
         combined_df["CONSENSUS_GROUP_ID"] = _build_consensus_group_ids(combined_df, rounding_px=float(max(0.1, consensus_group_rounding_px)))
@@ -930,10 +1356,16 @@ def _merge_tiepoints(
             if allow_single_band_fallback:
                 consensus_df = combined_df
                 result["consensus_fallback_used"] = True
+                result["fallback_notes"].append(
+                    f"consensus fallback enabled: no points met min_band_support={min_support}"
+                )
             else:
                 result["error_message"] = f"No tie points meet min_band_support={min_support} and fallback is disabled"
                 return result
+        result["stage_counts"]["03_consensus_filter"] = int(len(consensus_df))
         scored_df = _compute_quality_score(consensus_df)
+        result["stage_counts"]["04_quality_score"] = int(len(scored_df))
+        result["visualization_df"] = scored_df.copy()
         strat = _apply_spatial_stratification(
             scored_df,
             grid_rows=max(1, int(grid_rows)),
@@ -941,12 +1373,15 @@ def _merge_tiepoints(
             max_points_per_cell=max(1, int(max_points_per_cell)),
             min_points_required=max(1, int(min_points_required)),
             min_distance=float(spatial_fallback_min_distance),
+            stratification_extent=stratification_extent,
         )
         selected_df = strat.get("selected_df", scored_df)
         result["fallback_notes"].extend(strat.get("fallback_notes", []))
         result["occupied_cells_selected"] = int(strat.get("occupied_cells_selected", 0))
         result["occupied_cells_total"] = int(strat.get("occupied_cells_total", 0))
+        result["stage_counts"]["05_spatial_stratification"] = int(len(selected_df))
         selected_df = selected_df.sort_values("QUALITY_SCORE", ascending=False).drop_duplicates(subset="CONSENSUS_GROUP_ID", keep="first")
+        result["stage_counts"]["06_select_best_per_group_cell"] = int(len(selected_df))
         if "RELIABILITY" in selected_df.columns:
             thresholds = [float(min_reliability), 65.0, 55.0, 45.0, 30.0, 20.0]
             for threshold in thresholds:
@@ -958,18 +1393,33 @@ def _merge_tiepoints(
                 if threshold == thresholds[-1] and len(filtered) > 0:
                     selected_df = filtered
                     result["reliability_threshold_used"] = threshold
+                    result["fallback_notes"].append(
+                        f"reliability threshold relaxed to {threshold:.1f} due to low retained points"
+                    )
         result["n_after_reliability_filter"] = int(len(selected_df))
         result["stage_counts"]["07_final_reliability_filter"] = int(len(selected_df))
 
         if trim_by_residual and len(selected_df) > max(3, int(min_points_required)):
             residuals = None
-            if "X_SHIFT_M" in selected_df.columns and "Y_SHIFT_M" in selected_df.columns:
+            model_res = _tiepoint_model_residuals(selected_df, order=1)
+            if model_res.get("ok", False):
+                residuals = np.asarray(model_res.get("residuals"), dtype=float)
+                result["residual_basis"] = "model_residual_affine_m"
+            elif "X_SHIFT_M" in selected_df.columns and "Y_SHIFT_M" in selected_df.columns:
                 residuals = np.sqrt(
                     np.asarray(selected_df["X_SHIFT_M"], dtype=float) ** 2
                     + np.asarray(selected_df["Y_SHIFT_M"], dtype=float) ** 2
                 )
+                result["residual_basis"] = "shift_magnitude_fallback_m"
+                result["fallback_notes"].append(
+                    f"model residual trim unavailable; using shift magnitude ({model_res.get('error')})"
+                )
             elif "ABS_SHIFT_M" in selected_df.columns:
                 residuals = np.asarray(selected_df["ABS_SHIFT_M"], dtype=float)
+                result["residual_basis"] = "abs_shift_fallback_m"
+                result["fallback_notes"].append(
+                    f"model residual trim unavailable; using ABS_SHIFT_M ({model_res.get('error')})"
+                )
 
             if residuals is not None:
                 finite_mask = np.isfinite(residuals)
@@ -993,13 +1443,9 @@ def _merge_tiepoints(
                         selected_df = trimmed_df
                 if "_RESIDUAL_M" in selected_df.columns:
                     selected_df = selected_df.drop(columns=["_RESIDUAL_M"])
-                result["stage_counts"]["08_residual_trim"] = int(len(selected_df))
-            else:
-                result["stage_counts"]["08_residual_trim"] = int(len(selected_df))
-        else:
-            result["stage_counts"]["08_residual_trim"] = int(len(selected_df))
 
         result["n_after_residual_trim"] = int(len(selected_df))
+        result["stage_counts"]["08_optional_residual_trim"] = int(len(selected_df))
         result["merged_df"] = selected_df
         result["success"] = len(selected_df) >= int(max(1, min_points_required))
         if not result["success"]:
@@ -1043,6 +1489,7 @@ __all__ = [
     "_build_consensus_group_ids",
     "_build_gcps_from_tiepoints",
     "_compute_quality_score",
+    "_compute_srf_weights",
     "_compute_tiepoint_residuals",
     "_count_occupied_cells",
     "_decide_polynomial_order",
@@ -1058,6 +1505,8 @@ __all__ = [
     "_resolve_sensor_matcher_profile",
     "_run_postwarp_phasecorr_qa",
     "_safe_optional_float",
+    "_select_transform_model_cv",
     "_summarize_scene_tiepoint_quality",
+    "_tiepoint_model_residuals",
     "_validate_coreg_hybrid",
 ]

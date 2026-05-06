@@ -13,11 +13,19 @@ import sys
 import argparse
 import logging
 import json
+from copy import deepcopy
 from typing import Optional
 
 from hypercoreg._version import __version__
-from hypercoreg.config import DEFAULT_CONFIG
+from hypercoreg.config import (
+    DEFAULT_CONFIG,
+    PRESET_CONFIGS,
+    S2_L2A_OUTPUT_BANDS,
+    S2_L2A_REFERENCE_STACK_BANDS,
+    apply_cpu_oversubscription_guard,
+)
 from hypercoreg.logging_config import setup_logging, log_section_header
+from hypercoreg.result_status import describe_result_failure
 
 
 def _parse_int_pair(value: str, field_name: str) -> tuple[int, int]:
@@ -94,6 +102,12 @@ For more information, visit: https://github.com/AntoniogamezG/HyperCoreg-An-opti
         action="version",
         version=f"%(prog)s {__version__}"
     )
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_CONFIGS.keys()),
+        default="default",
+        help="Named runtime preset merged before explicit flags (default: default).",
+    )
 
     # Create subparsers for modes
     subparsers = parser.add_subparsers(
@@ -137,6 +151,13 @@ For more information, visit: https://github.com/AntoniogamezG/HyperCoreg-An-opti
 def _add_common_arguments(parser: argparse.ArgumentParser):
     """Add common arguments to a subparser."""
 
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_CONFIGS.keys()),
+        default=argparse.SUPPRESS,
+        help="Named runtime preset merged before explicit flags (default: default).",
+    )
+
     # Required output
     parser.add_argument(
         "-o", "--output",
@@ -144,43 +165,78 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         type=str,
         help="Output directory for coregistered products"
     )
+    parser.add_argument(
+        "--batch-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Worker processes for batch mode (default: {DEFAULT_CONFIG.get('batch_workers', 1)})",
+    )
 
     # Sentinel-2 search options
     s2_group = parser.add_argument_group("Sentinel-2 Reference Options")
     s2_group.add_argument(
         "--days-window",
         type=int,
-        default=DEFAULT_CONFIG['days_window'],
+        default=None,
         metavar="DAYS",
         help=f"Temporal search window for S2 reference (default: {DEFAULT_CONFIG['days_window']})"
     )
     s2_group.add_argument(
         "--min-overlap",
         type=float,
-        default=DEFAULT_CONFIG['min_overlap'],
+        default=None,
         metavar="FRAC",
         help=f"Minimum spatial overlap 0-1 (default: {DEFAULT_CONFIG['min_overlap']})"
     )
     s2_group.add_argument(
         "--max-cloud",
         type=float,
-        default=DEFAULT_CONFIG['max_cloud'],
+        default=None,
         metavar="PCT",
         help=f"Maximum S2 cloud cover %% (default: {DEFAULT_CONFIG['max_cloud']})"
     )
     s2_group.add_argument(
         "--max-input-cloud",
         type=float,
-        default=DEFAULT_CONFIG['max_input_cloud_cover'],
+        default=None,
         metavar="PCT",
         help=f"Skip input if cloud > this %% (default: {DEFAULT_CONFIG['max_input_cloud_cover']})"
     )
     s2_group.add_argument(
         "--local-s2-stack",
         type=str,
-        default=DEFAULT_CONFIG.get('local_s2_stack_path'),
+        default=None,
         metavar="PATH",
-        help="Use a local prebuilt Sentinel-2 stack and skip CDSE search/download."
+        help=(
+            "Use a local prebuilt Sentinel-2 L2A stack and skip CDSE search/download. "
+            "Expected reflectance band order: "
+            f"{', '.join(S2_L2A_OUTPUT_BANDS)}; optional trailing ancillary bands are also accepted: "
+            f"{', '.join(S2_L2A_REFERENCE_STACK_BANDS[len(S2_L2A_OUTPUT_BANDS):])}."
+        )
+    )
+    s2_group.add_argument(
+        "--s2-cache-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Persistent directory for cached Sentinel-2 reference stacks."
+    )
+    s2_group.add_argument(
+        "--no-s2-stack-cache",
+        action="store_false",
+        dest="s2_stack_cache",
+        default=None,
+        help="Disable persistent Sentinel-2 reference stack caching."
+    )
+    s2_group.add_argument(
+        "--s2-stack-mode",
+        choices=["materialized", "vrt"],
+        default=None,
+        help=(
+            "Reference stack mode: materialized GeoTIFF for compatibility or VRT where accepted "
+            f"(default: {DEFAULT_CONFIG['s2_stack_mode']})"
+        ),
     )
 
     # Coregistration options
@@ -188,28 +244,28 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--residual-threshold",
         type=float,
-        default=DEFAULT_CONFIG['residual_threshold'],
+        default=None,
         metavar="M",
         help=f"Residual threshold in meters (default: {DEFAULT_CONFIG['residual_threshold']})"
     )
     coreg_group.add_argument(
         "--min-tie-points",
         type=int,
-        default=DEFAULT_CONFIG['min_tie_points'],
+        default=None,
         metavar="N",
         help=f"Minimum tie points required (default: {DEFAULT_CONFIG['min_tie_points']})"
     )
     coreg_group.add_argument(
         "--max-s2-candidates",
         type=int,
-        default=DEFAULT_CONFIG['max_s2_candidates'],
+        default=None,
         metavar="N",
         help=f"Max S2 candidates to evaluate (default: {DEFAULT_CONFIG['max_s2_candidates']})"
     )
     coreg_group.add_argument(
         "--mad-factor",
         type=float,
-        default=DEFAULT_CONFIG['residual_mad_factor'],
+        default=None,
         metavar="F",
         help=f"MAD factor for outlier removal (default: {DEFAULT_CONFIG['residual_mad_factor']})"
     )
@@ -217,13 +273,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--s2-band",
         type=int,
         choices=[2, 3, 4, 8],
-        default=DEFAULT_CONFIG['s2_ref_band'],
+        default=None,
         help=f"S2 reference band: 2=Blue, 3=Green, 4=Red, 8=NIR (default: {DEFAULT_CONFIG['s2_ref_band']})"
     )
     coreg_group.add_argument(
         "--prefer-fixed-band-pairs",
         action="store_true",
-        default=DEFAULT_CONFIG['prefer_fixed_band_pairs'],
+        default=None,
         help=(
             "Prefer curated fixed PRISMA<->S2 band mappings before wavelength-window averaging "
             f"(default: {DEFAULT_CONFIG['prefer_fixed_band_pairs']})"
@@ -238,7 +294,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--bandpair-window-nm",
         type=float,
-        default=DEFAULT_CONFIG['bandpair_wavelength_window_nm'],
+        default=None,
         metavar="NM",
         help=(
             "Wavelength averaging window (nm) for non-fixed band matching fallback "
@@ -246,9 +302,35 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         ),
     )
     coreg_group.add_argument(
+        "--synthetic-s2-band-mode",
+        choices=["fixed_pair", "srf_weighted"],
+        default=None,
+        help=(
+            "Hyperspectral synthesis mode for S2-like local matching bands "
+            f"(default: {DEFAULT_CONFIG['synthetic_s2_band_mode']})"
+        ),
+    )
+    coreg_group.add_argument(
+        "--s2-band-subset-by-branch",
+        type=str,
+        default=None,
+        metavar="JSON",
+        help=(
+            "JSON branch-to-S2-band map for local tiepoint extraction, e.g. "
+            "'{\"VNIR\":[\"B04\",\"B08\"],\"SWIR\":[\"B11\",\"B12\"]}'."
+        ),
+    )
+    coreg_group.add_argument(
+        "--no-local-tiepoint-early-stop",
+        action="store_false",
+        dest="local_tiepoint_early_stop",
+        default=None,
+        help="Disable early stopping after enough high-quality local tiepoints are collected.",
+    )
+    coreg_group.add_argument(
         "--min-band-support",
         type=int,
-        default=DEFAULT_CONFIG['min_band_support'],
+        default=None,
         metavar="N",
         help=(
             "Minimum distinct band matches required for consensus-preferred tie points "
@@ -258,7 +340,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--allow-single-band-fallback",
         action="store_true",
-        default=DEFAULT_CONFIG['allow_single_band_fallback'],
+        default=None,
         help=(
             "Allow single-band points when consensus filtering yields too few candidates "
             f"(default: {DEFAULT_CONFIG['allow_single_band_fallback']})"
@@ -273,7 +355,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--consensus-group-rounding-px",
         type=float,
-        default=DEFAULT_CONFIG['consensus_group_rounding_px'],
+        default=None,
         metavar="PX",
         help=(
             "Image-space rounding (pixels) for deterministic consensus grouping when POINT_ID is absent "
@@ -283,7 +365,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--strat-grid-rows",
         type=int,
-        default=DEFAULT_CONFIG['spatial_stratification_grid_rows'],
+        default=None,
         metavar="N",
         help=(
             "Rows in image-space stratification grid "
@@ -293,7 +375,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--strat-grid-cols",
         type=int,
-        default=DEFAULT_CONFIG['spatial_stratification_grid_cols'],
+        default=None,
         metavar="N",
         help=(
             "Columns in image-space stratification grid "
@@ -303,7 +385,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--max-points-per-cell",
         type=int,
-        default=DEFAULT_CONFIG['max_points_per_cell'],
+        default=None,
         metavar="N",
         help=(
             "Maximum selected tie points per spatial grid cell "
@@ -314,7 +396,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--preferred-polynomial-order",
         type=int,
         choices=[1, 2],
-        default=DEFAULT_CONFIG['preferred_polynomial_order'],
+        default=None,
         help=(
             "Preferred polynomial warp order (auto-downgrade may still apply) "
             f"(default: {DEFAULT_CONFIG['preferred_polynomial_order']})"
@@ -323,7 +405,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--auto-downgrade-polynomial-order",
         action="store_true",
-        default=DEFAULT_CONFIG['auto_downgrade_polynomial_order'],
+        default=None,
         help=(
             "Auto-downgrade polynomial order when order-2 geometry is weak "
             f"(default: {DEFAULT_CONFIG['auto_downgrade_polynomial_order']})"
@@ -338,14 +420,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--min-gcps-order2",
         type=int,
-        default=DEFAULT_CONFIG['min_gcps_order2'],
+        default=None,
         metavar="N",
         help=f"Minimum GCPs to keep order-2 warp (default: {DEFAULT_CONFIG['min_gcps_order2']})",
     )
     coreg_group.add_argument(
         "--min-cells-order2",
         type=int,
-        default=DEFAULT_CONFIG['min_cells_order2'],
+        default=None,
         metavar="N",
         help=(
             "Minimum occupied stratification cells to keep order-2 warp "
@@ -355,14 +437,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--local-grid-res",
         type=int,
-        default=DEFAULT_CONFIG['local_coreg_grid_res'],
+        default=None,
         metavar="M",
         help=f"COREG_LOCAL grid resolution in meters (default: {DEFAULT_CONFIG['local_coreg_grid_res']})",
     )
     coreg_group.add_argument(
         "--local-window-size",
         type=lambda v: _parse_int_pair(v, "--local-window-size"),
-        default=tuple(DEFAULT_CONFIG['local_coreg_window_size']),
+        default=None,
         metavar="W,H",
         help=(
             "COREG_LOCAL window size in pixels as 'W,H' "
@@ -372,7 +454,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--local-tiep-filter-level",
         type=int,
-        default=DEFAULT_CONFIG['local_coreg_tieP_filter_level'],
+        default=None,
         metavar="N",
         help=(
             "COREG_LOCAL tie-point filtering level "
@@ -382,7 +464,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--local-max-iter",
         type=int,
-        default=DEFAULT_CONFIG['local_coreg_max_iter'],
+        default=None,
         metavar="N",
         help="Optional COREG_LOCAL max_iter override (applied only when supported by installed AROSICS)",
     )
@@ -419,7 +501,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--postwarp-phasecorr-check",
         action="store_true",
-        default=DEFAULT_CONFIG['postwarp_phasecorr_check'],
+        default=None,
         help=(
             "Run optional post-warp phase-correlation QA on final HS candidate "
             f"(default: {DEFAULT_CONFIG['postwarp_phasecorr_check']})"
@@ -434,7 +516,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--postwarp-phasecorr-warn-threshold-px",
         type=float,
-        default=DEFAULT_CONFIG['postwarp_phasecorr_warn_threshold_px'],
+        default=None,
         metavar="PX",
         help=(
             "Warning threshold in pixels for post-warp phase-correlation QA "
@@ -444,7 +526,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--postwarp-phasecorr-reject-threshold-px",
         type=float,
-        default=DEFAULT_CONFIG['postwarp_phasecorr_reject_threshold_px'],
+        default=None,
         metavar="PX",
         help=(
             "Rejection threshold in pixels for post-warp phase-correlation QA "
@@ -454,7 +536,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--postwarp-phasecorr-reject-bad",
         action="store_true",
-        default=DEFAULT_CONFIG['postwarp_phasecorr_reject_bad'],
+        default=None,
         help=(
             "Reject candidate outputs that exceed post-warp phase-correlation rejection threshold "
             f"(default: {DEFAULT_CONFIG['postwarp_phasecorr_reject_bad']})"
@@ -469,7 +551,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--postwarp-phasecorr-max-dim",
         type=int,
-        default=DEFAULT_CONFIG['postwarp_phasecorr_max_dim'],
+        default=None,
         metavar="N",
         help=(
             "Maximum dimension used in post-warp phase-correlation QA downsampling "
@@ -479,7 +561,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--use-geolocation-mesh-affine",
         action="store_true",
-        default=DEFAULT_CONFIG['use_geolocation_mesh_affine'],
+        default=None,
         help=(
             "Use optional subsampled PRISMA geolocation mesh for affine estimation "
             f"(default: {DEFAULT_CONFIG['use_geolocation_mesh_affine']})"
@@ -494,7 +576,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     coreg_group.add_argument(
         "--geolocation-mesh-stride",
         type=int,
-        default=DEFAULT_CONFIG['geolocation_mesh_stride'],
+        default=None,
         metavar="N",
         help=(
             "Sampling stride (pixels) for optional geolocation-mesh affine estimation "
@@ -507,14 +589,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     quality_group.add_argument(
         "--min-accuracy",
         type=float,
-        default=DEFAULT_CONFIG['min_accuracy'],
+        default=None,
         metavar="PCT",
         help=f"Minimum accuracy %% (default: {DEFAULT_CONFIG['min_accuracy']})"
     )
     quality_group.add_argument(
         "--max-displacement",
         type=float,
-        default=DEFAULT_CONFIG['max_displacement'],
+        default=None,
         metavar="M",
         help=f"Maximum displacement in meters (default: {DEFAULT_CONFIG['max_displacement']})"
     )
@@ -524,12 +606,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--save-pre",
         action="store_true",
+        default=None,
         help="Save pre-coregistration image"
     )
     output_group.add_argument(
         "--save-pan",
         action="store_true",
-        default=DEFAULT_CONFIG["save_pan"],
+        default=None,
         help="Save panchromatic band (PRISMA only, default: False)"
     )
     output_group.add_argument(
@@ -541,7 +624,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--save-quality-mask",
         action="store_true",
-        default=DEFAULT_CONFIG["save_quality_mask"],
+        default=None,
         help="Save ancillary quality outputs (PRISMA masks + EnMAP QL auxiliaries, default: False)"
     )
     output_group.add_argument(
@@ -554,9 +637,9 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--pan-gcp-mode",
         type=str,
         choices=["map_inverse", "scaled_image"],
-        default=DEFAULT_CONFIG['pan_gcp_mode'],
+        default=None,
         help=(
-            "PAN GCP construction mode: map_inverse (legacy inverse-transform from map coords) or "
+            "PAN GCP construction mode: map_inverse (inverse transform from map coords) or "
             f"scaled_image (X_IM/Y_IM scaled to PAN grid) (default: {DEFAULT_CONFIG['pan_gcp_mode']})"
         ),
     )
@@ -564,7 +647,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--pan-map-dxdy-source",
         type=str,
         choices=["auto", "xy_shift_m", "zero"],
-        default=DEFAULT_CONFIG['pan_map_dxdy_source'],
+        default=None,
         help=(
             "Source of map-space dx/dy for PAN scaled-image GCPs: auto, xy_shift_m, or zero "
             f"(default: {DEFAULT_CONFIG['pan_map_dxdy_source']})"
@@ -573,7 +656,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--pan-target-aligned-pixels",
         action="store_true",
-        default=DEFAULT_CONFIG['pan_target_aligned_pixels'],
+        default=None,
         help=(
             "Use gdalwarp target-aligned pixels (-tap) for PAN warp "
             f"(default: {DEFAULT_CONFIG['pan_target_aligned_pixels']})"
@@ -588,7 +671,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--pan-residual-check",
         action="store_true",
-        default=DEFAULT_CONFIG['pan_residual_check'],
+        default=None,
         help=(
             "Run optional post-warp PAN residual translation estimate (phase correlation) "
             f"(default: {DEFAULT_CONFIG['pan_residual_check']})"
@@ -603,7 +686,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--pan-residual-threshold-px",
         type=float,
-        default=DEFAULT_CONFIG['pan_residual_threshold_px'],
+        default=None,
         metavar="PX",
         help=(
             "Warn when PAN residual shift estimate exceeds this pixel threshold "
@@ -613,7 +696,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--pan-residual-max-dim",
         type=int,
-        default=DEFAULT_CONFIG['pan_residual_max_dim'],
+        default=None,
         metavar="N",
         help=(
             "Max display dimension used by PAN residual check phase-correlation "
@@ -623,7 +706,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--gen-tiepoint-pngs",
         action="store_true",
-        default=DEFAULT_CONFIG['gen_tiepoint_pngs'],
+        default=None,
         help=f"Generate tie point visualizations (default: {DEFAULT_CONFIG['gen_tiepoint_pngs']})"
     )
     output_group.add_argument(
@@ -635,12 +718,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--keep-temp",
         action="store_true",
+        default=None,
         help="Keep temporary files"
     )
     output_group.add_argument(
         "--remove-overlap-bands",
         action="store_true",
-        default=DEFAULT_CONFIG['remove_detector_overlap_bands'],
+        default=None,
         help="Remove VNIR/SWIR overlap bands (keeps SWIR in overlap region)"
     )
     output_group.add_argument(
@@ -653,7 +737,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--normalization-mode",
         type=str,
         choices=["none", "minmax", "percentile"],
-        default=DEFAULT_CONFIG['normalization_mode'],
+        default=None,
         help=(
             "Normalization mode: none (disabled), minmax (per-band min/max), "
             f"percentile (robust per-band percentile scaling) (default: {DEFAULT_CONFIG['normalization_mode']})"
@@ -662,7 +746,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--build-overviews",
         action="store_true",
-        default=DEFAULT_CONFIG['build_overviews'],
+        default=None,
         help="Build internal GeoTIFF overviews (2,4,8,16,32) for faster ENVI/QGIS display"
     )
     output_group.add_argument(
@@ -674,7 +758,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--strict-metadata",
         action="store_true",
-        default=DEFAULT_CONFIG['strict_metadata'],
+        default=None,
         help="Fail scene when output metadata writing is incomplete (default: True)"
     )
     output_group.add_argument(
@@ -687,7 +771,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--metadata-extension",
         type=str,
         choices=["none", "stats", "full"],
-        default=DEFAULT_CONFIG['metadata_extension_level'],
+        default=None,
         help=(
             "Metadata sidecar extension level: none (disabled), stats (PAM statistics), "
             "full (statistics + histogram)"
@@ -697,7 +781,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--metadata-stats-mode",
         type=str,
         choices=["exact", "approx", "none"],
-        default=DEFAULT_CONFIG['metadata_stats_mode'],
+        default=None,
         help=(
             "Metadata statistics mode: exact (full scan), approx (deterministic sampled windows), "
             "none (skip STATISTICS_* fields)"
@@ -707,7 +791,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         "--enmap-metadata-stats-mode",
         type=str,
         choices=["exact", "approx", "none"],
-        default=DEFAULT_CONFIG['enmap_metadata_stats_mode'],
+        default=None,
         help=(
             "EnMAP-only metadata statistics mode override. Defaults to none for faster EnMAP output generation; "
             "PRISMA still uses --metadata-stats-mode."
@@ -716,7 +800,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--metadata-stats-sample-windows",
         type=int,
-        default=DEFAULT_CONFIG['metadata_stats_sample_windows'],
+        default=None,
         metavar="N",
         help=(
             "Target sampled windows per band when metadata-stats-mode=approx "
@@ -726,28 +810,28 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
     output_group.add_argument(
         "--metadata-stats-seed",
         type=int,
-        default=DEFAULT_CONFIG['metadata_stats_seed'],
+        default=None,
         metavar="N",
         help=f"Deterministic seed for approximate metadata stats (default: {DEFAULT_CONFIG['metadata_stats_seed']})",
     )
     output_group.add_argument(
         "--metadata-histogram-buckets",
         type=int,
-        default=DEFAULT_CONFIG['metadata_histogram_buckets'],
+        default=None,
         metavar="N",
         help=f"Histogram bucket count for full metadata extension (default: {DEFAULT_CONFIG['metadata_histogram_buckets']})",
     )
     output_group.add_argument(
         "--metadata-label-precision",
         type=int,
-        default=DEFAULT_CONFIG['metadata_label_precision'],
+        default=None,
         metavar="N",
         help=f"Decimal precision for wavelength labels (default: {DEFAULT_CONFIG['metadata_label_precision']})",
     )
     output_group.add_argument(
         "--validation-max-windows",
         type=int,
-        default=DEFAULT_CONFIG['validation_max_windows'],
+        default=None,
         metavar="N",
         help=(
             "Optional cap on scanned windows for final validation (0 = full scan; "
@@ -766,34 +850,6 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Suppress output (WARNING level only)"
     )
-    general_group.add_argument(
-        "--use-pipeline-native",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=(
-            "Enable pipeline-native backend path during migration rollout. "
-            "When omitted, HYPERCOREG_USE_PIPELINE_NATIVE may supply the value."
-        ),
-    )
-    general_group.add_argument(
-        "--disable-legacy-fallback",
-        action="store_false",
-        dest="enable_legacy_fallback",
-        default=argparse.SUPPRESS,
-        help=(
-            "Disable fallback to legacy backend when native backend fails. "
-            "When omitted, HYPERCOREG_ENABLE_LEGACY_FALLBACK may supply the value."
-        ),
-    )
-    general_group.add_argument(
-        "--assert-legacy-parity",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=(
-            "Run optional parity shadow-check against legacy backend for selected output fields. "
-            "When omitted, HYPERCOREG_ASSERT_LEGACY_PARITY may supply the value."
-        ),
-    )
 
 
 def build_config_from_args(args: argparse.Namespace) -> dict:
@@ -806,6 +862,16 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
     Returns:
         dict: Configuration dictionary for coregistration
     """
+    preset_name = str(getattr(args, "preset", "default") or "default").strip().lower()
+    base_config = deepcopy(DEFAULT_CONFIG)
+    base_config.update(deepcopy(PRESET_CONFIGS.get(preset_name, {})))
+
+    def _arg_value(attr_name: str, config_key: Optional[str] = None):
+        value = getattr(args, attr_name, None)
+        if value is None:
+            return base_config[config_key or attr_name]
+        return value
+
     global_coreg_profiles_json = _parse_json_dict(
         getattr(args, "global_coreg_profiles_json", None),
         "--global-coreg-profiles-json",
@@ -818,7 +884,11 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         getattr(args, "local_max_shift_by_sensor_json", None),
         "--local-max-shift-by-sensor-json",
     )
-    local_window_size = getattr(args, "local_window_size", DEFAULT_CONFIG['local_coreg_window_size'])
+    s2_band_subset_by_branch_json = _parse_json_dict(
+        getattr(args, "s2_band_subset_by_branch", None),
+        "--s2-band-subset-by-branch",
+    )
+    local_window_size = _arg_value("local_window_size", "local_coreg_window_size")
     if isinstance(local_window_size, list):
         local_window_size = tuple(local_window_size)
 
@@ -826,206 +896,151 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         'input_path': args.input,
         'output_dir': args.output,
         'batch_mode': args.mode == 'batch',
+        'preset': preset_name,
 
         # S2 search
-        'days_window': args.days_window,
-        'min_overlap': args.min_overlap,
-        'max_cloud': args.max_cloud,
-        'max_input_cloud_cover': args.max_input_cloud,
-        'local_s2_stack_path': getattr(args, "local_s2_stack", DEFAULT_CONFIG.get('local_s2_stack_path')),
+        'days_window': _arg_value("days_window"),
+        'min_overlap': _arg_value("min_overlap"),
+        'max_cloud': _arg_value("max_cloud"),
+        'max_input_cloud_cover': _arg_value("max_input_cloud", "max_input_cloud_cover"),
+        'local_s2_stack_path': _arg_value("local_s2_stack", "local_s2_stack_path"),
+        's2_stack_cache': _arg_value("s2_stack_cache"),
+        's2_cache_dir': _arg_value("s2_cache_dir"),
+        's2_stack_mode': _arg_value("s2_stack_mode"),
 
         # Coregistration
-        'residual_threshold': args.residual_threshold,
-        'min_tie_points': args.min_tie_points,
-        'max_s2_candidates': args.max_s2_candidates,
-        'residual_mad_factor': args.mad_factor,
-        's2_ref_band': args.s2_band,
-        'prefer_fixed_band_pairs': getattr(
-            args,
-            "prefer_fixed_band_pairs",
-            DEFAULT_CONFIG['prefer_fixed_band_pairs'],
-        ),
-        'bandpair_wavelength_window_nm': getattr(
-            args,
+        'residual_threshold': _arg_value("residual_threshold"),
+        'min_tie_points': _arg_value("min_tie_points"),
+        'max_s2_candidates': _arg_value("max_s2_candidates"),
+        'residual_mad_factor': _arg_value("mad_factor", "residual_mad_factor"),
+        's2_ref_band': _arg_value("s2_band", "s2_ref_band"),
+        'prefer_fixed_band_pairs': _arg_value("prefer_fixed_band_pairs"),
+        'synthetic_s2_band_mode': _arg_value("synthetic_s2_band_mode"),
+        'bandpair_wavelength_window_nm': _arg_value(
             "bandpair_window_nm",
-            DEFAULT_CONFIG['bandpair_wavelength_window_nm'],
+            "bandpair_wavelength_window_nm",
         ),
-        'min_band_support': getattr(args, "min_band_support", DEFAULT_CONFIG['min_band_support']),
-        'allow_single_band_fallback': getattr(
-            args,
-            "allow_single_band_fallback",
-            DEFAULT_CONFIG['allow_single_band_fallback'],
+        's2_band_subset_by_branch': (
+            s2_band_subset_by_branch_json
+            if s2_band_subset_by_branch_json is not None
+            else base_config.get('s2_band_subset_by_branch', {})
         ),
-        'consensus_group_rounding_px': getattr(
-            args,
-            "consensus_group_rounding_px",
-            DEFAULT_CONFIG['consensus_group_rounding_px'],
-        ),
-        'spatial_stratification_grid_rows': getattr(
-            args,
+        'local_tiepoint_early_stop': _arg_value("local_tiepoint_early_stop"),
+        'min_band_support': _arg_value("min_band_support"),
+        'allow_single_band_fallback': _arg_value("allow_single_band_fallback"),
+        'consensus_group_rounding_px': _arg_value("consensus_group_rounding_px"),
+        'spatial_stratification_grid_rows': _arg_value(
             "strat_grid_rows",
-            DEFAULT_CONFIG['spatial_stratification_grid_rows'],
+            "spatial_stratification_grid_rows",
         ),
-        'spatial_stratification_grid_cols': getattr(
-            args,
+        'spatial_stratification_grid_cols': _arg_value(
             "strat_grid_cols",
-            DEFAULT_CONFIG['spatial_stratification_grid_cols'],
+            "spatial_stratification_grid_cols",
         ),
-        'max_points_per_cell': getattr(
-            args,
-            "max_points_per_cell",
-            DEFAULT_CONFIG['max_points_per_cell'],
-        ),
-        'preferred_polynomial_order': getattr(
-            args,
-            "preferred_polynomial_order",
-            DEFAULT_CONFIG['preferred_polynomial_order'],
-        ),
-        'auto_downgrade_polynomial_order': getattr(
-            args,
-            "auto_downgrade_polynomial_order",
-            DEFAULT_CONFIG['auto_downgrade_polynomial_order'],
-        ),
-        'min_gcps_order2': getattr(args, "min_gcps_order2", DEFAULT_CONFIG['min_gcps_order2']),
-        'min_cells_order2': getattr(args, "min_cells_order2", DEFAULT_CONFIG['min_cells_order2']),
-        'local_coreg_grid_res': getattr(
-            args,
-            "local_grid_res",
-            DEFAULT_CONFIG['local_coreg_grid_res'],
-        ),
+        'max_points_per_cell': _arg_value("max_points_per_cell"),
+        'preferred_polynomial_order': _arg_value("preferred_polynomial_order"),
+        'auto_downgrade_polynomial_order': _arg_value("auto_downgrade_polynomial_order"),
+        'min_gcps_order2': _arg_value("min_gcps_order2"),
+        'min_cells_order2': _arg_value("min_cells_order2"),
+        'local_coreg_grid_res': _arg_value("local_grid_res", "local_coreg_grid_res"),
         'local_coreg_window_size': tuple(local_window_size),
-        'local_coreg_tieP_filter_level': getattr(
-            args,
+        'local_coreg_tieP_filter_level': _arg_value(
             "local_tiep_filter_level",
-            DEFAULT_CONFIG['local_coreg_tieP_filter_level'],
+            "local_coreg_tieP_filter_level",
         ),
-        'local_coreg_max_iter': getattr(args, "local_max_iter", DEFAULT_CONFIG['local_coreg_max_iter']),
+        'local_coreg_max_iter': _arg_value("local_max_iter", "local_coreg_max_iter"),
         'global_coreg_profiles_by_sensor': (
             global_coreg_profiles_json
             if global_coreg_profiles_json is not None
-            else DEFAULT_CONFIG['global_coreg_profiles_by_sensor']
+            else base_config['global_coreg_profiles_by_sensor']
         ),
         'global_coreg_attempt_ladder': global_coreg_attempt_ladder_json,
         'local_max_shift_by_sensor': (
             local_max_shift_by_sensor_json
             if local_max_shift_by_sensor_json is not None
-            else DEFAULT_CONFIG['local_max_shift_by_sensor']
+            else base_config['local_max_shift_by_sensor']
         ),
-        'postwarp_phasecorr_check': getattr(
-            args,
-            "postwarp_phasecorr_check",
-            DEFAULT_CONFIG['postwarp_phasecorr_check'],
+        'postwarp_phasecorr_check': _arg_value("postwarp_phasecorr_check"),
+        'postwarp_phasecorr_warn_threshold_px': _arg_value("postwarp_phasecorr_warn_threshold_px"),
+        'postwarp_phasecorr_reject_threshold_px': _arg_value("postwarp_phasecorr_reject_threshold_px"),
+        'postwarp_phasecorr_reject_bad': _arg_value("postwarp_phasecorr_reject_bad"),
+        'postwarp_phasecorr_max_dim': _arg_value("postwarp_phasecorr_max_dim"),
+        'use_geolocation_mesh_affine': _arg_value("use_geolocation_mesh_affine"),
+        'geolocation_mesh_stride': _arg_value("geolocation_mesh_stride"),
+        'fixed_band_pairs_by_sensor': base_config.get('fixed_band_pairs_by_sensor', {}),
+        'transform_model_selection': base_config.get('transform_model_selection', 'rule_based'),
+        'transform_cv_folds': base_config.get('transform_cv_folds', 5),
+        'transform_cv_repeats': base_config.get('transform_cv_repeats', 5),
+        'transform_cv_holdout_fraction': base_config.get('transform_cv_holdout_fraction', 0.25),
+        'transform_cv_seed': base_config.get('transform_cv_seed', 1337),
+        'transform_cv_min_tps_gcps': base_config.get('transform_cv_min_tps_gcps', 20),
+        'transform_cv_min_tps_cells': base_config.get('transform_cv_min_tps_cells', 8),
+        'transform_cv_tps_min_p90_improvement_m': base_config.get(
+            'transform_cv_tps_min_p90_improvement_m',
+            1.0,
         ),
-        'postwarp_phasecorr_warn_threshold_px': getattr(
-            args,
-            "postwarp_phasecorr_warn_threshold_px",
-            DEFAULT_CONFIG['postwarp_phasecorr_warn_threshold_px'],
+        'transform_cv_edge_instability_factor': base_config.get(
+            'transform_cv_edge_instability_factor',
+            2.5,
         ),
-        'postwarp_phasecorr_reject_threshold_px': getattr(
-            args,
-            "postwarp_phasecorr_reject_threshold_px",
-            DEFAULT_CONFIG['postwarp_phasecorr_reject_threshold_px'],
-        ),
-        'postwarp_phasecorr_reject_bad': getattr(
-            args,
-            "postwarp_phasecorr_reject_bad",
-            DEFAULT_CONFIG['postwarp_phasecorr_reject_bad'],
-        ),
-        'postwarp_phasecorr_max_dim': getattr(
-            args,
-            "postwarp_phasecorr_max_dim",
-            DEFAULT_CONFIG['postwarp_phasecorr_max_dim'],
-        ),
-        'use_geolocation_mesh_affine': getattr(
-            args,
-            "use_geolocation_mesh_affine",
-            DEFAULT_CONFIG['use_geolocation_mesh_affine'],
-        ),
-        'geolocation_mesh_stride': getattr(
-            args,
-            "geolocation_mesh_stride",
-            DEFAULT_CONFIG['geolocation_mesh_stride'],
-        ),
-        'fixed_band_pairs_by_sensor': DEFAULT_CONFIG.get('fixed_band_pairs_by_sensor', {}),
 
         # Quality
-        'min_accuracy': args.min_accuracy,
-        'max_displacement': args.max_displacement,
+        'min_accuracy': _arg_value("min_accuracy"),
+        'max_displacement': _arg_value("max_displacement"),
 
         # Output
-        'save_pre': args.save_pre,
-        'save_pan': args.save_pan,
-        'save_quality_mask': args.save_quality_mask,
-        'pan_gcp_mode': getattr(args, "pan_gcp_mode", DEFAULT_CONFIG['pan_gcp_mode']),
-        'pan_map_dxdy_source': getattr(args, "pan_map_dxdy_source", DEFAULT_CONFIG['pan_map_dxdy_source']),
-        'pan_target_aligned_pixels': getattr(
-            args,
-            "pan_target_aligned_pixels",
-            DEFAULT_CONFIG['pan_target_aligned_pixels'],
-        ),
-        'pan_residual_check': getattr(args, "pan_residual_check", DEFAULT_CONFIG['pan_residual_check']),
-        'pan_residual_threshold_px': getattr(
-            args,
-            "pan_residual_threshold_px",
-            DEFAULT_CONFIG['pan_residual_threshold_px'],
-        ),
-        'pan_residual_max_dim': getattr(
-            args,
-            "pan_residual_max_dim",
-            DEFAULT_CONFIG['pan_residual_max_dim'],
-        ),
-        'gen_tiepoint_pngs': args.gen_tiepoint_pngs,
+        'save_pre': _arg_value("save_pre"),
+        'save_pan': _arg_value("save_pan"),
+        'save_quality_mask': _arg_value("save_quality_mask"),
+        'pan_gcp_mode': _arg_value("pan_gcp_mode"),
+        'pan_map_dxdy_source': _arg_value("pan_map_dxdy_source"),
+        'pan_target_aligned_pixels': _arg_value("pan_target_aligned_pixels"),
+        'pan_residual_check': _arg_value("pan_residual_check"),
+        'pan_residual_threshold_px': _arg_value("pan_residual_threshold_px"),
+        'pan_residual_max_dim': _arg_value("pan_residual_max_dim"),
+        'gen_tiepoint_pngs': _arg_value("gen_tiepoint_pngs"),
         'use_inmemory': True,
-        'keep_temp_files': args.keep_temp,
+        'keep_temp_files': _arg_value("keep_temp", "keep_temp_files"),
         'allow_gui_prompt': False,
-        'remove_detector_overlap_bands': args.remove_overlap_bands,
-        'normalization_mode': getattr(args, "normalization_mode", DEFAULT_CONFIG['normalization_mode']),
-        'norm_p_low': DEFAULT_CONFIG['norm_p_low'],
-        'norm_p_high': DEFAULT_CONFIG['norm_p_high'],
-        'norm_clip': DEFAULT_CONFIG['norm_clip'],
-        'norm_eps': DEFAULT_CONFIG['norm_eps'],
-        'norm_min_valid_pixels': DEFAULT_CONFIG['norm_min_valid_pixels'],
-        'norm_reservoir_size': DEFAULT_CONFIG['norm_reservoir_size'],
-        'norm_seed': DEFAULT_CONFIG['norm_seed'],
-        'norm_tile_size': DEFAULT_CONFIG['norm_tile_size'],
-        'build_overviews': getattr(args, "build_overviews", DEFAULT_CONFIG['build_overviews']),
-        'strict_metadata': args.strict_metadata,
-        'metadata_extension_level': getattr(
-            args, "metadata_extension", DEFAULT_CONFIG['metadata_extension_level']
+        'remove_detector_overlap_bands': _arg_value(
+            "remove_overlap_bands",
+            "remove_detector_overlap_bands",
         ),
-        'metadata_stats_mode': getattr(
-            args, "metadata_stats_mode", DEFAULT_CONFIG['metadata_stats_mode']
-        ),
-        'enmap_metadata_stats_mode': getattr(
-            args,
-            "enmap_metadata_stats_mode",
-            DEFAULT_CONFIG['enmap_metadata_stats_mode'],
-        ),
-        'metadata_stats_sample_windows': getattr(
-            args, "metadata_stats_sample_windows", DEFAULT_CONFIG['metadata_stats_sample_windows']
-        ),
-        'metadata_stats_seed': getattr(
-            args, "metadata_stats_seed", DEFAULT_CONFIG['metadata_stats_seed']
-        ),
-        'metadata_histogram_buckets': getattr(
-            args, "metadata_histogram_buckets", DEFAULT_CONFIG['metadata_histogram_buckets']
-        ),
-        'metadata_label_precision': getattr(
-            args, "metadata_label_precision", DEFAULT_CONFIG['metadata_label_precision']
-        ),
-        'validation_max_windows': getattr(
-            args, "validation_max_windows", DEFAULT_CONFIG['validation_max_windows']
-        ),
+        'normalization_mode': _arg_value("normalization_mode"),
+        'norm_p_low': base_config['norm_p_low'],
+        'norm_p_high': base_config['norm_p_high'],
+        'norm_clip': base_config['norm_clip'],
+        'norm_eps': base_config['norm_eps'],
+        'norm_min_valid_pixels': base_config['norm_min_valid_pixels'],
+        'norm_reservoir_size': base_config['norm_reservoir_size'],
+        'norm_seed': base_config['norm_seed'],
+        'norm_tile_size': base_config['norm_tile_size'],
+        'build_overviews': _arg_value("build_overviews"),
+        'strict_metadata': _arg_value("strict_metadata"),
+        'metadata_extension_level': _arg_value("metadata_extension", "metadata_extension_level"),
+        'metadata_stats_mode': _arg_value("metadata_stats_mode"),
+        'enmap_metadata_stats_mode': _arg_value("enmap_metadata_stats_mode"),
+        'metadata_stats_sample_windows': _arg_value("metadata_stats_sample_windows"),
+        'metadata_stats_seed': _arg_value("metadata_stats_seed"),
+        'metadata_histogram_buckets': _arg_value("metadata_histogram_buckets"),
+        'metadata_label_precision': _arg_value("metadata_label_precision"),
+        'validation_max_windows': _arg_value("validation_max_windows"),
         'defer_temp_cleanup_gui': False,
-        'timing_logs': True,
+        'timing_logs': base_config.get('timing_logs', True),
+        'arosics_cpus': base_config.get('arosics_cpus', DEFAULT_CONFIG.get('arosics_cpus', 0)),
+        'gdalwarp_multi': base_config.get('gdalwarp_multi', DEFAULT_CONFIG.get('gdalwarp_multi', True)),
+        'gdalwarp_num_threads': base_config.get(
+            'gdalwarp_num_threads',
+            DEFAULT_CONFIG.get('gdalwarp_num_threads', 'ALL_CPUS'),
+        ),
+        'batch_workers': _arg_value("batch_workers"),
     }
+    for key, value in base_config.items():
+        config.setdefault(key, deepcopy(value))
 
-    if hasattr(args, "use_pipeline_native"):
-        config["use_pipeline_native"] = bool(getattr(args, "use_pipeline_native"))
-    if hasattr(args, "enable_legacy_fallback"):
-        config["enable_legacy_fallback"] = bool(getattr(args, "enable_legacy_fallback"))
-    if hasattr(args, "assert_legacy_parity"):
-        config["assert_legacy_parity"] = bool(getattr(args, "assert_legacy_parity"))
+    config, cpu_guard_warnings = apply_cpu_oversubscription_guard(config, explicit_keys=set())
+    if cpu_guard_warnings:
+        config["_cpu_guard_cli_auto"] = True
 
     return config
 
@@ -1052,7 +1067,10 @@ def main(args: Optional[list] = None) -> int:
         log_level = logging.INFO
 
     # Build config
-    config = build_config_from_args(parsed_args)
+    try:
+        config = build_config_from_args(parsed_args)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     # Setup logging
     setup_logging(
@@ -1068,6 +1086,8 @@ def main(args: Optional[list] = None) -> int:
     logger.info(f"Mode: {parsed_args.mode}")
     logger.info(f"Input: {config['input_path']}")
     logger.info(f"Output: {config['output_dir']}")
+    for warning_msg in config.get("_cpu_guard_warnings", []) or []:
+        logger.warning(warning_msg)
 
     try:
         # Import here to avoid circular imports and speed up --help
@@ -1077,18 +1097,23 @@ def main(args: Optional[list] = None) -> int:
         if parsed_args.mode == "single":
             hyp_type = detect_hyp_type(config['input_path'])
             logger.info(f"Detected sensor type: {hyp_type}")
-            run_coregistration(
+            result = run_coregistration(
                 config['input_path'],
                 hyp_type,
                 config['output_dir'],
                 config
             )
         else:  # batch
-            run_batch_coregistration(
+            result = run_batch_coregistration(
                 config['input_path'],
                 config['output_dir'],
                 config
             )
+
+        failure_reason = describe_result_failure(result, parsed_args.mode)
+        if failure_reason:
+            logger.error(f"Processing failed: {failure_reason}")
+            return 1
 
         logger.info("Processing completed successfully")
         return 0

@@ -1,13 +1,14 @@
 """Sentinel-2 CDSE API helpers.
 
 This module is the migration target for query/ranking/download runtime logic
-previously hosted in ``_legacy_coreg.py``.
+now owned by the modular pipeline runtime.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from time import perf_counter, sleep
@@ -16,7 +17,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import requests
 
 from hypercoreg.pipeline import auth
-from hypercoreg.utils import SentinelNotFoundError
+from hypercoreg.pipeline.time_utils import _to_utc_datetime
+from hypercoreg.utils import CDSEAuthenticationError, SentinelNotFoundError
 
 logger = logging.getLogger("COREG_PROCESSING")
 
@@ -67,6 +69,7 @@ def _bbox_to_wkt(bbox):
 
 
 def _query_s2(session, center_time, bbox, days_window=30, max_cloud=20):
+    center_time = _to_utc_datetime(center_time)
     logger.info("Querying Sentinel-2...")
     logger.info("  Search window: +/-%s days from %s", days_window, center_time.strftime("%Y-%m-%d"))
     logger.info("  Max cloud cover: %s%%, Bounding box: %s", max_cloud, bbox)
@@ -146,6 +149,38 @@ def _query_s2_with_retry(
     except requests.HTTPError as exc:
         status = exc.response.status_code if getattr(exc, "response", None) is not None else None
         if status in (400, 401, 403):
+            try:
+                if auth._force_refresh_cdse_session(session):
+                    logger.warning(
+                        auth._fmt_issue(
+                            "CDSE_QUERY",
+                            f"Sentinel-2 query failed with HTTP {status}. "
+                            "Refreshing the existing CDSE token and retrying.",
+                        )
+                    )
+                    try:
+                        return _query_s2(session, center_time, bbox, days_window, max_cloud), session
+                    except requests.HTTPError as retry_exc:
+                        retry_status = (
+                            retry_exc.response.status_code
+                            if getattr(retry_exc, "response", None) is not None
+                            else None
+                        )
+                        if retry_status not in (400, 401, 403):
+                            raise
+                        logger.warning(
+                            auth._fmt_issue(
+                                "CDSE_QUERY",
+                                f"Refreshed CDSE session still failed with HTTP {retry_status}.",
+                            )
+                        )
+            except Exception as refresh_exc:
+                logger.warning(
+                    auth._fmt_issue(
+                        "CDSE_QUERY",
+                        f"CDSE token refresh unavailable: {refresh_exc}",
+                    )
+                )
             logger.warning(
                 auth._fmt_issue(
                     "CDSE_QUERY",
@@ -157,7 +192,25 @@ def _query_s2_with_retry(
                 allow_gui_prompt=allow_gui_prompt,
                 prompt_userpass_fn=prompt_userpass_fn,
             )
-            return _query_s2(public_session, center_time, bbox, days_window, max_cloud), public_session
+            try:
+                return (
+                    _query_s2(public_session, center_time, bbox, days_window, max_cloud),
+                    public_session,
+                )
+            except requests.HTTPError as retry_exc:
+                retry_status = (
+                    retry_exc.response.status_code
+                    if getattr(retry_exc, "response", None) is not None
+                    else None
+                )
+                if retry_status in (400, 401, 403):
+                    raise CDSEAuthenticationError(
+                        auth._fmt_issue(
+                            "CDSE_QUERY",
+                            f"Sentinel-2 query authentication failed after retry (HTTP {retry_status}).",
+                        )
+                    ) from retry_exc
+                raise
         raise
 
 
@@ -165,6 +218,7 @@ def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
     from shapely.geometry import Polygon, shape
     import shapely.wkt as shapely_wkt
 
+    center_time = _to_utc_datetime(center_time)
     logger.info("Ranking S2 candidates (min overlap: %.1f%%)...", min_overlap * 100.0)
 
     minx, miny, maxx, maxy = bbox
@@ -215,6 +269,7 @@ def _download_s2_product(
         f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({pid})/$value",
     ]
     zip_path = os.path.join(out_dir, f"{pid}.zip")
+    os.makedirs(out_dir, exist_ok=True)
 
     def _is_valid_zip_quick(path: str) -> bool:
         if not os.path.exists(path):
@@ -283,35 +338,51 @@ def _download_s2_product(
                         bytes_written = 0
                         last_emit_t = perf_counter()
                         last_emit_bytes = 0
-                        with open(zip_path, "wb") as fh:
-                            for chunk in response.iter_content(1024 * 1024):
-                                if not chunk:
-                                    continue
-                                fh.write(chunk)
-                                bytes_written += len(chunk)
-                                now_t = perf_counter()
-                                if (now_t - last_emit_t) >= 1.0 or (bytes_written - last_emit_bytes) >= (25 * 1024 * 1024):
-                                    event_kwargs = {
-                                        "download_endpoint": url,
-                                        "download_mb": round(bytes_written / (1024 * 1024), 2),
-                                    }
-                                    if total_size > 0:
-                                        event_kwargs["download_total_mb"] = round(total_size / (1024 * 1024), 2)
-                                        event_kwargs["download_percent"] = round((100.0 * bytes_written) / total_size, 2)
-                                    _emit_progress(
-                                        progress_callback,
-                                        "Downloading Sentinel-2 reference",
-                                        scene_idx=scene_idx,
-                                        scene_total=scene_total,
-                                        **event_kwargs,
-                                    )
-                                    last_emit_t = now_t
-                                    last_emit_bytes = bytes_written
+                        tmp_fd, tmp_path = tempfile.mkstemp(
+                            prefix=f".{pid}.",
+                            suffix=".part",
+                            dir=out_dir,
+                        )
+                        try:
+                            with os.fdopen(tmp_fd, "wb") as fh:
+                                for chunk in response.iter_content(1024 * 1024):
+                                    if not chunk:
+                                        continue
+                                    fh.write(chunk)
+                                    bytes_written += len(chunk)
+                                    now_t = perf_counter()
+                                    if (now_t - last_emit_t) >= 1.0 or (bytes_written - last_emit_bytes) >= (25 * 1024 * 1024):
+                                        event_kwargs = {
+                                            "download_endpoint": url,
+                                            "download_mb": round(bytes_written / (1024 * 1024), 2),
+                                        }
+                                        if total_size > 0:
+                                            event_kwargs["download_total_mb"] = round(total_size / (1024 * 1024), 2)
+                                            event_kwargs["download_percent"] = round((100.0 * bytes_written) / total_size, 2)
+                                        _emit_progress(
+                                            progress_callback,
+                                            "Downloading Sentinel-2 reference",
+                                            scene_idx=scene_idx,
+                                            scene_total=scene_total,
+                                            **event_kwargs,
+                                        )
+                                        last_emit_t = now_t
+                                        last_emit_bytes = bytes_written
+                            if _is_valid_zip_quick(tmp_path):
+                                os.replace(tmp_path, zip_path)
+                            else:
+                                attempt_errors.append(f"{url} -> downloaded file is not a valid zip")
+                                break
+                        finally:
+                            if os.path.exists(tmp_path):
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
 
                         if _is_valid_zip_quick(zip_path):
                             return True, attempt_errors, audience_error
 
-                        attempt_errors.append(f"{url} -> downloaded file is not a valid zip")
                         try:
                             os.remove(zip_path)
                         except Exception:
@@ -342,6 +413,28 @@ def _download_s2_product(
         return zip_path, session
 
     if saw_auth_error:
+        try:
+            if auth._force_refresh_cdse_session(session):
+                logger.warning(
+                    auth._fmt_issue(
+                        "S2_DOWNLOAD",
+                        "Sentinel-2 download authentication failed. "
+                        "Refreshing the existing CDSE token and retrying.",
+                    )
+                )
+                ok2, errors2, saw_auth_error_2 = _attempt_download(session)
+                if ok2:
+                    return zip_path, session
+                errors.extend(errors2)
+                saw_auth_error = saw_auth_error or saw_auth_error_2
+        except Exception as refresh_exc:
+            logger.warning(
+                auth._fmt_issue(
+                    "S2_DOWNLOAD",
+                    f"CDSE token refresh unavailable: {refresh_exc}",
+                )
+            )
+
         fallback_session = None
         try:
             logger.warning(
@@ -355,7 +448,12 @@ def _download_s2_product(
                 prompt_userpass_fn=prompt_userpass_fn,
             )
         except Exception as exc:
-            logger.warning(auth._fmt_issue("S2_DOWNLOAD", f"Username/password fallback unavailable: {exc}"))
+            logger.warning(
+                auth._fmt_issue(
+                    "S2_DOWNLOAD",
+                    f"Username/password fallback unavailable: {exc}",
+                )
+            )
 
         if fallback_session is not None:
             ok2, errors2, saw_auth_error_2 = _attempt_download(fallback_session)
@@ -365,7 +463,7 @@ def _download_s2_product(
             saw_auth_error = saw_auth_error or saw_auth_error_2
 
     if saw_auth_error:
-        raise RuntimeError(
+        raise CDSEAuthenticationError(
             auth._fmt_issue(
                 "S2_DOWNLOAD",
                 "CDSE authentication failed for product download. "

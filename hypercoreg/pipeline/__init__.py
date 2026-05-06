@@ -8,11 +8,14 @@ __all__ = [
     "api_client",
     "auth",
     "baseline",
+    "branches",
     "coreg_math",
-    "migration",
     "orchestrator",
+    "outputs",
     "raster_io",
     "reporting",
+    "runtime",
+    "s2_stack",
 ]
 
 

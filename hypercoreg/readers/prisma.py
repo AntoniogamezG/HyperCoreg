@@ -22,6 +22,15 @@ from hypercoreg.logging_config import log_section_header
 logger = logging.getLogger("COREG_PROCESSING")
 
 
+def _parse_product_start_time(raw: Any) -> datetime:
+    """Parse PRISMA Product_StartTime metadata and return UTC."""
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
+    dt = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def estimate_prisma_geotransform(
     lon: np.ndarray,
     lat: np.ndarray,
@@ -183,6 +192,8 @@ def read_prisma_cube_and_meta(
             fwhm_swir,
             remove_detector_overlap=remove_detector_overlap
         )
+        if len(band_table) == 0:
+            raise ValueError("No valid spectral bands after filtering invalid wavelengths")
 
         # Validate the band table
         is_valid, issues = band_table.validate()
@@ -222,8 +233,7 @@ def read_prisma_cube_and_meta(
         logger.info(f"Wavelengths: {len(wl)} bands from {wl.min():.1f} to {wl.max():.1f} nm")
 
         # Extract acquisition time
-        t = attrs["Product_StartTime"].decode()
-        prisma_time = datetime.fromisoformat(t).replace(tzinfo=timezone.utc)
+        prisma_time = _parse_product_start_time(attrs["Product_StartTime"])
         logger.info(f"Acquisition time: {prisma_time}")
 
         # Extract geolocation
@@ -453,7 +463,9 @@ def check_cloud_threshold(
             return (True, None, None)
 
     else:  # EnMAP
-        enmap_cloud = extended_meta.get('prisma_cloud_pct')  # Mapped from enmap_cloud_pct
+        enmap_cloud = extended_meta.get('enmap_cloud_pct')
+        if enmap_cloud is None:
+            enmap_cloud = extended_meta.get('prisma_cloud_pct')  # Backward-compatible mapped key
         enmap_haze = extended_meta.get('enmap_haze_pct', 0.0) or 0.0
         enmap_cirrus = extended_meta.get('enmap_cirrus_pct', 0.0) or 0.0
 
@@ -461,7 +473,8 @@ def check_cloud_threshold(
             logger.warning("Cloud metadata unavailable for EnMAP image - proceeding with processing")
             return (True, None, None)
 
-        cloud_pct = enmap_cloud + enmap_haze + enmap_cirrus
+        cloud_pct_raw = enmap_cloud + enmap_haze + enmap_cirrus
+        cloud_pct = min(100.0, cloud_pct_raw)
         logger.info(
             f"EnMAP total cloud coverage: {cloud_pct:.1f}% "
             f"(cloud={enmap_cloud:.1f}%, haze={enmap_haze:.1f}%, cirrus={enmap_cirrus:.1f}%)"

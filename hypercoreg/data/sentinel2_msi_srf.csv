@@ -1,0 +1,37 @@
+# Compact normalized Sentinel-2 MSI SRF samples for synthetic S2-band matching.
+# Source basis: Copernicus Sentinel-2 MSI SRF document library (S2-SRF v3.1/v4.0)
+# plus mission band centers/FWHM; this compact table is for deterministic
+# integration against hyperspectral band support, not radiometric calibration.
+platform,band,wavelength_nm,response
+S2A,B02,430,0.00
+S2A,B02,445,0.25
+S2A,B02,460,0.75
+S2A,B02,490,1.00
+S2A,B02,520,0.75
+S2A,B02,535,0.25
+S2A,B02,550,0.00
+S2A,B03,520,0.00
+S2A,B03,540,0.45
+S2A,B03,560,1.00
+S2A,B03,580,0.45
+S2A,B03,600,0.00
+S2A,B04,625,0.00
+S2A,B04,645,0.35
+S2A,B04,665,1.00
+S2A,B04,685,0.35
+S2A,B04,705,0.00
+S2A,B08,760,0.00
+S2A,B08,790,0.35
+S2A,B08,842,1.00
+S2A,B08,895,0.35
+S2A,B08,930,0.00
+S2A,B11,1535,0.00
+S2A,B11,1565,0.30
+S2A,B11,1610,1.00
+S2A,B11,1655,0.30
+S2A,B11,1695,0.00
+S2A,B12,2080,0.00
+S2A,B12,2140,0.35
+S2A,B12,2190,1.00
+S2A,B12,2250,0.35
+S2A,B12,2320,0.00

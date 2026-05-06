@@ -1,21 +1,23 @@
 """Manifest and summary reporting helpers.
 
 This module is the migration target for reporting/runtime metadata helpers
-previously hosted in ``_legacy_coreg.py``.
+now owned by the modular pipeline runtime.
 """
 
 from __future__ import annotations
 
 import json
-import hashlib
 import math
 import logging
 import os
 import re
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
+
+from hypercoreg.path_utils import _portable_name, _portable_stem, _portable_suffix
 
 logger = logging.getLogger("COREG_PROCESSING")
 
@@ -27,9 +29,24 @@ DATASET_XLSX_COLUMNS: List[str] = [
     "prisma_date",
     "prisma_cloud_pct",
     "prisma_sea_pct",
+    "enmap_id",
+    "enmap_date",
+    "enmap_processing_version",
+    "enmap_cloud_pct",
+    "enmap_haze_pct",
+    "enmap_cirrus_pct",
+    "enmap_snow_pct",
+    "enmap_water_pct",
+    "enmap_total_cloud_pct",
+    "input_cloud_threshold_pct",
     "observation_angle",
     "rel_azimuth_angle",
     "sun_azimuth_angle",
+    "sun_elevation_angle",
+    "sun_zenith_angle",
+    "across_offnadir_angle",
+    "along_offnadir_angle",
+    "scene_azimuth_angle",
     "solar_zenith_angle",
     "bbox_top_left_x",
     "bbox_top_left_y",
@@ -206,17 +223,145 @@ def _safe_dataset_file_stem(raw_value: Any, fallback: str = "scene") -> str:
     return text or fallback
 
 
-def _build_scene_output_name(source_path: str, hyp_type: Optional[str], acquisition_time: Any = None) -> str:
-    sensor = _infer_sensor_from_identifiers(hyp_type, None, Path(str(source_path)).name)
-    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
-    source_text = os.path.abspath(str(source_path)) if source_path else ""
-    token_src = source_text or str(source_path) or sensor_tag
-    token = hashlib.sha1(token_src.encode("utf-8", errors="ignore")).hexdigest()[:8].upper()
-    stem = _safe_dataset_file_stem(Path(str(source_path)).stem if source_path else "scene", fallback="scene")
+def _format_scene_datetime_tags(acquisition_time: Any) -> Tuple[Optional[str], Optional[str]]:
     if isinstance(acquisition_time, datetime):
-        date_tag = acquisition_time.strftime("%y%m%d")
-        return f"{sensor_tag}_{date_tag}_{stem}_{token}"
-    return f"{sensor_tag}_{stem}_{token}"
+        return acquisition_time.strftime("%y%m%d"), acquisition_time.strftime("%H_%M_%S")
+    return None, None
+
+
+def _build_scene_output_name(source_path: str, hyp_type: Optional[str], acquisition_time: Any = None) -> str:
+    sensor = _infer_sensor_from_identifiers(hyp_type, None, _portable_name(source_path))
+    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
+    date_tag, time_tag = _format_scene_datetime_tags(acquisition_time)
+    if date_tag and time_tag:
+        return f"{sensor_tag}_{date_tag}_{time_tag}"
+    stem = _safe_dataset_file_stem(_portable_stem(source_path, fallback="scene"), fallback="scene")
+    return f"{sensor_tag}_{stem}"
+
+
+def _build_scene_output_root(output_dir: str, hyp_type: Optional[str], acquisition_time: Any) -> str:
+    sensor = _infer_sensor_from_identifiers(hyp_type, None, None)
+    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
+    date_tag, time_tag = _format_scene_datetime_tags(acquisition_time)
+    if not (date_tag and time_tag):
+        return output_dir
+    return os.path.join(output_dir, f"{sensor_tag}_{date_tag}", time_tag)
+
+
+def _scene_collision_suffix_from_source(source_path: Optional[str]) -> Optional[str]:
+    candidates = _scene_collision_suffix_candidates_from_source(source_path)
+    return candidates[0] if candidates else None
+
+
+def _scene_collision_suffix_candidates_from_source(source_path: Optional[str]) -> List[str]:
+    if not source_path:
+        return []
+    stem = _portable_stem(source_path, fallback="scene")
+    candidates: List[str] = []
+    version_match = re.search(r"[_-]v(\d{6})(?:[_-]|$)", stem, flags=re.IGNORECASE)
+    if version_match:
+        candidates.append(f"V{version_match.group(1)}")
+    product_match = re.search(
+        r"[_-]v(\d{6})[_-](\d{8}t\d{6}z)(?:[_-]|$)",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if product_match:
+        candidates.append(f"V{product_match.group(1)}_{product_match.group(2).upper()}")
+    prisma_match = re.search(
+        r"^PRS_[A-Z0-9]+_[A-Z0-9]+_(\d{14})_(\d{14})_([A-Za-z0-9]+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if prisma_match:
+        candidates.append(f"PRS_{prisma_match.group(2)}_{prisma_match.group(3).upper()}")
+    if candidates:
+        source_key = os.path.normcase(os.path.abspath(str(source_path)))
+        source_hash = (
+            hashlib.sha1(source_key.encode("utf-8", errors="ignore")).hexdigest()[:8].upper()
+        )
+        candidates.append(f"SRC_{source_hash}")
+    return list(dict.fromkeys(candidates))
+
+
+def _scene_root_matches_source(scene_root: str, source_path: Optional[str]) -> bool:
+    if not source_path:
+        return False
+    reports_dir = os.path.join(scene_root, "04_reports")
+    if not os.path.isdir(reports_dir):
+        return False
+    expected = os.path.normcase(os.path.abspath(str(source_path)))
+    try:
+        manifest_names = [
+            name
+            for name in os.listdir(reports_dir)
+            if name.lower().endswith("_run_manifest.json")
+        ]
+    except OSError:
+        return False
+    for name in manifest_names:
+        try:
+            with open(os.path.join(reports_dir, name), "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            scene_block = manifest.get("scene") if isinstance(manifest.get("scene"), dict) else {}
+            input_block = manifest.get("input") if isinstance(manifest.get("input"), dict) else {}
+            raw_sources = (
+                scene_block.get("source_path"),
+                scene_block.get("hs_file"),
+                input_block.get("hs_file"),
+                input_block.get("source_path"),
+                manifest.get("source_path"),
+                manifest.get("hs_file"),
+            )
+            for raw_source in raw_sources:
+                if raw_source and os.path.normcase(os.path.abspath(str(raw_source))) == expected:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _create_scene_root_with_collision_suffix(
+    output_dir: str,
+    hyp_type: Optional[str],
+    acquisition_time: Any,
+    source_path: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    scene_root = _build_scene_output_root(output_dir, hyp_type, acquisition_time)
+    if scene_root == output_dir:
+        return scene_root, None
+    try:
+        os.makedirs(scene_root, exist_ok=False)
+        return scene_root, None
+    except FileExistsError as exc:
+        if _scene_root_matches_source(scene_root, source_path):
+            raise FileExistsError(
+                "Scene output folder already exists for this acquisition time and source identity: "
+                f"{scene_root}. Remove or rename the existing folder before rerunning."
+            ) from exc
+        suffixes = _scene_collision_suffix_candidates_from_source(source_path)
+        for suffix in suffixes:
+            suffixed_root = f"{scene_root}_{suffix}"
+            try:
+                os.makedirs(suffixed_root, exist_ok=False)
+                return suffixed_root, suffix
+            except FileExistsError as suffix_exc:
+                if _scene_root_matches_source(suffixed_root, source_path):
+                    raise FileExistsError(
+                        "Scene output folder already exists for this acquisition time and source identity: "
+                        f"{suffixed_root}. Remove or rename the existing folder before rerunning."
+                    ) from suffix_exc
+                continue
+        if suffixes:
+            last_root = f"{scene_root}_{suffixes[-1]}"
+            raise FileExistsError(
+                "Scene output folder already exists for this acquisition time and all derived source suffixes: "
+                f"{last_root}. Remove or rename the existing folder before rerunning."
+            ) from exc
+        raise FileExistsError(
+            "Scene output folder already exists for this acquisition time: "
+            f"{scene_root}. Remove or rename the existing folder before rerunning."
+        ) from exc
 
 
 def _row_identity_key(row: Dict[str, Any]) -> str:
@@ -237,14 +382,14 @@ def _resolve_dataset_scene_name(metrics_dict: Dict[str, Any]) -> str:
         return str(scene_name)
     filename = metrics_dict.get("filename")
     if filename:
-        return Path(str(filename)).stem
+        return _portable_stem(filename)
     return "scene"
 
 
 def _build_dataset_xlsx_filename(scene_name: Optional[str], filename: Optional[str] = None) -> str:
     label = scene_name
     if not label and filename:
-        label = Path(str(filename)).stem
+        label = _portable_stem(filename)
     safe_label = _safe_dataset_file_stem(label, fallback="scene")
     return f"{safe_label}_DATASET.xlsx"
 
@@ -269,7 +414,7 @@ def _infer_sensor_from_identifiers(
             return "ENMAP"
 
     if filename:
-        suffix = Path(str(filename)).suffix.lower()
+        suffix = _portable_suffix(filename).lower()
         if suffix == ".he5":
             return "PRISMA"
 
@@ -502,7 +647,7 @@ def _write_batch_summary_xlsx(
 
 
 def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_message: str) -> Dict[str, Any]:
-    filename = os.path.basename(hs_file)
+    filename = _portable_name(hs_file)
     inferred_sensor = _infer_sensor_from_identifiers(hyp_type, None, filename)
     scene_name = _build_scene_output_name(hs_file, inferred_sensor)
     return {
@@ -543,15 +688,26 @@ def _build_skip_result(
     extra_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     scene_name = _build_scene_output_name(hs_file, hyp_type, hs_time)
-    skip_manifest_path = os.path.join(output_dir, f"{scene_name}_run_manifest.json")
-    skip_dataset_xlsx_path = os.path.join(
+    filename = _portable_name(hs_file)
+    skip_scene_root, scene_suffix = _create_scene_root_with_collision_suffix(
         output_dir,
-        _build_dataset_xlsx_filename(scene_name=scene_name, filename=os.path.basename(hs_file)),
+        hyp_type,
+        hs_time,
+        hs_file,
+    )
+    if scene_suffix:
+        scene_name = f"{scene_name}_{scene_suffix}"
+    skip_reports_dir = os.path.join(skip_scene_root, "04_reports") if skip_scene_root != output_dir else output_dir
+    os.makedirs(skip_reports_dir, exist_ok=True)
+    skip_manifest_path = os.path.join(skip_reports_dir, f"{scene_name}_run_manifest.json")
+    skip_dataset_xlsx_path = os.path.join(
+        skip_reports_dir,
+        _build_dataset_xlsx_filename(scene_name=scene_name, filename=filename),
     )
     skip_metrics = {
         "status": status,
         "scene_name": scene_name,
-        "filename": os.path.basename(hs_file),
+        "filename": filename,
         "source_path": hs_file,
         "hyp_type": hyp_type,
         "reason": reason,
@@ -594,13 +750,14 @@ def _build_skip_result(
         "status": status,
         "scene": {
             "scene_name": scene_name,
-            "filename": os.path.basename(hs_file),
+            "filename": filename,
             "sensor_type": hyp_type,
             "scene_idx": int(scene_idx),
             "scene_total": int(scene_total),
         },
         "paths": {
             "output_dir": output_dir,
+            "scene_root": skip_scene_root,
             "run_manifest": skip_manifest_path,
             "displacement_vectors_path": None,
             "dataset_xlsx": skip_dataset_xlsx_path,

@@ -19,6 +19,7 @@ import re
 import json
 import inspect
 import zipfile
+import csv
 import textwrap
 import tempfile
 import threading
@@ -38,7 +39,7 @@ import rasterio
 from rasterio.errors import RasterioIOError
 from rasterio import warp
 from rasterio.enums import Resampling
-from rasterio.transform import Affine, from_bounds as transform_from_bounds
+from rasterio.transform import Affine, array_bounds, from_bounds as transform_from_bounds
 from rasterio.windows import Window, from_bounds
 from rasterio.plot import plotting_extent
 from pyproj import Transformer, CRS
@@ -47,21 +48,34 @@ import shapely.wkt as shapely_wkt
 from geoarray import GeoArray
 from arosics import COREG_LOCAL, COREG
 
+from hypercoreg.pipeline import auth as cdse_auth
+from hypercoreg.pipeline.time_utils import _to_utc_datetime
 from hypercoreg.logging_config import log_section_header, log_subsection_header, setup_logging
+from hypercoreg.path_utils import _portable_name, _portable_stem, _portable_suffix
 from hypercoreg.utils import (
-    detect_hyp_type, SentinelNotFoundError, resolve_gdalwarp_exe,
+    detect_hyp_type, SentinelNotFoundError, CDSEAuthenticationError, resolve_gdalwarp_exe,
     create_narrowband_average, diagnose_raster
 )
 from hypercoreg.config import (
     S2_BANDS,
+    S2_APPROX_FWHM_NM,
+    S2_L2A_ANCILLARY_BANDS,
+    S2_L2A_OUTPUT_BANDS,
+    S2_L2A_OUTPUT_BAND_INDEX,
+    S2_L2A_REFERENCE_STACK_BANDS,
     MULTIBAND_S2_WAVELENGTHS,
     DEFAULT_CONFIG,
     PRISMA_FIXED_BAND_PAIRS,
+    apply_cpu_oversubscription_guard,
 )
 from hypercoreg.spectral import build_prisma_band_table, build_enmap_band_table
 from hypercoreg.normalization import (
+    filter_band_tags_for_raster_copy,
+    filter_dataset_tags_for_raster_copy,
     NormalizationParams,
     normalize_mode,
+    resolve_raster_nodata_values,
+    scrub_incomplete_raster_band_metadata_inplace,
     sanitize_normalization_params,
     normalize_raster_to_path,
     stream_copy_raster_to_path,
@@ -73,7 +87,7 @@ from hypercoreg.readers.prisma import (
 )
 from hypercoreg.readers.enmap import (
     find_enmap_metadata_for_spectral_image, read_enmap_metadata,
-    inject_metadata_into_raster, read_enmap_metadata_from_raster,
+    stage_enmap_metadata_for_session, read_enmap_metadata_from_raster,
     derive_enmap_bbox_from_raster,
 )
 
@@ -123,14 +137,38 @@ RUN_MANIFEST_SCHEMA_VERSION = 1
 SCENE_CLUSTER_SPREAD_THRESHOLD = 0.35
 SCENE_CLUSTER_HULL_RATIO_THRESHOLD = 0.20
 
+
+class SceneProcessingError(RuntimeError):
+    """Scene failure that already has structured scene metrics attached."""
+
+    def __init__(self, message: str, metrics: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.metrics = dict(metrics or {})
+
+
 DATASET_XLSX_COLUMNS: List[str] = [
     "folder_name",
     "prisma_date",
     "prisma_cloud_pct",
     "prisma_sea_pct",
+    "enmap_id",
+    "enmap_date",
+    "enmap_processing_version",
+    "enmap_cloud_pct",
+    "enmap_haze_pct",
+    "enmap_cirrus_pct",
+    "enmap_snow_pct",
+    "enmap_water_pct",
+    "enmap_total_cloud_pct",
+    "input_cloud_threshold_pct",
     "observation_angle",
     "rel_azimuth_angle",
     "sun_azimuth_angle",
+    "sun_elevation_angle",
+    "sun_zenith_angle",
+    "across_offnadir_angle",
+    "along_offnadir_angle",
+    "scene_azimuth_angle",
     "solar_zenith_angle",
     "bbox_top_left_x",
     "bbox_top_left_y",
@@ -185,10 +223,56 @@ SCL_EXCLUDE_CLASSES = {
     8: "Cloud Medium Probability", 9: "Cloud High Probability", 10: "Thin Cirrus"
 }
 
+
+def _coerce_scl_exclude_classes(values: Any = None) -> List[int]:
+    """Normalize configurable SCL class exclusions for cache keys and masking."""
+    if values is None:
+        return [int(v) for v in SCL_EXCLUDE_CLASSES.keys()]
+    if isinstance(values, str):
+        tokens: Sequence[Any] = [
+            part.strip() for part in values.split(",") if part.strip()
+        ]
+    else:
+        try:
+            tokens = list(values)
+        except TypeError:
+            tokens = [values]
+    try:
+        return [int(v) for v in tokens]
+    except Exception:
+        logger.warning(
+            _fmt_issue(
+                "CONFIG",
+                f"Invalid scl_exclude_classes={values!r}; using defaults.",
+            )
+        )
+        return [int(v) for v in SCL_EXCLUDE_CLASSES.keys()]
+
+
+def _s2_vrt_zip_dependency_info(
+    *,
+    source_zip_path: str,
+    zip_for_vrt: str,
+    cached_zip_path: Optional[str],
+) -> Dict[str, Any]:
+    """Describe whether a VRT ZIP dependency is cache-owned and safe to reuse."""
+    zip_dependency_path = cached_zip_path or zip_for_vrt
+    zip_is_persistently_available = bool(
+        cached_zip_path is not None and os.path.exists(cached_zip_path)
+    )
+    vrt_uses_source_zip = bool(
+        os.path.abspath(str(zip_dependency_path)) == os.path.abspath(str(source_zip_path))
+    )
+    return {
+        "vrt_zip_path": zip_dependency_path,
+        "zip_retained": zip_is_persistently_available,
+        "source_zip_can_delete": not vrt_uses_source_zip,
+    }
+
 METADATA_SCHEMA_VERSION = 2
 FINAL_VIEWER_SAFE_TIFF_PROFILE: Dict[str, Any] = {
     "driver": "GTiff",
-    # Match the legacy viewer-safe contract used by known-good outputs:
+    # Match the established viewer-safe contract used by known-good outputs:
     # standard TIFF, untiled, uncompressed, pixel-interleaved hyperspectral
     # data with ENVI sidecars describing the raster as BIP.
     "interleave": "pixel",
@@ -228,6 +312,338 @@ def _fmt_issue(scope: str, message: str) -> str:
     return f"[{scope}] {message}"
 
 
+def _record_stage_timing(timings: Optional[Dict[str, float]], key: str, started_at: float) -> float:
+    """Record elapsed seconds for a named stage and return the elapsed value."""
+    elapsed = max(0.0, perf_counter() - float(started_at))
+    if timings is not None:
+        timings[str(key)] = float(timings.get(str(key), 0.0)) + float(elapsed)
+    return elapsed
+
+
+def _default_cache_root() -> str:
+    """Return the default persistent cache root for reusable reference products."""
+    env_root = os.environ.get("HYPERCOREG_CACHE_DIR")
+    if env_root:
+        return os.path.abspath(os.path.expanduser(env_root))
+    return os.path.join(str(Path.home()), ".cache", "hypercoreg")
+
+
+def _resolve_cache_dir(configured: Any, child: str) -> str:
+    root = str(configured or "").strip()
+    if not root:
+        root = os.path.join(_default_cache_root(), child)
+    return os.path.abspath(os.path.expanduser(root))
+
+
+def _normalise_s2_band_labels(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.replace(";", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        return []
+    labels: List[str] = []
+    for val in values:
+        label = str(val).upper().strip()
+        if not label:
+            continue
+        if label.startswith("B") and len(label) == 2 and label[1].isdigit():
+            label = f"B0{label[1]}"
+        if label in MULTIBAND_S2_WAVELENGTHS and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _apply_s2_band_subset_overrides(detector_plan: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply optional per-branch S2 tiepoint band subsets to a detector plan."""
+    subsets = config.get("s2_band_subset_by_branch", DEFAULT_CONFIG.get("s2_band_subset_by_branch", {}))
+    if not isinstance(subsets, dict):
+        return detector_plan
+    branches = detector_plan.get("branches")
+    if not isinstance(branches, dict):
+        return detector_plan
+    for branch_name, branch_cfg in branches.items():
+        requested = _normalise_s2_band_labels(subsets.get(str(branch_name).upper(), subsets.get(branch_name)))
+        if requested:
+            branch_cfg["s2_subset"] = tuple(requested)
+    return detector_plan
+
+
+def _vsizip_path(zip_path: str, member_path: str) -> str:
+    """Build a GDAL /vsizip/ path that also works on Windows drive-letter paths."""
+    zip_abs = os.path.abspath(str(zip_path)).replace("\\", "/")
+    member = str(member_path).lstrip("/").replace("\\", "/")
+    return f"/vsizip/{zip_abs}/{member}"
+
+
+def _s2_valid_mask_path(stack_path: str) -> str:
+    base, _ext = os.path.splitext(str(stack_path))
+    return f"{base}_valid_mask.tif"
+
+
+def _rounded_bounds(bounds: Sequence[float], ndigits: int = 1) -> Tuple[float, float, float, float]:
+    return tuple(round(float(v), int(ndigits)) for v in bounds[:4])  # type: ignore[return-value]
+
+
+def _build_s2_cache_key(
+    *,
+    product_id: str,
+    selected_bands: Sequence[str],
+    target_crs: Any,
+    target_resolution: Sequence[float],
+    overlap_bounds: Sequence[float],
+    scl_exclude_classes: Sequence[int],
+) -> str:
+    payload = {
+        "schema": 1,
+        "product_id": str(product_id),
+        "selected_bands": [str(b) for b in selected_bands],
+        "target_crs": _summarize_crs(target_crs),
+        "target_resolution": [round(float(v), 6) for v in target_resolution],
+        "overlap_bounds": [round(float(v), 1) for v in overlap_bounds],
+        "scl_exclude_classes": [int(v) for v in sorted(scl_exclude_classes)],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+_S2_L2A_BAND_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+    "B01": ("_B01_60m.jp2",),
+    "B02": ("_B02_10m.jp2",),
+    "B03": ("_B03_10m.jp2",),
+    "B04": ("_B04_10m.jp2",),
+    "B05": ("_B05_20m.jp2",),
+    "B06": ("_B06_20m.jp2",),
+    "B07": ("_B07_20m.jp2",),
+    "B08": ("_B08_10m.jp2",),
+    "B8A": ("_B8A_20m.jp2",),
+    "B09": ("_B09_60m.jp2",),
+    "B11": ("_B11_20m.jp2",),
+    "B12": ("_B12_20m.jp2",),
+    "SCL": ("_SCL_20m.jp2", "_SCL_60m.jp2"),
+    "AOT": ("_AOT_10m.jp2", "_AOT_20m.jp2", "_AOT_60m.jp2"),
+    "WVP": ("_WVP_10m.jp2", "_WVP_20m.jp2", "_WVP_60m.jp2"),
+}
+
+
+def _normalize_s2_band_label(value: Any) -> Optional[str]:
+    text = str(value or "").upper().strip()
+    if not text:
+        return None
+    for ancillary_label in S2_L2A_ANCILLARY_BANDS:
+        if ancillary_label in text:
+            return ancillary_label
+    if "B8A" in text:
+        return "B8A"
+    match = re.search(r"\bB0?([1-9])\b|\bB(1[12])\b", text)
+    if not match:
+        return None
+    number = match.group(1) or match.group(2)
+    if number is None:
+        return None
+    try:
+        return f"B{int(number):02d}"
+    except Exception:
+        return None
+
+
+def _expected_s2_l2a_output_band_count() -> int:
+    return int(len(S2_L2A_REFERENCE_STACK_BANDS))
+
+
+def _minimum_local_s2_stack_band_count() -> int:
+    return int(len(S2_L2A_OUTPUT_BANDS))
+
+
+def _format_expected_s2_l2a_bands() -> str:
+    return ", ".join(str(b) for b in S2_L2A_REFERENCE_STACK_BANDS)
+
+
+def _require_s2_l2a_band_paths(
+    bands_paths: Dict[str, str],
+    required_bands: Sequence[str],
+    *,
+    context: str,
+) -> None:
+    missing = [str(b) for b in required_bands if not bands_paths.get(str(b))]
+    if missing:
+        raise ValueError(
+            f"{context} is missing required Sentinel-2 L2A bands: {', '.join(missing)}. "
+            f"Expected canonical L2A stack order: {_format_expected_s2_l2a_bands()}."
+        )
+
+
+def _require_s2_l2a_output_band_count(path: str, *, context: str) -> int:
+    expected_count = _expected_s2_l2a_output_band_count()
+    try:
+        with rasterio.open(path) as src:
+            band_count = int(src.count)
+    except Exception as exc:
+        raise RuntimeError(f"Could not inspect {context} band count at {path}: {exc}") from exc
+    if band_count < expected_count:
+        raise RuntimeError(
+            f"{context} has too few bands ({band_count} < {expected_count}) at {path}. "
+            f"Expected canonical Sentinel-2 L2A bands: {_format_expected_s2_l2a_bands()}."
+        )
+    return band_count
+
+
+def _resolve_s2_zip_band_paths(
+    zip_path: str,
+    requested_bands: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Resolve Sentinel-2 L2A band JP2 members to /vsizip/ paths."""
+    requested = [str(b).upper() for b in (requested_bands or list(S2_L2A_REFERENCE_STACK_BANDS))]
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        ref_hits = [n for n in names if "_B04_10m.jp2" in n and "/GRANULE/" in n]
+        if not ref_hits:
+            ref_hits = [n for n in names if "_B08_10m.jp2" in n and "/GRANULE/" in n]
+        if not ref_hits:
+            raise ValueError("No Sentinel-2 10 m reference band found in ZIP.")
+        reference_member = ref_hits[0]
+        parts = reference_member.split("/GRANULE/")
+        granule_id = parts[1].split("/")[0] if len(parts) > 1 else ""
+        granule_prefix = f"{parts[0]}/GRANULE/{granule_id}/" if granule_id else ""
+
+        members: Dict[str, str] = {}
+        paths: Dict[str, str] = {}
+        for band in requested:
+            suffixes = _S2_L2A_BAND_SUFFIXES.get(band, ())
+            hits = [
+                n
+                for n in names
+                if (not granule_prefix or n.startswith(granule_prefix))
+                and any(suffix in n for suffix in suffixes)
+            ]
+            if not hits and band == "SCL":
+                continue
+            if not hits:
+                raise ValueError(f"Band {band} not found in selected Sentinel-2 granule.")
+            members[band] = hits[0]
+            paths[band] = _vsizip_path(zip_path, hits[0])
+    return {
+        "granule_id": granule_id,
+        "granule_prefix": granule_prefix,
+        "reference_band": "B04" if "B04" in paths else "B08",
+        "members": members,
+        "paths": paths,
+    }
+
+
+def _destination_window_source_read(
+    src,
+    *,
+    band_index: int,
+    dst_shape: Tuple[int, int],
+    dst_transform: Affine,
+    dst_crs: Any,
+    dst_nodata: Any,
+    out_dtype: Any,
+) -> Tuple[Optional[np.ndarray], Optional[Affine]]:
+    """Read only the source window needed for a destination reproject window."""
+    try:
+        bounds = array_bounds(int(dst_shape[0]), int(dst_shape[1]), dst_transform)
+        if src.crs is not None and dst_crs is not None and not _crs_equivalent(src.crs, dst_crs):
+            bounds = warp.transform_bounds(dst_crs, src.crs, *bounds, densify_pts=8)
+        raw_window = from_bounds(*bounds, transform=src.transform)
+        col0 = max(0, int(np.floor(raw_window.col_off)))
+        row0 = max(0, int(np.floor(raw_window.row_off)))
+        col1 = min(int(src.width), int(np.ceil(raw_window.col_off + raw_window.width)))
+        row1 = min(int(src.height), int(np.ceil(raw_window.row_off + raw_window.height)))
+        if col1 <= col0 or row1 <= row0:
+            return None, None
+        source_window = Window(col0, row0, col1 - col0, row1 - row0)
+        fill = src.nodata if src.nodata is not None else dst_nodata
+        arr = src.read(
+            int(band_index),
+            window=source_window,
+            boundless=False,
+            fill_value=fill,
+            out_dtype=np.dtype(out_dtype).name,
+        )
+        return arr, src.window_transform(source_window)
+    except Exception:
+        return None, None
+
+
+def _reproject_source_window_to_destination(
+    src,
+    *,
+    band_index: int,
+    destination: np.ndarray,
+    dst_transform: Affine,
+    dst_crs: Any,
+    resampling: Resampling,
+    dst_nodata: Any,
+    src_nodata: Any = None,
+) -> bool:
+    """Reproject a clipped source window into a destination array."""
+    src_array, src_transform = _destination_window_source_read(
+        src,
+        band_index=band_index,
+        dst_shape=(int(destination.shape[0]), int(destination.shape[1])),
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=dst_nodata,
+        out_dtype=destination.dtype,
+    )
+    if src_array is None or src_transform is None:
+        destination.fill(dst_nodata)
+        return False
+    warp.reproject(
+        source=src_array,
+        destination=destination,
+        src_transform=src_transform,
+        src_crs=src.crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        src_nodata=src.nodata if src_nodata is None else src_nodata,
+        dst_nodata=dst_nodata,
+        resampling=resampling,
+    )
+    return True
+
+
+def _copy_s2_stack_with_mask(source_stack: str, target_stack: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(target_stack)), exist_ok=True)
+    shutil.copy2(source_stack, target_stack)
+    source_mask = _s2_valid_mask_path(source_stack)
+    if os.path.exists(source_mask):
+        shutil.copy2(source_mask, _s2_valid_mask_path(target_stack))
+
+
+def _acquire_cache_lock(lock_path: str, *, timeout_s: float = 900.0, poll_s: float = 0.25) -> Optional[int]:
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    deadline = perf_counter() + max(1.0, float(timeout_s))
+    while True:
+        try:
+            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if perf_counter() >= deadline:
+                logger.warning(_fmt_issue("CACHE", f"Timed out waiting for cache lock: {lock_path}"))
+                return None
+            sleep(max(0.05, float(poll_s)))
+        except Exception as exc:
+            logger.warning(_fmt_issue("CACHE", f"Failed to acquire cache lock {lock_path}: {exc}"))
+            return None
+
+
+def _release_cache_lock(lock_fd: Optional[int], lock_path: str) -> None:
+    try:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+
+
 def _retry_delay_seconds(retry_index: int) -> float:
     """Compute exponential backoff delay for retry index (1-based)."""
     idx = max(1, int(retry_index))
@@ -237,6 +653,36 @@ def _retry_delay_seconds(retry_index: int) -> float:
 def _is_retryable_http_status(status_code: int) -> bool:
     """Return True when an HTTP status code should be retried."""
     return int(status_code) in HTTP_RETRYABLE_STATUS_CODES
+
+
+def _make_gdal_temp_path(output_raster: str, suffix: str) -> str:
+    out_path = Path(output_raster)
+    out_dir = out_path.parent if str(out_path.parent) else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{out_path.stem}.", suffix=suffix, dir=str(out_dir))
+    os.close(fd)
+    try:
+        os.remove(temp_path)
+    except FileNotFoundError:
+        pass
+    return temp_path
+
+
+def _cleanup_raster_temp_outputs(path: Optional[str]) -> None:
+    if not path:
+        return
+    for candidate in (path, f"{path}.aux.xml", f"{path}.ovr", f"{path}.msk"):
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        except Exception:
+            pass
+
+
+def _validate_warp_output(path: str) -> None:
+    with rasterio.open(path) as ds:
+        if int(ds.width) <= 0 or int(ds.height) <= 0 or int(ds.count) <= 0:
+            raise RuntimeError("Warped raster is invalid")
 
 
 def _sanitize_manifest_value(key: str, value: Any) -> Any:
@@ -390,13 +836,13 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                     sleep(delay_s)
                     continue
                 msg = r.text[:500]
-                raise RuntimeError(
+                raise CDSEAuthenticationError(
                     _fmt_issue("AUTH", f"{flow_name} token generation failed ({r.status_code}): {msg}")
                 )
 
             token = r.json().get("access_token")
             if not token:
-                raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token response missing access_token."))
+                raise CDSEAuthenticationError(_fmt_issue("AUTH", f"{flow_name} token response missing access_token."))
             return token
         except requests.RequestException as e:
             last_error = e
@@ -411,7 +857,7 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                 )
                 sleep(delay_s)
                 continue
-            raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token request failed: {e}")) from e
+            raise CDSEAuthenticationError(_fmt_issue("AUTH", f"{flow_name} token request failed: {e}")) from e
         except Exception as e:
             last_error = e
             if attempt < attempts:
@@ -425,10 +871,12 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                 )
                 sleep(delay_s)
                 continue
-            raise
+            if isinstance(e, CDSEAuthenticationError):
+                raise
+            raise CDSEAuthenticationError(_fmt_issue("AUTH", f"{flow_name} token generation failed: {e}")) from e
     if last_error is not None:
-        raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token generation failed: {last_error}"))
-    raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token generation failed unexpectedly."))
+        raise CDSEAuthenticationError(_fmt_issue("AUTH", f"{flow_name} token generation failed: {last_error}"))
+    raise CDSEAuthenticationError(_fmt_issue("AUTH", f"{flow_name} token generation failed unexpectedly."))
 
 
 def _generate_cdse_public_access_token(username: str, password: str, totp: Optional[str] = None) -> str:
@@ -567,7 +1015,7 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
     """Prompt for CDSE username/password in terminal (CLI mode)."""
     stdin = getattr(sys, "stdin", None)
     if stdin is None or not callable(getattr(stdin, "isatty", None)) or not bool(stdin.isatty()):
-        raise RuntimeError(
+        raise CDSEAuthenticationError(
             _fmt_issue(
                 "AUTH",
                 "No interactive terminal available for CDSE username/password prompt. "
@@ -583,7 +1031,7 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
             pwd = getpass.getpass("CDSE password: ")
             totp = input("CDSE TOTP (optional): ").strip() or None
         except EOFError as e:
-            raise RuntimeError(
+            raise CDSEAuthenticationError(
                 _fmt_issue(
                     "AUTH",
                     "CDSE credential prompt reached EOF (non-interactive input stream). "
@@ -592,7 +1040,7 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
                 )
             ) from e
         except KeyboardInterrupt as e:
-            raise RuntimeError(_fmt_issue("AUTH", "CDSE login cancelled by user.")) from e
+            raise CDSEAuthenticationError(_fmt_issue("AUTH", "CDSE login cancelled by user.")) from e
 
         if user and pwd:
             return user, pwd, totp
@@ -604,7 +1052,7 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
             )
         )
 
-    raise RuntimeError(_fmt_issue("AUTH", "CDSE username/password were not provided."))
+    raise CDSEAuthenticationError(_fmt_issue("AUTH", "CDSE username/password were not provided."))
 
 
 def _request_cdse_userpass(
@@ -616,7 +1064,7 @@ def _request_cdse_userpass(
         if prompt_userpass_fn is not None:
             return prompt_userpass_fn()
         if threading.current_thread() is not threading.main_thread():
-            raise RuntimeError(
+            raise CDSEAuthenticationError(
                 _fmt_issue(
                     "AUTH",
                     "GUI credential prompt requested from a worker thread. "
@@ -662,10 +1110,15 @@ def _create_public_session_with_retry(
             sess = _create_cdse_public_session(user, pwd, totp=totp)
             _cache_cdse_public_credentials(username=user, password=pwd, totp=totp)
             return sess
+        except CDSEAuthenticationError as e:
+            lower_msg = str(e).lower()
+            if "cancelled" in lower_msg or "no interactive terminal" in lower_msg:
+                raise
+            last_error = e
         except RuntimeError as e:
             # User cancelled.
             if "cancelled" in str(e).lower():
-                raise
+                raise CDSEAuthenticationError(str(e)) from e
             last_error = e
         except Exception as e:
             last_error = e
@@ -678,7 +1131,7 @@ def _create_public_session_with_retry(
                 )
             )
 
-    raise RuntimeError(_fmt_issue("AUTH", f"CDSE username/password authentication failed: {last_error}"))
+    raise CDSEAuthenticationError(_fmt_issue("AUTH", f"CDSE username/password authentication failed: {last_error}"))
 
 
 def _prompt_cdse_userpass_gui() -> Tuple[str, str, Optional[str]]:
@@ -758,9 +1211,42 @@ def _prompt_cdse_userpass_gui() -> Tuple[str, str, Optional[str]]:
             pass
 
     if not result["ok"]:
-        raise RuntimeError(_fmt_issue("AUTH", "CDSE login cancelled by user."))
+        raise CDSEAuthenticationError(_fmt_issue("AUTH", "CDSE login cancelled by user."))
 
     return result["username"], result["password"], (result["totp"] or None)
+
+
+# Compatibility names for the live runtime path. Auth behavior is owned by
+# hypercoreg.pipeline.auth so token refresh semantics do not drift between the
+# modular helpers and the monolithic runtime facade.
+_BearerAuth = cdse_auth._BearerAuth
+_RefreshableBearerAuth = cdse_auth._RefreshableBearerAuth
+_cache_cdse_public_credentials = cdse_auth._cache_cdse_public_credentials
+_clear_cached_cdse_public_credentials = cdse_auth._clear_cached_cdse_public_credentials
+_create_cdse_bearer_session = cdse_auth._create_cdse_bearer_session
+_create_cdse_client_session = cdse_auth._create_cdse_client_session
+_create_cdse_public_session = cdse_auth._create_cdse_public_session
+_create_cdse_refreshable_bearer_session = (
+    cdse_auth._create_cdse_refreshable_bearer_session
+)
+_create_cdse_session_from_environment = cdse_auth._create_cdse_session_from_environment
+_create_cdse_session_with_retry = cdse_auth._create_cdse_session_with_retry
+_create_public_session_with_retry = cdse_auth._create_public_session_with_retry
+_decode_jwt_exp = cdse_auth._decode_jwt_exp
+_extract_cdse_credential_value = cdse_auth._extract_cdse_credential_value
+_force_refresh_cdse_session = cdse_auth._force_refresh_cdse_session
+_generate_cdse_client_access_token = cdse_auth._generate_cdse_client_access_token
+_generate_cdse_public_access_token = cdse_auth._generate_cdse_public_access_token
+_get_cached_cdse_public_credentials = cdse_auth._get_cached_cdse_public_credentials
+_prompt_cdse_userpass_cli = cdse_auth._prompt_cdse_userpass_cli
+_prompt_cdse_userpass_gui = cdse_auth._prompt_cdse_userpass_gui
+_read_cdse_credentials_file = cdse_auth._read_cdse_credentials_file
+_request_cdse_access_token = cdse_auth._request_cdse_access_token
+_request_cdse_userpass = cdse_auth._request_cdse_userpass
+_resolve_cdse_credentials_file_path = cdse_auth._resolve_cdse_credentials_file_path
+_retry_delay_seconds = cdse_auth._retry_delay_seconds
+_is_retryable_http_status = cdse_auth._is_retryable_http_status
+_fmt_issue = cdse_auth._fmt_issue
 
 
 def _get_attr(attributes, name, default=100.0):
@@ -772,6 +1258,35 @@ def _get_attr(attributes, name, default=100.0):
             except Exception:
                 return default
     return default
+
+
+def _selected_s2_metadata_from_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Build report metadata for the selected remote Sentinel-2 candidate."""
+    product_name = candidate.get("Name") or candidate.get("name") or candidate.get("Id") or "Unknown"
+    metadata: Dict[str, Any] = {"product_id": str(product_name)}
+
+    content_date = candidate.get("ContentDate")
+    start_time = content_date.get("Start") if isinstance(content_date, dict) else None
+    if start_time:
+        try:
+            metadata["date"] = (
+                datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+                .astimezone(timezone.utc)
+                .isoformat()
+            )
+        except Exception:
+            metadata["date"] = str(start_time)
+
+    cloud_cover = candidate.get("_metadata_cloud_pct")
+    if cloud_cover is None:
+        cloud_cover = _get_attr(candidate.get("Attributes", []), "cloudCover", None)
+    if cloud_cover is not None:
+        try:
+            metadata["cloud_cover_pct"] = float(cloud_cover)
+        except Exception:
+            metadata["cloud_cover_pct"] = cloud_cover
+
+    return metadata
 
 
 def _bbox_to_wkt(bbox):
@@ -813,6 +1328,42 @@ def _query_s2_with_retry(
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) is not None else None
         if status in (400, 401, 403):
+            try:
+                if _force_refresh_cdse_session(session):
+                    logger.warning(
+                        _fmt_issue(
+                            "CDSE_QUERY",
+                            f"Sentinel-2 query failed with HTTP {status}. "
+                            "Refreshing the existing CDSE token and retrying.",
+                        )
+                    )
+                    try:
+                        return (
+                            _query_s2(session, center_time, bbox, days_window, max_cloud),
+                            session,
+                        )
+                    except requests.HTTPError as refresh_retry_exc:
+                        refresh_retry_status = (
+                            refresh_retry_exc.response.status_code
+                            if getattr(refresh_retry_exc, "response", None) is not None
+                            else None
+                        )
+                        if refresh_retry_status not in (400, 401, 403):
+                            raise
+                        logger.warning(
+                            _fmt_issue(
+                                "CDSE_QUERY",
+                                "Refreshed CDSE session still failed with HTTP "
+                                f"{refresh_retry_status}.",
+                            )
+                        )
+            except Exception as refresh_exc:
+                logger.warning(
+                    _fmt_issue(
+                        "CDSE_QUERY",
+                        f"CDSE token refresh unavailable: {refresh_exc}",
+                    )
+                )
             logger.warning(
                 _fmt_issue(
                     "CDSE_QUERY",
@@ -824,12 +1375,31 @@ def _query_s2_with_retry(
                 allow_gui_prompt=allow_gui_prompt,
                 prompt_userpass_fn=prompt_userpass_fn,
             )
-            return _query_s2(public_session, center_time, bbox, days_window, max_cloud), public_session
+            try:
+                return (
+                    _query_s2(public_session, center_time, bbox, days_window, max_cloud),
+                    public_session,
+                )
+            except requests.HTTPError as retry_exc:
+                retry_status = (
+                    retry_exc.response.status_code
+                    if getattr(retry_exc, "response", None) is not None
+                    else None
+                )
+                if retry_status in (400, 401, 403):
+                    raise CDSEAuthenticationError(
+                        _fmt_issue(
+                            "CDSE_QUERY",
+                            f"Sentinel-2 query authentication failed after retry (HTTP {retry_status}).",
+                        )
+                    ) from retry_exc
+                raise
         raise
 
 
 def _query_s2(session, center_time, bbox, days_window=30, max_cloud=20):
     """Query Sentinel-2 L2A products from CDSE OData API."""
+    center_time = _to_utc_datetime(center_time)
     logger.info("Querying Sentinel-2...")
     logger.info(f"  Search window: +/-{days_window} days from {center_time.strftime('%Y-%m-%d')}")
     logger.info(f"  Max cloud cover: {max_cloud}%, Bounding box: {bbox}")
@@ -896,6 +1466,7 @@ def _query_s2(session, center_time, bbox, days_window=30, max_cloud=20):
 
 def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
     """Rank Sentinel-2 candidates by quality score and filter by overlap."""
+    center_time = _to_utc_datetime(center_time)
     logger.info(f"Ranking S2 candidates (min overlap: {min_overlap:.1%})...")
 
     minx, miny, maxx, maxy = bbox
@@ -918,7 +1489,12 @@ def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
         logger.info(f"  {it['Name']}: overlap={ov:.1%}, cloud={cloud:.1f}%")
         tdiff_h = abs((dt - center_time).total_seconds()) / 3600.0
         score = cloud + 0.5 * tdiff_h - 20.0 * ov
-        scored_candidates.append({'item': it, 'score': score, 'cloud': cloud, 'overlap': ov, 'time': dt})
+        ranked_item = dict(it)
+        ranked_item["_metadata_rank_score"] = float(score)
+        ranked_item["_metadata_overlap_fraction"] = float(ov)
+        ranked_item["_metadata_cloud_pct"] = float(cloud)
+        ranked_item["_metadata_temporal_distance_hours"] = float(tdiff_h)
+        scored_candidates.append({'item': ranked_item, 'score': score, 'cloud': cloud, 'overlap': ov, 'time': dt})
 
     if not scored_candidates:
         logger.error(_fmt_issue("CDSE_QUERY", "No suitable Sentinel-2 products found."))
@@ -947,6 +1523,7 @@ def _download_s2_product(
         f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({pid})/$value",
     ]
     zip_path = os.path.join(out_dir, f"{pid}.zip")
+    os.makedirs(out_dir, exist_ok=True)
 
     def _is_valid_zip_quick(path: str) -> bool:
         """Fast ZIP validity check without full CRC scan."""
@@ -979,6 +1556,7 @@ def _download_s2_product(
 
     def _attempt_download(sess: requests.Session):
         attempt_errors = []
+        auth_error = False
         audience_error = False
         download_attempts = max(1, int(HTTP_DOWNLOAD_RETRY_ATTEMPTS))
         for url in download_urls:
@@ -997,6 +1575,8 @@ def _download_s2_product(
                     with sess.get(url, stream=True, timeout=HTTP_TIMEOUT_CONNECT_READ) as r:
                         if r.status_code >= 400:
                             msg = r.text[:500]
+                            if r.status_code in (401, 403):
+                                auth_error = True
                             if "DAT-ZIP-609" in msg or "Token audience not allowed" in msg:
                                 audience_error = True
                             if _is_retryable_http_status(r.status_code) and attempt < download_attempts:
@@ -1024,33 +1604,50 @@ def _download_s2_product(
                         next_log = 200 * 1024 * 1024
                         last_emit_t = perf_counter()
                         last_emit_bytes = 0
-                        with open(zip_path, "wb") as f:
-                            for chunk in r.iter_content(1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                                    bytes_written += len(chunk)
-                                    now_t = perf_counter()
-                                    if (now_t - last_emit_t) >= 1.0 or (bytes_written - last_emit_bytes) >= (25 * 1024 * 1024):
-                                        download_mb = bytes_written / (1024 * 1024)
-                                        event_kwargs = {
-                                            "download_endpoint": url,
-                                            "download_mb": round(download_mb, 2),
-                                        }
-                                        if total_size > 0:
-                                            event_kwargs["download_total_mb"] = round(total_size / (1024 * 1024), 2)
-                                            event_kwargs["download_percent"] = round((100.0 * bytes_written) / total_size, 2)
-                                        _emit_progress(
-                                            progress_callback,
-                                            "Downloading Sentinel-2 reference",
-                                            scene_idx=scene_idx,
-                                            scene_total=scene_total,
-                                            **event_kwargs,
-                                        )
-                                        last_emit_t = now_t
-                                        last_emit_bytes = bytes_written
-                                    if bytes_written >= next_log:
-                                        logger.info(f"  Downloaded {bytes_written / (1024 * 1024):.1f} MB...")
-                                        next_log += 200 * 1024 * 1024
+                        tmp_fd, tmp_path = tempfile.mkstemp(
+                            prefix=f".{pid}.",
+                            suffix=".part",
+                            dir=out_dir,
+                        )
+                        try:
+                            with os.fdopen(tmp_fd, "wb") as f:
+                                for chunk in r.iter_content(1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                                        bytes_written += len(chunk)
+                                        now_t = perf_counter()
+                                        if (now_t - last_emit_t) >= 1.0 or (bytes_written - last_emit_bytes) >= (25 * 1024 * 1024):
+                                            download_mb = bytes_written / (1024 * 1024)
+                                            event_kwargs = {
+                                                "download_endpoint": url,
+                                                "download_mb": round(download_mb, 2),
+                                            }
+                                            if total_size > 0:
+                                                event_kwargs["download_total_mb"] = round(total_size / (1024 * 1024), 2)
+                                                event_kwargs["download_percent"] = round((100.0 * bytes_written) / total_size, 2)
+                                            _emit_progress(
+                                                progress_callback,
+                                                "Downloading Sentinel-2 reference",
+                                                scene_idx=scene_idx,
+                                                scene_total=scene_total,
+                                                **event_kwargs,
+                                            )
+                                            last_emit_t = now_t
+                                            last_emit_bytes = bytes_written
+                                        if bytes_written >= next_log:
+                                            logger.info(f"  Downloaded {bytes_written / (1024 * 1024):.1f} MB...")
+                                            next_log += 200 * 1024 * 1024
+                            if _is_valid_zip_quick(tmp_path):
+                                os.replace(tmp_path, zip_path)
+                            else:
+                                attempt_errors.append(f"{url} -> downloaded file is not a valid zip")
+                                break
+                        finally:
+                            if os.path.exists(tmp_path):
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
                         logger.info(f"  Download completed: {bytes_written / (1024 * 1024):.1f} MB")
                         final_kwargs = {
                             "download_endpoint": url,
@@ -1093,44 +1690,150 @@ def _download_s2_product(
                 except Exception as e:
                     attempt_errors.append(f"{url} -> request error: {e}")
                     break
-        return False, attempt_errors, audience_error
+        return False, attempt_errors, auth_error or audience_error
 
-    ok, errors, saw_audience_error = _attempt_download(session)
-    if ok:
+    lock_path = os.path.join(out_dir, f".{pid}.zip.lock")
+    lock_fd = _acquire_cache_lock(lock_path)
+    try:
+        if os.path.exists(zip_path) and _is_valid_zip_quick(zip_path):
+            logger.info("S2 already downloaded after waiting for product lock.")
+            return zip_path, session
+
+        ok, errors, saw_auth_error = _attempt_download(session)
+        if ok:
+            return zip_path, session
+
+        if saw_auth_error:
+            try:
+                if _force_refresh_cdse_session(session):
+                    logger.warning(
+                        _fmt_issue(
+                            "S2_DOWNLOAD",
+                            "Sentinel-2 download authentication failed. "
+                            "Refreshing the existing CDSE token and retrying.",
+                        )
+                    )
+                    ok2, errors2, auth2 = _attempt_download(session)
+                    if ok2:
+                        return zip_path, session
+                    errors.extend(errors2)
+                    saw_auth_error = saw_auth_error or auth2
+            except Exception as e:
+                logger.warning(
+                    _fmt_issue(
+                        "S2_DOWNLOAD",
+                        f"CDSE token refresh unavailable: {e}",
+                    )
+                )
+
+            fallback_session = None
+            try:
+                logger.warning(
+                    _fmt_issue(
+                        "S2_DOWNLOAD",
+                        "Sentinel-2 download authentication failed. Trying username/password token flow.",
+                    )
+                )
+                fallback_session = _create_public_session_with_retry(
+                    allow_gui_prompt=allow_gui_prompt,
+                    prompt_userpass_fn=prompt_userpass_fn,
+                )
+            except Exception as e:
+                logger.warning(_fmt_issue("S2_DOWNLOAD", f"Username/password fallback unavailable: {e}"))
+
+            if fallback_session is not None:
+                ok2, errors2, auth2 = _attempt_download(fallback_session)
+                if ok2:
+                    return zip_path, fallback_session
+                errors.extend(errors2)
+                saw_auth_error = saw_auth_error or auth2
+
+        if saw_auth_error:
+            raise CDSEAuthenticationError(
+                _fmt_issue(
+                    "S2_DOWNLOAD",
+                    "CDSE authentication failed for product download. "
+                    "Please re-run and log in again with CDSE username/password. "
+                    f"Endpoint attempts: {' | '.join(errors[:3])}",
+                )
+            )
+
+        if errors:
+            raise RuntimeError(_fmt_issue("S2_DOWNLOAD", f"S2 download failed on all endpoints: {' | '.join(errors[:3])}"))
         return zip_path, session
+    finally:
+        _release_cache_lock(lock_fd, lock_path)
 
-    # Fallback: generate cdse-public token from username/password if available.
-    if saw_audience_error:
-        fallback_session = None
-        try:
-            logger.warning(_fmt_issue("S2_DOWNLOAD", "Token audience rejected. Trying username/password token flow."))
-            fallback_session = _create_public_session_with_retry(
-                allow_gui_prompt=allow_gui_prompt,
-                prompt_userpass_fn=prompt_userpass_fn,
-            )
-        except Exception as e:
-            logger.warning(_fmt_issue("S2_DOWNLOAD", f"Username/password fallback unavailable: {e}"))
 
-        if fallback_session is not None:
-            ok2, errors2, audience2 = _attempt_download(fallback_session)
-            if ok2:
-                return zip_path, fallback_session
-            errors.extend(errors2)
-            saw_audience_error = saw_audience_error or audience2
+def _build_s2_stack_vrt(
+    *,
+    bands_paths: Dict[str, str],
+    out_s2_path: str,
+    s2_crs: Any,
+    output_bounds: Sequence[float],
+    target_resolution: Sequence[float],
+    resample_bands: Sequence[str],
+) -> str:
+    """Build a stacked GDAL VRT from /vsizip/ JP2 sources without materializing pixels."""
+    from osgeo import gdal
 
-    if saw_audience_error:
-        raise RuntimeError(
-            _fmt_issue(
-                "S2_DOWNLOAD",
-                "CDSE token audience not allowed for product download (DAT-ZIP-609). "
-                "Please re-run and log in again with CDSE username/password. "
-                f"Endpoint attempts: {' | '.join(errors[:3])}",
-            )
+    gdal.UseExceptions()
+    vrt_path = str(out_s2_path)
+    if not vrt_path.lower().endswith(".vrt"):
+        vrt_path = os.path.splitext(vrt_path)[0] + ".vrt"
+    os.makedirs(os.path.dirname(os.path.abspath(vrt_path)), exist_ok=True)
+    base = os.path.splitext(vrt_path)[0]
+    dst_srs = s2_crs.to_wkt() if hasattr(s2_crs, "to_wkt") else str(s2_crs)
+    _require_s2_l2a_band_paths(
+        bands_paths,
+        resample_bands,
+        context="Sentinel-2 VRT stack source",
+    )
+    warped_vrts: List[str] = []
+    for band_name in list(resample_bands):
+        src_path = bands_paths.get(str(band_name))
+        band_vrt = f"{base}_{band_name}.vrt"
+        resample_alg = "near" if str(band_name).upper() == "SCL" else "bilinear"
+        opts = gdal.WarpOptions(
+            format="VRT",
+            dstSRS=dst_srs,
+            outputBounds=[float(v) for v in output_bounds[:4]],
+            outputBoundsSRS=dst_srs,
+            xRes=float(target_resolution[0]),
+            yRes=float(target_resolution[1]),
+            resampleAlg=resample_alg,
+            srcNodata=0,
+            dstNodata=0,
         )
-
-    if errors:
-        raise RuntimeError(_fmt_issue("S2_DOWNLOAD", f"S2 download failed on all endpoints: {' | '.join(errors[:3])}"))
-    return zip_path, session
+        ds = gdal.Warp(band_vrt, src_path, options=opts)
+        if ds is None:
+            raise RuntimeError(f"GDAL failed to build warped VRT for {band_name}.")
+        try:
+            ds.GetRasterBand(1).SetDescription(str(band_name))
+        except Exception:
+            pass
+        ds = None
+        warped_vrts.append(band_vrt)
+    if not warped_vrts:
+        raise RuntimeError("No Sentinel-2 band VRTs were created.")
+    build_opts = gdal.BuildVRTOptions(separate=True)
+    ds = gdal.BuildVRT(vrt_path, warped_vrts, options=build_opts)
+    if ds is None:
+        raise RuntimeError("GDAL failed to build stacked Sentinel-2 VRT.")
+    if int(ds.RasterCount) != int(len(resample_bands)):
+        actual_count = int(ds.RasterCount)
+        ds = None
+        raise RuntimeError(
+            f"Sentinel-2 VRT stack has {actual_count} bands; expected {len(resample_bands)} "
+            f"({_format_expected_s2_l2a_bands()})."
+        )
+    for bidx, band_name in enumerate(list(resample_bands), 1):
+        try:
+            ds.GetRasterBand(bidx).SetDescription(str(band_name))
+        except Exception:
+            pass
+    ds = None
+    return vrt_path
 
 
 def _build_s2_stack(
@@ -1140,10 +1843,32 @@ def _build_s2_stack(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     scene_idx: int = 1,
     scene_total: int = 1,
+    product_id: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    use_cache: bool = True,
+    cache_info: Optional[Dict[str, Any]] = None,
+    stack_mode: str = "materialized",
+    scl_exclude_classes: Optional[Sequence[int]] = None,
 ):
-    """Build 7-band Sentinel-2 reference stack from L2A ZIP product."""
+    """Build a cropped Sentinel-2 L2A spectral reference stack from an L2A ZIP product."""
     from osgeo import gdal
     gdal.UseExceptions()
+
+    if cache_info is not None:
+        cache_info.update(
+            {
+                "enabled": bool(use_cache),
+                "hit": False,
+                "cache_key": None,
+                "cache_path": None,
+                "valid_mask_path": None,
+                "jp2_access": "vsizip",
+                "windowed_write": True,
+                "stack_mode": str(stack_mode or "materialized"),
+                "vrt_path": None,
+                "source_zip_can_delete": True,
+            }
+        )
 
     log_section_header("BUILDING SENTINEL-2 STACK")
     _emit_progress(
@@ -1154,93 +1879,26 @@ def _build_s2_stack(
         substage="Inspecting granule metadata",
     )
 
-    # Find reference band and granule
-    reference_band = "B04"
-    granule_prefix = None
-
-    with zipfile.ZipFile(zip_path) as z:
-        all_files = z.namelist()
-        b04_hits = [n for n in all_files if f"_{reference_band}_10m.jp2" in n and "/GRANULE/" in n]
-        if not b04_hits:
-            reference_band = "B08"
-            b04_hits = [n for n in all_files if f"_{reference_band}_10m.jp2" in n and "/GRANULE/" in n]
-        if not b04_hits:
-            raise ValueError(f"No reference band found in S2 product.")
-
-        reference_jp2_path = b04_hits[0]
-        if "/GRANULE/" in reference_jp2_path:
-            parts = reference_jp2_path.split("/GRANULE/")
-            granule_id = parts[1].split("/")[0]
-            granule_prefix = parts[0] + "/GRANULE/" + granule_id + "/"
-            logger.info(f"  Selected granule: {granule_id}")
-            _emit_progress(
-                progress_callback,
-                "Building Sentinel-2 stack",
-                scene_idx=scene_idx,
-                scene_total=scene_total,
-                substage=f"Selected granule {granule_id}",
-            )
-
-    bands_to_extract = {
-        "B02": "_B02_10m.jp2", "B03": "_B03_10m.jp2", "B04": "_B04_10m.jp2",
-        "B08": "_B08_10m.jp2", "B11": "_B11_20m.jp2", "B12": "_B12_20m.jp2",
-        "SCL": "_SCL_20m.jp2"
-    }
-
-    bands_jp2_paths = {}
-    bands_extracted_paths = {}
-
-    with zipfile.ZipFile(zip_path) as z:
-        total_extract = len(bands_to_extract)
-        for idx, (band_name, suffix) in enumerate(bands_to_extract.items(), 1):
-            _emit_progress(
-                progress_callback,
-                "Building Sentinel-2 stack",
-                scene_idx=scene_idx,
-                scene_total=scene_total,
-                substage=f"Extracting {band_name} ({idx}/{total_extract})",
-                step=idx,
-                step_total=total_extract,
-            )
-            hits = [n for n in z.namelist() if n.startswith(granule_prefix) and suffix in n]
-            if band_name == "SCL" and not hits:
-                hits = [n for n in z.namelist() if n.startswith(granule_prefix) and "_SCL_60m.jp2" in n]
-            if not hits:
-                if band_name == "SCL":
-                    continue
-                raise ValueError(f"Band {band_name} not found in granule.")
-
-            jp2_path_in_zip = hits[0]
-            bands_jp2_paths[band_name] = jp2_path_in_zip
-            z.extract(jp2_path_in_zip, os.path.dirname(out_s2_path))
-            bands_extracted_paths[band_name] = os.path.join(os.path.dirname(out_s2_path), jp2_path_in_zip)
-
-    # Convert JP2 to GeoTIFF
-    bands_paths = {}
-    for idx, (band_name, jp2_path) in enumerate(bands_extracted_paths.items(), 1):
-        _emit_progress(
-            progress_callback,
-            "Building Sentinel-2 stack",
-            scene_idx=scene_idx,
-            scene_total=scene_total,
-            substage=f"Translating {band_name} JP2 to GeoTIFF ({idx}/{len(bands_extracted_paths)})",
-            step=idx,
-            step_total=len(bands_extracted_paths),
-        )
-        if jp2_path.lower().endswith('.jp2'):
-            tif_path = jp2_path.replace('.jp2', '_temp.tif').replace('.JP2', '_temp.tif')
-            try:
-                ds = gdal.Open(jp2_path)
-                if ds:
-                    gdal.Translate(tif_path, ds, format='GTiff', creationOptions=['COMPRESS=LZW', 'TILED=YES'])
-                    ds = None
-                    bands_paths[band_name] = tif_path
-                else:
-                    bands_paths[band_name] = jp2_path
-            except Exception:
-                bands_paths[band_name] = jp2_path
-        else:
-            bands_paths[band_name] = jp2_path
+    resample_bands = list(S2_L2A_REFERENCE_STACK_BANDS)
+    spectral_output_bands = set(S2_L2A_OUTPUT_BANDS)
+    active_scl_exclude_classes = _coerce_scl_exclude_classes(scl_exclude_classes)
+    resolved_paths = _resolve_s2_zip_band_paths(zip_path, list(resample_bands))
+    reference_band = str(resolved_paths.get("reference_band") or "B04")
+    granule_id = str(resolved_paths.get("granule_id") or "")
+    bands_paths = dict(resolved_paths.get("paths") or {})
+    _require_s2_l2a_band_paths(
+        bands_paths,
+        resample_bands,
+        context="Selected Sentinel-2 granule",
+    )
+    logger.info(f"  Selected granule: {granule_id}")
+    _emit_progress(
+        progress_callback,
+        "Building Sentinel-2 stack",
+        scene_idx=scene_idx,
+        scene_total=scene_total,
+        substage=f"Selected granule {granule_id}",
+    )
 
     # Define reference grid
     _emit_progress(
@@ -1261,83 +1919,290 @@ def _build_s2_stack(
         window = window.round_offsets().round_shape()
         ref_transform = ref.window_transform(window)
         ref_height, ref_width = int(window.height), int(window.width)
+        target_resolution = (abs(float(ref_transform.a)), abs(float(ref_transform.e)))
+        overlap_bounds_projected = (
+            min(float(minx), float(maxx)) - buffer,
+            min(float(miny), float(maxy)) - buffer,
+            max(float(minx), float(maxx)) + buffer,
+            max(float(miny), float(maxy)) + buffer,
+        )
 
-    # Resample all bands
-    stack = []
-    resample_bands = ["B02", "B03", "B04", "B08", "B11", "B12"]
-    for idx, band_name in enumerate(resample_bands, 1):
+    cache_lock_fd: Optional[int] = None
+    cache_lock_path: Optional[str] = None
+    cache_stack_path: Optional[str] = None
+    cache_mask_path: Optional[str] = None
+    cache_key: Optional[str] = None
+    stack_mode_token = str(stack_mode or DEFAULT_CONFIG.get("s2_stack_mode", "materialized")).strip().lower()
+    if stack_mode_token not in {"materialized", "vrt"}:
+        stack_mode_token = "materialized"
+    cache_enabled = bool(use_cache) and bool(cache_dir)
+    if cache_enabled:
+        cache_key = _build_s2_cache_key(
+            product_id=str(product_id or Path(str(zip_path)).stem),
+            selected_bands=resample_bands,
+            target_crs=s2_crs,
+            target_resolution=target_resolution,
+            overlap_bounds=overlap_bounds_projected,
+            scl_exclude_classes=active_scl_exclude_classes,
+        )
+        cache_ext = ".vrt" if stack_mode_token == "vrt" else ".tif"
+        cache_stack_path = os.path.join(str(cache_dir), f"{cache_key}{cache_ext}")
+        cache_mask_path = _s2_valid_mask_path(cache_stack_path)
+        cached_vrt_zip_path = (
+            os.path.join(str(cache_dir), f"{cache_key}.zip")
+            if stack_mode_token == "vrt"
+            else None
+        )
+        if cache_info is not None:
+            cache_info.update(
+                {
+                    "enabled": True,
+                    "cache_key": cache_key,
+                    "cache_path": cache_stack_path,
+                    "valid_mask_path": cache_mask_path,
+                    "stack_mode": stack_mode_token,
+                }
+            )
+        os.makedirs(str(cache_dir), exist_ok=True)
+        if os.path.exists(cache_stack_path):
+            cache_skip_reason = None
+            cache_ready = stack_mode_token != "vrt" or bool(
+                cached_vrt_zip_path and os.path.exists(cached_vrt_zip_path)
+            )
+            if cache_ready:
+                try:
+                    _require_s2_l2a_output_band_count(
+                        cache_stack_path,
+                        context="Cached Sentinel-2 stack",
+                    )
+                except Exception as exc:
+                    cache_ready = False
+                    cache_skip_reason = str(exc)
+            if cache_ready and stack_mode_token == "vrt":
+                out_s2_path = cache_stack_path
+            elif cache_ready:
+                _copy_s2_stack_with_mask(cache_stack_path, out_s2_path)
+            if cache_ready:
+                if cache_info is not None:
+                    cache_info["hit"] = True
+                    if stack_mode_token == "vrt":
+                        cache_info["zip_retained"] = True
+                        cache_info["vrt_zip_path"] = cached_vrt_zip_path
+                        cache_info["source_zip_can_delete"] = True
+                logger.info("Reused cached S2 stack: %s", cache_stack_path)
+                return out_s2_path, s2_crs
+            if cache_skip_reason:
+                logger.warning(_fmt_issue("S2_CACHE", f"Ignoring cached S2 stack: {cache_skip_reason}"))
+            else:
+                logger.warning(
+                    _fmt_issue(
+                        "S2_CACHE",
+                        f"Ignoring cached VRT without retained ZIP dependency: {cache_stack_path}",
+                    )
+                )
+        cache_lock_path = f"{cache_stack_path}.lock"
+        cache_lock_fd = _acquire_cache_lock(cache_lock_path)
+        if cache_lock_fd is not None and os.path.exists(cache_stack_path):
+            cache_skip_reason = None
+            cache_ready = stack_mode_token != "vrt" or bool(
+                cached_vrt_zip_path and os.path.exists(cached_vrt_zip_path)
+            )
+            if cache_ready:
+                try:
+                    _require_s2_l2a_output_band_count(
+                        cache_stack_path,
+                        context="Cached Sentinel-2 stack",
+                    )
+                except Exception as exc:
+                    cache_ready = False
+                    cache_skip_reason = str(exc)
+            if cache_ready and stack_mode_token == "vrt":
+                out_s2_path = cache_stack_path
+            elif cache_ready:
+                _copy_s2_stack_with_mask(cache_stack_path, out_s2_path)
+            if cache_ready:
+                if cache_info is not None:
+                    cache_info["hit"] = True
+                    if stack_mode_token == "vrt":
+                        cache_info["zip_retained"] = True
+                        cache_info["vrt_zip_path"] = cached_vrt_zip_path
+                        cache_info["source_zip_can_delete"] = True
+                _release_cache_lock(cache_lock_fd, cache_lock_path)
+                logger.info("Reused cached S2 stack after lock wait: %s", cache_stack_path)
+                return out_s2_path, s2_crs
+            if cache_skip_reason:
+                logger.warning(_fmt_issue("S2_CACHE", f"Rebuilding cached S2 stack: {cache_skip_reason}"))
+            else:
+                logger.warning(
+                    _fmt_issue(
+                        "S2_CACHE",
+                        f"Rebuilding cached VRT because retained ZIP is missing: {cache_stack_path}",
+                    )
+                )
+
+    try:
+        if stack_mode_token == "vrt":
+            target_vrt_path = (
+                cache_stack_path
+                if cache_stack_path and cache_lock_fd is not None
+                else out_s2_path
+            )
+            zip_for_vrt = str(zip_path)
+            cached_zip_path = None
+            if cache_stack_path and cache_lock_fd is not None and cache_key:
+                cached_zip_path = os.path.join(str(cache_dir), f"{cache_key}.zip")
+                if not os.path.exists(cached_zip_path):
+                    tmp_zip_path = f"{cached_zip_path}.{uuid.uuid4().hex}.tmp"
+                    shutil.copy2(str(zip_path), tmp_zip_path)
+                    os.replace(tmp_zip_path, cached_zip_path)
+                zip_for_vrt = cached_zip_path
+                bands_paths = dict(
+                    _resolve_s2_zip_band_paths(
+                        zip_for_vrt,
+                        list(resample_bands),
+                    ).get("paths")
+                    or {}
+                )
+                _require_s2_l2a_band_paths(
+                    bands_paths,
+                    resample_bands,
+                    context="Cached Sentinel-2 ZIP dependency",
+                )
+            vrt_path = _build_s2_stack_vrt(
+                bands_paths=bands_paths,
+                out_s2_path=target_vrt_path,
+                s2_crs=s2_crs,
+                output_bounds=overlap_bounds_projected,
+                target_resolution=target_resolution,
+                resample_bands=resample_bands,
+            )
+            out_s2_path = vrt_path
+            if cache_info is not None:
+                zip_dependency_info = _s2_vrt_zip_dependency_info(
+                    source_zip_path=str(zip_path),
+                    zip_for_vrt=str(zip_for_vrt),
+                    cached_zip_path=cached_zip_path,
+                )
+                cache_info.update(
+                    {
+                        "cache_path": cache_stack_path or vrt_path,
+                        "vrt_path": vrt_path,
+                        "stack_mode": "vrt",
+                        **zip_dependency_info,
+                    }
+                )
+            logger.info("S2 VRT stack created successfully: %s", vrt_path)
+            return out_s2_path, s2_crs
+
+        # Write stack window-by-window to avoid full-scene np.stack() memory spikes.
         _emit_progress(
             progress_callback,
             "Building Sentinel-2 stack",
             scene_idx=scene_idx,
             scene_total=scene_total,
-            substage=f"Resampling {band_name} ({idx}/{len(resample_bands)})",
-            step=idx,
-            step_total=len(resample_bands),
+            substage="Writing stacked reference raster",
         )
-        if band_name not in bands_paths:
-            stack.append(np.zeros((ref_height, ref_width), dtype=np.uint16))
-            continue
-        with rasterio.open(bands_paths[band_name]) as src:
-            data = np.zeros((ref_height, ref_width), dtype=np.uint16)
-            rasterio.warp.reproject(
-                source=rasterio.band(src, 1), destination=data,
-                src_transform=src.transform, src_crs=src.crs,
-                dst_transform=ref_transform, dst_crs=s2_crs,
-                resampling=Resampling.bilinear, dst_nodata=0
+        out_mask_path = _s2_valid_mask_path(out_s2_path)
+        dst_profile = {
+            "driver": "GTiff",
+            "width": ref_width,
+            "height": ref_height,
+            "count": len(resample_bands),
+            "dtype": "uint16",
+            "crs": s2_crs,
+            "transform": ref_transform,
+            "compress": "lzw",
+            "tiled": True,
+            "BIGTIFF": "YES",
+        }
+        mask_profile = dict(dst_profile)
+        mask_profile.update(count=1, dtype="uint8", nodata=0)
+
+        masked_pixels = 0
+        total_pixels = 0
+        with contextlib.ExitStack() as stack_ctx:
+            srcs = {
+                band_name: stack_ctx.enter_context(rasterio.open(path))
+                for band_name, path in bands_paths.items()
+            }
+            dst = stack_ctx.enter_context(rasterio.open(out_s2_path, "w", **dst_profile))
+            mask_dst = stack_ctx.enter_context(rasterio.open(out_mask_path, "w", **mask_profile))
+            for band_index, band_name in enumerate(resample_bands, 1):
+                dst.set_band_description(band_index, str(band_name))
+
+            windows = list(dst.block_windows(1))
+            for window_idx, (_block_idx, dst_window) in enumerate(windows, 1):
+                if window_idx == 1 or window_idx == len(windows) or window_idx % 64 == 0:
+                    _emit_progress(
+                        progress_callback,
+                        "Building Sentinel-2 stack",
+                        scene_idx=scene_idx,
+                        scene_total=scene_total,
+                        substage=f"Resampling stack window {window_idx}/{len(windows)}",
+                        step=window_idx,
+                        step_total=len(windows),
+                    )
+
+                shape_hw = (int(dst_window.height), int(dst_window.width))
+                dst_window_transform = rasterio.windows.transform(dst_window, ref_transform)
+                scl_data = np.zeros(shape_hw, dtype=np.uint16)
+                if "SCL" in srcs:
+                    scl_src = srcs["SCL"]
+                    _reproject_source_window_to_destination(
+                        scl_src,
+                        band_index=1,
+                        destination=scl_data,
+                        dst_transform=dst_window_transform,
+                        dst_crs=s2_crs,
+                        resampling=Resampling.nearest,
+                        dst_nodata=0,
+                    )
+                cloud_shadow_mask = np.isin(scl_data, active_scl_exclude_classes)
+                any_valid_band = np.zeros(shape_hw, dtype=bool)
+                for band_index, band_name in enumerate(resample_bands, 1):
+                    data = np.zeros(shape_hw, dtype=np.uint16)
+                    src = srcs.get(band_name)
+                    if src is not None:
+                        resampling_method = (
+                            Resampling.nearest if str(band_name).upper() == "SCL" else Resampling.bilinear
+                        )
+                        _reproject_source_window_to_destination(
+                            src,
+                            band_index=1,
+                            destination=data,
+                            dst_transform=dst_window_transform,
+                            dst_crs=s2_crs,
+                            resampling=resampling_method,
+                            dst_nodata=0,
+                        )
+                    if band_name in spectral_output_bands and np.any(cloud_shadow_mask):
+                        data[cloud_shadow_mask] = 0
+                    if band_name in spectral_output_bands:
+                        any_valid_band |= data != 0
+                    dst.write(data, band_index, window=dst_window)
+                valid_mask = (~cloud_shadow_mask & any_valid_band).astype(np.uint8)
+                mask_dst.write(valid_mask, 1, window=dst_window)
+                masked_pixels += int(np.count_nonzero(cloud_shadow_mask))
+                total_pixels += int(cloud_shadow_mask.size)
+
+        if total_pixels > 0:
+            logger.info(
+                "  Applied cloud/shadow mask: %.1f%% masked",
+                100.0 * float(masked_pixels) / float(total_pixels),
             )
-            stack.append(data)
 
-    # Handle SCL
-    _emit_progress(
-        progress_callback,
-        "Building Sentinel-2 stack",
-        scene_idx=scene_idx,
-        scene_total=scene_total,
-        substage="Resampling SCL mask",
-    )
-    if "SCL" in bands_paths:
-        with rasterio.open(bands_paths["SCL"]) as src:
-            scl_data = np.zeros((ref_height, ref_width), dtype=np.uint8)
-            rasterio.warp.reproject(
-                source=rasterio.band(src, 1), destination=scl_data,
-                src_transform=src.transform, src_crs=src.crs,
-                dst_transform=ref_transform, dst_crs=s2_crs,
-                resampling=Resampling.nearest, dst_nodata=0
-            )
-            stack.append(scl_data)
-    else:
-        stack.append(np.zeros((ref_height, ref_width), dtype=np.uint8))
-
-    stack = np.stack(stack)
-
-    # Apply cloud mask
-    if "SCL" in bands_paths:
-        scl_band = stack[6]
-        cloud_shadow_mask = np.isin(scl_band, list(SCL_EXCLUDE_CLASSES.keys()))
-        for i in range(6):
-            stack[i][cloud_shadow_mask] = 0
-        logger.info(f"  Applied cloud/shadow mask: {100 * np.sum(cloud_shadow_mask) / cloud_shadow_mask.size:.1f}% masked")
-
-    # Write stack
-    _emit_progress(
-        progress_callback,
-        "Building Sentinel-2 stack",
-        scene_idx=scene_idx,
-        scene_total=scene_total,
-        substage="Writing stacked reference raster",
-    )
-    with rasterio.open(out_s2_path, "w", driver="GTiff", width=ref_width, height=ref_height,
-                       count=7, dtype=stack.dtype, crs=s2_crs, transform=ref_transform,
-                       compress="lzw", tiled=True, BIGTIFF="YES") as dst:
-        dst.write(stack)
-
-    # Cleanup
-    for p in bands_paths.values():
-        try:
-            os.remove(p)
-        except Exception:
-            pass
+        if cache_stack_path and cache_lock_fd is not None:
+            tmp_cache_stack = f"{cache_stack_path}.{uuid.uuid4().hex}.tmp"
+            tmp_cache_mask = f"{cache_mask_path}.{uuid.uuid4().hex}.tmp" if cache_mask_path else None
+            shutil.copy2(out_s2_path, tmp_cache_stack)
+            os.replace(tmp_cache_stack, cache_stack_path)
+            if cache_mask_path and os.path.exists(out_mask_path) and tmp_cache_mask:
+                shutil.copy2(out_mask_path, tmp_cache_mask)
+                os.replace(tmp_cache_mask, cache_mask_path)
+            logger.info("Cached S2 stack for reuse: %s", cache_stack_path)
+    finally:
+        if cache_lock_path is not None and cache_lock_fd is not None:
+            _release_cache_lock(cache_lock_fd, cache_lock_path)
 
     logger.info("S2 stack created successfully")
     _emit_progress(
@@ -1368,8 +2233,8 @@ def _reproject_reference_stack_to_target_crs(
     """
     Reproject a Sentinel-2 reference stack into a target CRS.
 
-    The last band (typically SCL) is reprojected with nearest-neighbor;
-    all other bands use bilinear interpolation.
+    Spectral bands use bilinear interpolation; explicitly labelled SCL bands
+    use nearest-neighbor interpolation.
     """
     out: Dict[str, Any] = {
         "ok": False,
@@ -1400,13 +2265,19 @@ def _reproject_reference_stack_to_target_crs(
                 out["reprojected"] = False
                 return out
 
+            transform_kwargs: Dict[str, Any] = {}
+            if bool(getattr(source_crs_obj, "is_projected", False)) and bool(
+                getattr(target_crs_obj, "is_projected", False)
+            ):
+                transform_kwargs["resolution"] = src.res
+
             dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
                 src.crs,
                 target_crs_obj,
                 src.width,
                 src.height,
                 *src.bounds,
-                resolution=src.res,
+                **transform_kwargs,
             )
 
             dst_nodata = src.nodata if src.nodata is not None else 0
@@ -1423,44 +2294,49 @@ def _reproject_reference_stack_to_target_crs(
                     "BIGTIFF": "YES",
                 }
             )
+            profile.pop("blockxsize", None)
+            profile.pop("blockysize", None)
+            if int(dst_width) < 16 or int(dst_height) < 16:
+                profile["tiled"] = False
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
 
                 for bidx in range(1, int(src.count) + 1):
                     band_dtype = np.dtype(src.dtypes[bidx - 1])
-                    dest = np.full(
-                        (int(dst_height), int(dst_width)),
-                        fill_value=dst_nodata,
-                        dtype=band_dtype,
-                    )
-
                     band_desc = src.descriptions[bidx - 1]
-                    is_scl_band = (
-                        (band_desc is not None and "scl" in str(band_desc).lower())
-                        or (bidx == int(src.count) and int(src.count) >= 7)
-                    )
+                    is_scl_band = band_desc is not None and "scl" in str(band_desc).lower()
                     band_resampling = Resampling.nearest if is_scl_band else Resampling.bilinear
 
-                    rasterio.warp.reproject(
-                        source=rasterio.band(src, bidx),
-                        destination=dest,
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=dst_transform,
-                        dst_crs=target_crs_obj,
-                        src_nodata=src.nodata,
-                        dst_nodata=dst_nodata,
-                        resampling=band_resampling,
-                    )
-                    dst.write(dest, bidx)
+                    for _block_idx, dst_window in dst.block_windows(bidx):
+                        dest = np.full(
+                            (int(dst_window.height), int(dst_window.width)),
+                            fill_value=dst_nodata,
+                            dtype=band_dtype,
+                        )
+                        dst_window_transform = rasterio.windows.transform(dst_window, dst_transform)
+                        _reproject_source_window_to_destination(
+                            src,
+                            band_index=bidx,
+                            destination=dest,
+                            dst_transform=dst_window_transform,
+                            dst_crs=target_crs_obj,
+                            src_nodata=src.nodata,
+                            dst_nodata=dst_nodata,
+                            resampling=band_resampling,
+                        )
+                        dst.write(dest, bidx, window=dst_window)
 
                     if band_desc:
                         dst.set_band_description(bidx, band_desc)
-                    band_tags = src.tags(bidx)
+                    band_tags = filter_band_tags_for_raster_copy(src.tags(bidx))
                     if band_tags:
                         dst.update_tags(bidx, **band_tags)
 
@@ -1473,11 +2349,125 @@ def _reproject_reference_stack_to_target_crs(
         return out
 
 
-def _create_scene_folder_structure(base_output_dir, sensor_tag, date_tag, unique_hex):
+def _build_scene_output_root(base_output_dir: str, sensor_tag: str, date_tag: str, time_tag: str) -> str:
+    """Return the nested root folder for one acquisition-time scene."""
+    return os.path.join(base_output_dir, f"{sensor_tag}_{date_tag}", time_tag)
+
+
+def _scene_collision_suffix_from_source(source_path: Optional[str]) -> Optional[str]:
+    """Return a short stable suffix for same-acquisition products."""
+    candidates = _scene_collision_suffix_candidates_from_source(source_path)
+    return candidates[0] if candidates else None
+
+
+def _scene_collision_suffix_candidates_from_source(source_path: Optional[str]) -> List[str]:
+    """Return stable suffixes for same-acquisition products, from compact to specific."""
+    if not source_path:
+        return []
+    stem = _portable_stem(source_path, fallback="scene")
+    candidates: List[str] = []
+    version_match = re.search(r"[_-]v(\d{6})(?:[_-]|$)", stem, flags=re.IGNORECASE)
+    if version_match:
+        candidates.append(f"V{version_match.group(1)}")
+    product_match = re.search(
+        r"[_-]v(\d{6})[_-](\d{8}t\d{6}z)(?:[_-]|$)",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if product_match:
+        candidates.append(f"V{product_match.group(1)}_{product_match.group(2).upper()}")
+    prisma_match = re.search(
+        r"^PRS_[A-Z0-9]+_[A-Z0-9]+_(\d{14})_(\d{14})_([A-Za-z0-9]+)$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if prisma_match:
+        candidates.append(f"PRS_{prisma_match.group(2)}_{prisma_match.group(3).upper()}")
+    if candidates:
+        source_key = os.path.normcase(os.path.abspath(str(source_path)))
+        source_hash = (
+            hashlib.sha1(source_key.encode("utf-8", errors="ignore")).hexdigest()[:8].upper()
+        )
+        candidates.append(f"SRC_{source_hash}")
+    return list(dict.fromkeys(candidates))
+
+
+def _scene_root_matches_source(scene_root: str, source_path: Optional[str]) -> bool:
+    if not source_path:
+        return False
+    reports_dir = os.path.join(scene_root, "04_reports")
+    if not os.path.isdir(reports_dir):
+        return False
+    expected = os.path.normcase(os.path.abspath(str(source_path)))
+    try:
+        manifest_names = [
+            name
+            for name in os.listdir(reports_dir)
+            if name.lower().endswith("_run_manifest.json")
+        ]
+    except OSError:
+        return False
+    for name in manifest_names:
+        try:
+            with open(os.path.join(reports_dir, name), "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            scene_block = manifest.get("scene") if isinstance(manifest.get("scene"), dict) else {}
+            input_block = manifest.get("input") if isinstance(manifest.get("input"), dict) else {}
+            raw_sources = (
+                scene_block.get("source_path"),
+                scene_block.get("hs_file"),
+                input_block.get("hs_file"),
+                input_block.get("source_path"),
+                manifest.get("source_path"),
+                manifest.get("hs_file"),
+            )
+            for raw_source in raw_sources:
+                if raw_source and os.path.normcase(os.path.abspath(str(raw_source))) == expected:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _create_scene_folder_structure(base_output_dir, sensor_tag, date_tag, time_tag, source_path=None):
     """Create organized subfolder structure for scene outputs."""
-    scene_root = os.path.join(base_output_dir, f"{sensor_tag}_{date_tag}_{unique_hex}")
+    scene_root = _build_scene_output_root(base_output_dir, sensor_tag, date_tag, time_tag)
+    scene_suffix = None
+    try:
+        os.makedirs(scene_root, exist_ok=False)
+    except FileExistsError as exc:
+        if _scene_root_matches_source(scene_root, source_path):
+            raise FileExistsError(
+                "Scene output folder already exists for this acquisition time and source identity: "
+                f"{scene_root}. Remove or rename the existing folder before rerunning."
+            ) from exc
+        suffixes = _scene_collision_suffix_candidates_from_source(source_path)
+        for scene_suffix in suffixes:
+            suffixed_scene_root = f"{scene_root}_{scene_suffix}"
+            try:
+                os.makedirs(suffixed_scene_root, exist_ok=False)
+                scene_root = suffixed_scene_root
+                break
+            except FileExistsError:
+                if _scene_root_matches_source(suffixed_scene_root, source_path):
+                    raise FileExistsError(
+                        "Scene output folder already exists for this acquisition time and source identity: "
+                        f"{suffixed_scene_root}. Remove or rename the existing folder before rerunning."
+                    ) from exc
+                continue
+        else:
+            if suffixes:
+                raise FileExistsError(
+                    "Scene output folder already exists for this acquisition time and all derived source suffixes: "
+                    f"{scene_root}_{suffixes[-1]}. Remove or rename the existing folder before rerunning."
+                ) from exc
+            raise FileExistsError(
+                "Scene output folder already exists for this acquisition time: "
+                f"{scene_root}. Remove or rename the existing folder before rerunning."
+            ) from exc
     folders = {
         'scene_root': scene_root,
+        'scene_suffix': scene_suffix,
         'inputs': os.path.join(scene_root, "00_inputs"),
         'reference': os.path.join(scene_root, "01_reference"),
         'temp': os.path.join(scene_root, "02_temp"),
@@ -1485,7 +2475,9 @@ def _create_scene_folder_structure(base_output_dir, sensor_tag, date_tag, unique
         'reports': os.path.join(scene_root, "04_reports"),
         'quicklooks': os.path.join(scene_root, "05_quicklooks"),
     }
-    for folder_path in folders.values():
+    for key, folder_path in folders.items():
+        if key in {"scene_root", "scene_suffix"}:
+            continue
         os.makedirs(folder_path, exist_ok=True)
     return folders
 
@@ -1624,6 +2616,10 @@ def _compute_tiepoint_residuals(tie_points_df, pixel_size_m=30.0):
 def _normalize_sensor_name(sensor_type: Optional[str]) -> str:
     """Normalize sensor labels used in profile dictionaries."""
     name = str(sensor_type or "").strip().upper()
+    for suffix in ("_VNIR", "_SWIR"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
     return name if name else "DEFAULT"
 
 
@@ -1984,12 +2980,12 @@ def _compute_quality_score(df):
         return out if higher_is_better else (1.0 - out)
 
     metric_specs = [
-        ("RELIABILITY", 0.40, True),
-        ("SSIM_IMPRO", 0.20, True),
-        ("SSIM_AFTER", 0.15, True),
-        ("LAST_ERR", 0.15, False),
-        ("ABS_SHIFT", 0.05, False),
-        ("ABS_SHIFT_M", 0.05, False),
+        ("RELIABILITY", 0.45, True),
+        ("SSIM_IMPRO", 0.25, True),
+        ("SSIM_AFTER", 0.20, True),
+        ("LAST_ERR", 0.10, False),
+        ("ABS_SHIFT", 0.01, False),
+        ("ABS_SHIFT_M", 0.01, False),
     ]
     score = np.zeros(len(work), dtype=float)
     weight_sum = 0.0
@@ -2013,12 +3009,638 @@ def _compute_quality_score(df):
     return work
 
 
+def _tiepoint_model_residuals(df: Any, order: int = 1) -> Dict[str, Any]:
+    """Fit an image-to-corrected-map model and return per-point geometric residuals."""
+    out: Dict[str, Any] = {
+        "ok": False,
+        "residuals": None,
+        "valid_mask": None,
+        "order": int(1 if int(order) <= 1 else 2),
+        "error": None,
+    }
+    required = ("X_IM", "Y_IM", "X_MAP", "Y_MAP", "X_SHIFT_M", "Y_SHIFT_M")
+    if df is None or not hasattr(df, "columns"):
+        out["error"] = "missing dataframe"
+        return out
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        out["error"] = f"missing columns: {missing}"
+        return out
+    try:
+        x = np.asarray(df["X_IM"], dtype=float).reshape(-1)
+        y = np.asarray(df["Y_IM"], dtype=float).reshape(-1)
+        dst_x = np.asarray(df["X_MAP"], dtype=float).reshape(-1) + np.asarray(df["X_SHIFT_M"], dtype=float).reshape(-1)
+        dst_y = np.asarray(df["Y_MAP"], dtype=float).reshape(-1) + np.asarray(df["Y_SHIFT_M"], dtype=float).reshape(-1)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(dst_x) & np.isfinite(dst_y)
+        if int(np.count_nonzero(valid)) < 4:
+            out["error"] = "insufficient finite tiepoints for model residuals"
+            return out
+        xv = x[valid]
+        yv = y[valid]
+        if int(out["order"]) <= 1:
+            design = np.column_stack([np.ones_like(xv), xv, yv])
+        else:
+            if int(np.count_nonzero(valid)) < 7:
+                out["order"] = 1
+                design = np.column_stack([np.ones_like(xv), xv, yv])
+            else:
+                design = np.column_stack([np.ones_like(xv), xv, yv, xv * yv, xv * xv, yv * yv])
+        if int(np.count_nonzero(valid)) <= int(design.shape[1]):
+            out["error"] = "not enough tiepoints for overdetermined model fit"
+            return out
+        coef_x, *_ = np.linalg.lstsq(design, dst_x[valid], rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y[valid], rcond=None)
+        pred_x = design @ coef_x
+        pred_y = design @ coef_y
+        residual_valid = np.hypot(pred_x - dst_x[valid], pred_y - dst_y[valid])
+        residuals = np.full(len(x), np.nan, dtype=float)
+        residuals[valid] = residual_valid
+        out["ok"] = True
+        out["residuals"] = residuals
+        out["valid_mask"] = valid
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
+def _extract_tiepoint_model_arrays(df: Any) -> Dict[str, Any]:
+    required = ("X_IM", "Y_IM", "X_MAP", "Y_MAP", "X_SHIFT_M", "Y_SHIFT_M")
+    out: Dict[str, Any] = {"ok": False, "error": None}
+    if df is None or not hasattr(df, "columns"):
+        out["error"] = "missing dataframe"
+        return out
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        out["error"] = f"missing columns: {missing}"
+        return out
+    try:
+        x = np.asarray(df["X_IM"], dtype=float).reshape(-1)
+        y = np.asarray(df["Y_IM"], dtype=float).reshape(-1)
+        dst_x = np.asarray(df["X_MAP"], dtype=float).reshape(-1) + np.asarray(df["X_SHIFT_M"], dtype=float).reshape(-1)
+        dst_y = np.asarray(df["Y_MAP"], dtype=float).reshape(-1) + np.asarray(df["Y_SHIFT_M"], dtype=float).reshape(-1)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(dst_x) & np.isfinite(dst_y)
+        if int(np.count_nonzero(valid)) < 4:
+            out["error"] = "insufficient finite tiepoints"
+            return out
+        out.update(
+            {
+                "ok": True,
+                "x": x[valid],
+                "y": y[valid],
+                "dst_x": dst_x[valid],
+                "dst_y": dst_y[valid],
+                "valid_mask": valid,
+            }
+        )
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
+def _poly_design_matrix(x: np.ndarray, y: np.ndarray, order: int) -> np.ndarray:
+    if int(order) <= 1:
+        return np.column_stack([np.ones_like(x), x, y])
+    return np.column_stack([np.ones_like(x), x, y, x * y, x * x, y * y])
+
+
+def _fit_transform_model(kind: str, x: np.ndarray, y: np.ndarray, dst_x: np.ndarray, dst_y: np.ndarray) -> Dict[str, Any]:
+    kind = str(kind)
+    if kind == "affine":
+        design = _poly_design_matrix(x, y, 1)
+        if x.size <= design.shape[1]:
+            return {"ok": False, "error": "insufficient affine train points"}
+        coef_x, *_ = np.linalg.lstsq(design, dst_x, rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y, rcond=None)
+        return {"ok": True, "kind": kind, "coef_x": coef_x, "coef_y": coef_y, "order": 1}
+    if kind == "order2":
+        design = _poly_design_matrix(x, y, 2)
+        if x.size <= design.shape[1]:
+            return {"ok": False, "error": "insufficient order2 train points"}
+        coef_x, *_ = np.linalg.lstsq(design, dst_x, rcond=None)
+        coef_y, *_ = np.linalg.lstsq(design, dst_y, rcond=None)
+        return {"ok": True, "kind": kind, "coef_x": coef_x, "coef_y": coef_y, "order": 2}
+    if kind == "tps":
+        try:
+            from scipy.interpolate import Rbf
+
+            smooth = 0.0
+            return {
+                "ok": True,
+                "kind": kind,
+                "rbf_x": Rbf(x, y, dst_x, function="thin_plate", smooth=smooth),
+                "rbf_y": Rbf(x, y, dst_y, function="thin_plate", smooth=smooth),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": f"unknown model kind {kind}"}
+
+
+def _predict_transform_model(model: Dict[str, Any], x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    kind = str(model.get("kind"))
+    if kind in {"affine", "order2"}:
+        design = _poly_design_matrix(np.asarray(x, dtype=float), np.asarray(y, dtype=float), int(model.get("order", 1)))
+        return design @ np.asarray(model["coef_x"], dtype=float), design @ np.asarray(model["coef_y"], dtype=float)
+    if kind == "tps":
+        return np.asarray(model["rbf_x"](x, y), dtype=float), np.asarray(model["rbf_y"](x, y), dtype=float)
+    raise ValueError(f"Unknown transform model kind: {kind}")
+
+
+def _model_edge_stability_ok(
+    model: Dict[str, Any],
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    dst_x: np.ndarray,
+    dst_y: np.ndarray,
+    factor: float,
+) -> Tuple[bool, str]:
+    if x.size < 4:
+        return False, "insufficient points for edge check"
+    corners_x = np.asarray([np.nanmin(x), np.nanmin(x), np.nanmax(x), np.nanmax(x)], dtype=float)
+    corners_y = np.asarray([np.nanmin(y), np.nanmax(y), np.nanmin(y), np.nanmax(y)], dtype=float)
+    try:
+        pred_x, pred_y = _predict_transform_model(model, corners_x, corners_y)
+    except Exception as exc:
+        return False, f"edge prediction failed: {exc}"
+    if not (np.all(np.isfinite(pred_x)) and np.all(np.isfinite(pred_y))):
+        return False, "non-finite edge prediction"
+    diag = float(np.hypot(np.nanmax(dst_x) - np.nanmin(dst_x), np.nanmax(dst_y) - np.nanmin(dst_y)))
+    if not np.isfinite(diag) or diag <= 0:
+        diag = 1.0
+    margin = max(100.0, float(factor) * diag)
+    if (
+        np.nanmin(pred_x) < np.nanmin(dst_x) - margin
+        or np.nanmax(pred_x) > np.nanmax(dst_x) + margin
+        or np.nanmin(pred_y) < np.nanmin(dst_y) - margin
+        or np.nanmax(pred_y) > np.nanmax(dst_y) + margin
+    ):
+        return False, "edge prediction outside expanded target extent"
+    return True, "stable"
+
+
+def _select_transform_model_cv(
+    tiepoints_df: Any,
+    *,
+    grid_rows: int = 4,
+    grid_cols: int = 4,
+    stratification_extent: Optional[Sequence[float]] = None,
+    folds: int = 5,
+    repeats: int = 3,
+    holdout_fraction: float = 0.25,
+    seed: int = 1337,
+    min_tps_gcps: int = 20,
+    min_tps_cells: int = 8,
+    tps_min_p90_improvement_m: float = 1.0,
+    edge_instability_factor: float = 2.5,
+) -> Dict[str, Any]:
+    """Choose affine, order-2 polynomial, or TPS by held-out residuals."""
+    arrays = _extract_tiepoint_model_arrays(tiepoints_df)
+    if not arrays.get("ok", False):
+        return {"ok": False, "model": "rule_based", "order_used": 1, "use_tps": False, "reason": arrays.get("error")}
+    x = np.asarray(arrays["x"], dtype=float)
+    y = np.asarray(arrays["y"], dtype=float)
+    dst_x = np.asarray(arrays["dst_x"], dtype=float)
+    dst_y = np.asarray(arrays["dst_y"], dtype=float)
+    n = int(x.size)
+    occupied = _count_occupied_cells(
+        tiepoints_df,
+        grid_rows=max(1, int(grid_rows)),
+        grid_cols=max(1, int(grid_cols)),
+        extent=stratification_extent,
+    )
+    candidates = ["affine"]
+    if n >= 8:
+        candidates.append("order2")
+    if n >= int(min_tps_gcps) and occupied >= int(min_tps_cells):
+        candidates.append("tps")
+    rng = np.random.default_rng(int(seed))
+    holdout_n = int(max(3, round(float(np.clip(holdout_fraction, 0.05, 0.5)) * n)))
+    holdout_n = min(max(1, holdout_n), max(1, n - 4))
+    split_count = max(1, int(folds)) * max(1, int(repeats))
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for kind in candidates:
+        residuals: List[float] = []
+        errors: List[str] = []
+        for _split in range(split_count):
+            perm = rng.permutation(n)
+            test_idx = perm[:holdout_n]
+            train_idx = perm[holdout_n:]
+            min_train = 4 if kind == "affine" else (8 if kind == "order2" else max(8, int(min_tps_gcps // 2)))
+            if int(train_idx.size) < min_train:
+                errors.append("insufficient train points")
+                continue
+            fit = _fit_transform_model(kind, x[train_idx], y[train_idx], dst_x[train_idx], dst_y[train_idx])
+            if not fit.get("ok", False):
+                errors.append(str(fit.get("error", "fit failed")))
+                continue
+            try:
+                pred_x, pred_y = _predict_transform_model(fit, x[test_idx], y[test_idx])
+                res = np.hypot(pred_x - dst_x[test_idx], pred_y - dst_y[test_idx])
+                residuals.extend([float(v) for v in res if np.isfinite(v)])
+            except Exception as exc:
+                errors.append(str(exc))
+        full_fit = _fit_transform_model(kind, x, y, dst_x, dst_y)
+        stable, stable_reason = (
+            _model_edge_stability_ok(
+                full_fit,
+                x=x,
+                y=y,
+                dst_x=dst_x,
+                dst_y=dst_y,
+                factor=float(edge_instability_factor),
+            )
+            if full_fit.get("ok", False)
+            else (False, str(full_fit.get("error", "full fit failed")))
+        )
+        if residuals:
+            arr = np.asarray(residuals, dtype=float)
+            metrics[kind] = {
+                "ok": bool(stable),
+                "median_residual_m": float(np.median(arr)),
+                "p90_residual_m": float(np.percentile(arr, 90)),
+                "n_residuals": int(arr.size),
+                "edge_stable": bool(stable),
+                "edge_reason": stable_reason,
+                "errors": errors[:5],
+            }
+        else:
+            metrics[kind] = {
+                "ok": False,
+                "median_residual_m": None,
+                "p90_residual_m": None,
+                "n_residuals": 0,
+                "edge_stable": bool(stable),
+                "edge_reason": stable_reason,
+                "errors": errors[:5] or ["no held-out residuals"],
+            }
+
+    valid_metrics = {k: v for k, v in metrics.items() if v.get("ok") and v.get("p90_residual_m") is not None}
+    if not valid_metrics:
+        return {
+            "ok": False,
+            "model": "rule_based",
+            "order_used": 1,
+            "use_tps": False,
+            "reason": "no stable CV model",
+            "cv_metrics": metrics,
+            "n_gcps": n,
+            "occupied_cells": int(occupied),
+        }
+    non_tps = {k: v for k, v in valid_metrics.items() if k != "tps"}
+    best_non_tps_name = min(non_tps, key=lambda k: float(non_tps[k]["p90_residual_m"])) if non_tps else None
+    best_name = min(valid_metrics, key=lambda k: float(valid_metrics[k]["p90_residual_m"]))
+    if "tps" in valid_metrics and best_non_tps_name is not None:
+        tps_p90 = float(valid_metrics["tps"]["p90_residual_m"])
+        non_p90 = float(valid_metrics[best_non_tps_name]["p90_residual_m"])
+        if (non_p90 - tps_p90) >= float(tps_min_p90_improvement_m):
+            best_name = "tps"
+        elif best_name == "tps":
+            best_name = best_non_tps_name
+    model_label = {"affine": "affine", "order2": "polynomial_order2", "tps": "tps"}[best_name]
+    return {
+        "ok": True,
+        "model": model_label,
+        "order_used": 1 if best_name == "affine" else 2,
+        "use_tps": bool(best_name == "tps"),
+        "reason": f"selected {model_label} by held-out P90 residual",
+        "cv_metrics": metrics,
+        "n_gcps": n,
+        "occupied_cells": int(occupied),
+    }
+
+
+def _build_hs_narrowband_cache_key(
+    hs_path: str,
+    sensor_tag: str,
+    band_name: str,
+    band_indices_1based: Sequence[int],
+    weights: Optional[Sequence[float]] = None,
+    mode: str = "fixed_pair",
+) -> str:
+    try:
+        stat = os.stat(hs_path)
+        src_sig = {
+            "path": os.path.abspath(hs_path),
+            "size": int(stat.st_size),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+        }
+    except Exception:
+        src_sig = {"path": os.path.abspath(str(hs_path))}
+    payload = {
+        "schema": 1,
+        "source": src_sig,
+        "sensor_tag": str(sensor_tag),
+        "band_name": str(band_name),
+        "band_indices_1based": [int(v) for v in band_indices_1based],
+        "weights": None if weights is None else [round(float(v), 10) for v in weights],
+        "mode": str(mode),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+_S2_SRF_TABLE_CACHE: Optional[Dict[str, List[Tuple[float, float]]]] = None
+
+
+def _load_sentinel2_srf_table() -> Dict[str, List[Tuple[float, float]]]:
+    """Load bundled Sentinel-2 MSI SRF samples keyed by PLATFORM:BAND."""
+    global _S2_SRF_TABLE_CACHE
+    if _S2_SRF_TABLE_CACHE is not None:
+        return _S2_SRF_TABLE_CACHE
+    table: Dict[str, List[Tuple[float, float]]] = {}
+    path = Path(__file__).resolve().parents[1] / "data" / "sentinel2_msi_srf.csv"
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(row for row in f if not row.lstrip().startswith("#"))
+            for row in reader:
+                platform = str(row.get("platform", "S2A")).strip().upper() or "S2A"
+                band = str(row.get("band", "")).strip().upper()
+                if not band:
+                    continue
+                wl = float(row.get("wavelength_nm", "nan"))
+                response = float(row.get("response", "nan"))
+                if not np.isfinite(wl) or not np.isfinite(response):
+                    continue
+                table.setdefault(f"{platform}:{band}", []).append((wl, max(0.0, response)))
+    except FileNotFoundError:
+        table = {}
+    except Exception as exc:
+        logger.debug("Failed to load bundled Sentinel-2 SRF table: %s", exc)
+        table = {}
+    for key in list(table.keys()):
+        table[key] = sorted(table[key], key=lambda item: item[0])
+    _S2_SRF_TABLE_CACHE = table
+    return table
+
+
+def _s2_platform_from_product_name(name: Optional[str]) -> str:
+    text = str(name or "").upper()
+    if text.startswith("S2C") or "_S2C" in text:
+        return "S2C"
+    if text.startswith("S2B") or "_S2B" in text:
+        return "S2B"
+    return "S2A"
+
+
+def _compute_srf_weights(
+    hs_wavelengths: Sequence[float],
+    hs_fwhm: Optional[Sequence[float]],
+    band_label: str,
+    platform: str = "S2A",
+) -> Dict[str, Any]:
+    """Compute HS band weights by integrating MSI SRF over HS band supports."""
+    hs_wl = np.asarray(hs_wavelengths, dtype=float).reshape(-1)
+    out: Dict[str, Any] = {
+        "resolved": False,
+        "mode": "srf_weighted",
+        "indices": [],
+        "weights": [],
+        "band_label": str(band_label),
+        "platform": str(platform or "S2A").upper(),
+        "reason": None,
+    }
+    finite = np.isfinite(hs_wl)
+    if not np.any(finite):
+        out["reason"] = "no finite hyperspectral wavelengths"
+        return out
+    if hs_fwhm is not None:
+        fwhm = np.asarray(hs_fwhm, dtype=float).reshape(-1)
+        if fwhm.size != hs_wl.size:
+            fwhm = None
+    else:
+        fwhm = None
+    if fwhm is None:
+        finite_wl = np.sort(hs_wl[finite])
+        spacing = float(np.nanmedian(np.diff(finite_wl))) if finite_wl.size > 1 else 10.0
+        if not np.isfinite(spacing) or spacing <= 0:
+            spacing = 10.0
+        fwhm = np.full(hs_wl.shape, spacing, dtype=float)
+    fwhm = np.where(np.isfinite(fwhm) & (fwhm > 0), fwhm, np.nanmedian(fwhm[np.isfinite(fwhm) & (fwhm > 0)]))
+    fwhm = np.where(np.isfinite(fwhm) & (fwhm > 0), fwhm, 10.0)
+
+    table = _load_sentinel2_srf_table()
+    platform_key = str(platform or "S2A").upper()
+    samples = table.get(f"{platform_key}:{str(band_label).upper()}")
+    if not samples:
+        samples = table.get(f"S2A:{str(band_label).upper()}")
+    if not samples:
+        center = MULTIBAND_S2_WAVELENGTHS.get(str(band_label).upper(), {}).get("wavelength")
+        approx_fwhm = S2_APPROX_FWHM_NM.get(str(band_label).upper(), 20.0)
+        if center is None:
+            out["reason"] = f"no SRF samples for {band_label}"
+            return out
+        grid = np.arange(float(center) - 2.0 * approx_fwhm, float(center) + 2.0 * approx_fwhm + 1.0, 1.0)
+        sigma = float(approx_fwhm) / 2.355
+        response = np.exp(-0.5 * ((grid - float(center)) / sigma) ** 2)
+        samples = list(zip(grid.astype(float).tolist(), response.astype(float).tolist()))
+        out["reason"] = "using approximate Gaussian SRF fallback"
+
+    srf_wl = np.asarray([p[0] for p in samples], dtype=float)
+    srf_resp = np.asarray([p[1] for p in samples], dtype=float)
+    if srf_wl.size < 2 or not np.any(srf_resp > 0):
+        out["reason"] = f"insufficient SRF samples for {band_label}"
+        return out
+
+    raw_weights = np.zeros(hs_wl.size, dtype=float)
+    for idx, (center_wl, width) in enumerate(zip(hs_wl, fwhm)):
+        if not np.isfinite(center_wl) or not np.isfinite(width) or width <= 0:
+            continue
+        lo = float(center_wl) - float(width) / 2.0
+        hi = float(center_wl) + float(width) / 2.0
+        if hi < float(np.nanmin(srf_wl)) or lo > float(np.nanmax(srf_wl)):
+            continue
+        mask = (srf_wl >= lo) & (srf_wl <= hi)
+        if np.count_nonzero(mask) >= 2:
+            raw_weights[idx] = float(np.trapz(srf_resp[mask], srf_wl[mask]))
+        else:
+            interp = float(np.interp(float(center_wl), srf_wl, srf_resp, left=0.0, right=0.0))
+            raw_weights[idx] = max(0.0, interp) * float(width)
+    positive = raw_weights > 0
+    if not np.any(positive):
+        out["reason"] = f"SRF {band_label} has no overlap with hyperspectral bands"
+        return out
+    norm = raw_weights[positive] / float(np.sum(raw_weights[positive]))
+    out["resolved"] = True
+    out["indices"] = (np.where(positive)[0] + 1).astype(int).tolist()
+    out["weights"] = norm.astype(float).tolist()
+    return out
+
+
+def _resolve_synthetic_s2_band_for_matching(
+    *,
+    hs_wavelengths: Sequence[float],
+    hs_fwhm: Optional[Sequence[float]],
+    target_wavelength_nm: float,
+    band_label: str,
+    sensor_type: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    mode = str(config.get("synthetic_s2_band_mode", DEFAULT_CONFIG.get("synthetic_s2_band_mode", "fixed_pair"))).lower()
+    if mode == "srf_weighted":
+        platform = str(config.get("s2_platform", "S2A")).upper()
+        srf = _compute_srf_weights(hs_wavelengths, hs_fwhm, band_label, platform=platform)
+        if srf.get("resolved", False):
+            return srf
+        logger.info(
+            "SRF-weighted synthesis unavailable for %s (%s); falling back to fixed-pair band resolution.",
+            band_label,
+            srf.get("reason") or "no overlap",
+        )
+    return _resolve_band_indices_for_matching(
+        hs_wavelengths=np.asarray(hs_wavelengths, dtype=float),
+        target_wavelength_nm=target_wavelength_nm,
+        band_label=band_label,
+        sensor_type=sensor_type,
+        prefer_fixed_band_pairs=bool(config.get("prefer_fixed_band_pairs", True)),
+        fixed_band_pairs_by_sensor=config.get("fixed_band_pairs_by_sensor"),
+        wavelength_window_nm=float(config.get("bandpair_wavelength_window_nm", 20.0)),
+    )
+
+
+def _write_hs_narrowband_windowed(
+    *,
+    hs_path: str,
+    output_path: str,
+    band_indices_1based: Sequence[int],
+    weights: Optional[Sequence[float]] = None,
+    out_dtype: Any = PROCESSING_DTYPE,
+) -> Dict[str, Any]:
+    """Synthesize one narrowband raster by reading source bands window-by-window."""
+    out: Dict[str, Any] = {"ok": False, "error": None, "windows": 0, "bands": list(band_indices_1based)}
+    try:
+        indices = [int(i) for i in band_indices_1based]
+        if not indices:
+            out["error"] = "no source bands selected"
+            return out
+        weight_arr = None
+        if weights is not None:
+            weight_arr = np.asarray(weights, dtype=float).reshape(-1)
+            if weight_arr.size != len(indices) or not np.any(np.isfinite(weight_arr) & (weight_arr > 0)):
+                out["error"] = "invalid narrowband weights"
+                return out
+            weight_arr = np.where(np.isfinite(weight_arr) & (weight_arr > 0), weight_arr, 0.0)
+            weight_arr = weight_arr / float(np.sum(weight_arr))
+
+        with rasterio.open(hs_path) as src:
+            invalid = [i for i in indices if i < 1 or i > int(src.count)]
+            if invalid:
+                out["error"] = f"source band indices out of range: {invalid}"
+                return out
+            nodata = src.nodata
+            if nodata is None or not np.isfinite(float(nodata)):
+                nodata = PROCESSING_NODATA
+            nodata = float(nodata)
+            out_dtype_name = np.dtype(out_dtype).name
+            profile = src.profile.copy()
+            profile.update(count=1, dtype=out_dtype_name, nodata=nodata, compress="LZW", tiled=True, BIGTIFF="YES")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            with rasterio.open(output_path, "w", **profile) as dst:
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
+                if src_tags:
+                    dst.update_tags(**src_tags)
+                window_count = 0
+                for _block_idx, window in src.block_windows(1):
+                    block = src.read(indexes=indices, window=window, out_dtype=PROCESSING_DTYPE)
+                    block = np.asarray(block, dtype=PROCESSING_DTYPE)
+                    valid = np.isfinite(block) & (block != nodata)
+                    if weight_arr is None:
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            sums = np.where(valid, block, 0.0).sum(axis=0)
+                            counts = valid.sum(axis=0)
+                            narrow = np.where(counts > 0, sums / np.maximum(counts, 1), nodata)
+                    else:
+                        w = weight_arr.reshape((-1, 1, 1)).astype(PROCESSING_DTYPE)
+                        weighted = np.where(valid, block * w, 0.0)
+                        denom = np.where(valid, w, 0.0).sum(axis=0)
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            narrow = np.where(denom > 0, weighted.sum(axis=0) / denom, nodata)
+                    dst.write(narrow.astype(out_dtype_name, copy=False), 1, window=window)
+                    window_count += 1
+                out["windows"] = int(window_count)
+        out["ok"] = True
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
+def _tiepoint_early_stop_ready(
+    tiepoint_frames: Sequence[Any],
+    *,
+    min_points: int,
+    min_cells: int,
+    median_reliability_threshold: float,
+    grid_rows: int,
+    grid_cols: int,
+    min_band_support: int,
+    stratification_extent: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "ready": False,
+        "n_valid_tiepoints": 0,
+        "occupied_grid_cells": 0,
+        "median_reliability": None,
+        "band_count": 0,
+    }
+    if not tiepoint_frames:
+        return out
+    try:
+        import pandas as pd
+
+        combined = pd.concat(list(tiepoint_frames), ignore_index=True)
+        if len(combined) == 0:
+            return out
+        if "RELIABILITY" in combined.columns:
+            rel = pd.to_numeric(combined["RELIABILITY"], errors="coerce")
+            combined = combined[rel.notna()]
+            rel = pd.to_numeric(combined["RELIABILITY"], errors="coerce")
+            if len(combined) > 0 and float(rel.max()) <= 1.0:
+                rel = rel * 100.0
+                combined = combined.copy()
+                combined["RELIABILITY"] = rel
+            finite_rel = rel[np.isfinite(rel)]
+            if len(finite_rel) > 0:
+                out["median_reliability"] = float(np.median(finite_rel))
+        out["n_valid_tiepoints"] = int(len(combined))
+        if "BAND_LABEL" in combined.columns:
+            out["band_count"] = int(combined["BAND_LABEL"].nunique())
+        else:
+            out["band_count"] = 1
+        out["occupied_grid_cells"] = _count_occupied_cells(
+            combined,
+            grid_rows=max(1, int(grid_rows)),
+            grid_cols=max(1, int(grid_cols)),
+            extent=stratification_extent,
+        )
+        rel_ok = (
+            out["median_reliability"] is not None
+            and float(out["median_reliability"]) >= float(median_reliability_threshold)
+        )
+        out["ready"] = bool(
+            int(out["n_valid_tiepoints"]) >= int(max(1, min_points))
+            and int(out["occupied_grid_cells"]) >= int(max(1, min_cells))
+            and int(out["band_count"]) >= int(max(1, min_band_support))
+            and rel_ok
+        )
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
 def _count_occupied_cells(
     df,
     grid_rows: int,
     grid_cols: int,
     x_col: str = "X_IM",
     y_col: str = "Y_IM",
+    extent: Optional[Sequence[float]] = None,
 ) -> int:
     """Count occupied image-space stratification cells for the given tie points."""
     if df is None or len(df) == 0 or x_col not in df.columns or y_col not in df.columns:
@@ -2032,8 +3654,14 @@ def _count_occupied_cells(
     y = y[valid]
     gx = max(1, int(grid_cols))
     gy = max(1, int(grid_rows))
-    x_min, x_max = float(np.min(x)), float(np.max(x))
-    y_min, y_max = float(np.min(y)), float(np.max(y))
+    if extent is not None and len(extent) >= 4:
+        x_min = float(min(float(extent[0]), float(extent[2])))
+        x_max = float(max(float(extent[0]), float(extent[2])))
+        y_min = float(min(float(extent[1]), float(extent[3])))
+        y_max = float(max(float(extent[1]), float(extent[3])))
+    else:
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        y_min, y_max = float(np.min(y)), float(np.max(y))
     x_span = max(1e-6, x_max - x_min)
     y_span = max(1e-6, y_max - y_min)
     cx = np.floor((x - x_min) / x_span * gx).astype(int)
@@ -2101,6 +3729,7 @@ def _summarize_scene_tiepoint_quality(
     tie_points_df: Any,
     grid_rows: int,
     grid_cols: int,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Summarize per-scene tie-point quality and spatial coverage diagnostics."""
     summary: Dict[str, Any] = {
@@ -2147,6 +3776,7 @@ def _summarize_scene_tiepoint_quality(
         tie_points_df,
         grid_rows=grid_rows_i,
         grid_cols=grid_cols_i,
+        extent=stratification_extent,
     )
     total_cells = int(grid_rows_i * grid_cols_i)
     if total_cells > 0:
@@ -2218,8 +3848,9 @@ def _apply_spatial_stratification(
     max_points_per_cell: int,
     min_points_required: int,
     min_distance: float = 60.0,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
-    """Apply image-space balancing with quota relaxation and distance-constrained fallback."""
+    """Apply image-space balancing against the full raster/overlap extent when available."""
     import pandas as pd
 
     selected_default = df.copy() if hasattr(df, "copy") else df
@@ -2255,8 +3886,14 @@ def _apply_spatial_stratification(
     gy = max(1, int(grid_rows))
     x_valid = x[valid]
     y_valid = y[valid]
-    x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
-    y_min, y_max = float(np.min(y_valid)), float(np.max(y_valid))
+    if stratification_extent is not None and len(stratification_extent) >= 4:
+        x_min = float(min(float(stratification_extent[0]), float(stratification_extent[2])))
+        x_max = float(max(float(stratification_extent[0]), float(stratification_extent[2])))
+        y_min = float(min(float(stratification_extent[1]), float(stratification_extent[3])))
+        y_max = float(max(float(stratification_extent[1]), float(stratification_extent[3])))
+    else:
+        x_min, x_max = float(np.min(x_valid)), float(np.max(x_valid))
+        y_min, y_max = float(np.min(y_valid)), float(np.max(y_valid))
     x_span = max(1e-6, x_max - x_min)
     y_span = max(1e-6, y_max - y_min)
 
@@ -2399,7 +4036,12 @@ def _apply_spatial_stratification(
         selected = selected.drop(columns=["_STRAT_CELL"])
     result["quota_used"] = quota
     result["selected_df"] = selected
-    result["occupied_cells_selected"] = _count_occupied_cells(selected, gy, gx)
+    result["occupied_cells_selected"] = _count_occupied_cells(
+        selected,
+        gy,
+        gx,
+        extent=stratification_extent,
+    )
     return result
 
 
@@ -2413,6 +4055,7 @@ def _collect_multiband_tiepoints(
     cand_idx,
     s2_band_subset: Optional[Sequence[str]] = None,
     config: Optional[Dict[str, Any]] = None,
+    hs_fwhm=None,
 ):
     """Collect tie points from multiple S2 bands with fixed-pair and profile-aware controls."""
     result = {
@@ -2420,8 +4063,11 @@ def _collect_multiband_tiepoints(
         'all_tiepoints': [],
         'tiepoint_counts': {},
         'band_match_modes': {},
+        'band_weights': {},
         'error_message': None,
         'matcher_profile': {},
+        'early_stop': {'enabled': False, 'triggered': False},
+        'narrowband_cache': {'enabled': False, 'hits': 0, 'writes': 0},
     }
     hs_wl = np.asarray(hs_wl).flatten()
     cfg = config or {}
@@ -2431,6 +4077,59 @@ def _collect_multiband_tiepoints(
         cfg.get("arosics_cpus", DEFAULT_CONFIG.get("arosics_cpus", CPUS_FOR_AROSICS)),
         default=CPUS_FOR_AROSICS,
     )
+    raw_min_required = cfg.get("min_required_tiepoints", MIN_TIE_POINTS_FOR_POLYNOMIAL)
+    try:
+        min_required_tiepoints = int(max(1, int(raw_min_required)))
+    except Exception:
+        min_required_tiepoints = int(MIN_TIE_POINTS_FOR_POLYNOMIAL)
+    early_stop_enabled = bool(cfg.get("early_stop_enabled", DEFAULT_CONFIG.get("local_tiepoint_early_stop", True)))
+    early_stop_min_points = cfg.get(
+        "early_stop_min_points",
+        DEFAULT_CONFIG.get("local_tiepoint_early_stop_min_points"),
+    )
+    early_stop_min_cells = cfg.get(
+        "early_stop_min_cells",
+        DEFAULT_CONFIG.get("local_tiepoint_early_stop_min_cells"),
+    )
+    early_stop_reliability = float(
+        cfg.get(
+            "early_stop_reliability",
+            DEFAULT_CONFIG.get("local_tiepoint_early_stop_reliability", MIN_RELIABILITY_THRESHOLD),
+        )
+    )
+    early_stop_grid_rows = int(max(1, cfg.get("early_stop_grid_rows", 4)))
+    early_stop_grid_cols = int(max(1, cfg.get("early_stop_grid_cols", 4)))
+    early_stop_extent = cfg.get("early_stop_extent")
+    early_stop_min_band_support = int(max(1, cfg.get("min_band_support", DEFAULT_CONFIG.get("min_band_support", 2))))
+    early_stop_min_points_i = int(max(1, early_stop_min_points or min_required_tiepoints))
+    early_stop_min_cells_i = int(max(1, early_stop_min_cells or min(early_stop_grid_rows * early_stop_grid_cols, 4)))
+    result["early_stop"] = {
+        "enabled": bool(early_stop_enabled),
+        "triggered": False,
+        "min_points": int(early_stop_min_points_i),
+        "min_cells": int(early_stop_min_cells_i),
+        "reliability_threshold": float(early_stop_reliability),
+    }
+    cache_hs_narrowbands = bool(
+        cfg.get("cache_hs_narrowbands", DEFAULT_CONFIG.get("cache_hs_narrowbands", True))
+    )
+    hs_nb_cache_dir = _resolve_cache_dir(
+        cfg.get("hs_narrowband_cache_dir", DEFAULT_CONFIG.get("hs_narrowband_cache_dir")),
+        "hs_narrowband",
+    )
+    result["narrowband_cache"] = {
+        "enabled": bool(cache_hs_narrowbands),
+        "dir": hs_nb_cache_dir if cache_hs_narrowbands else None,
+        "hits": 0,
+        "writes": 0,
+    }
+    if cache_hs_narrowbands:
+        try:
+            os.makedirs(hs_nb_cache_dir, exist_ok=True)
+        except Exception as exc:
+            logger.warning(_fmt_issue("CACHE", f"Disabled hyperspectral narrowband cache: {exc}"))
+            cache_hs_narrowbands = False
+            result["narrowband_cache"]["enabled"] = False
 
     prefer_fixed_pairs = bool(cfg.get("prefer_fixed_band_pairs", DEFAULT_CONFIG.get("prefer_fixed_band_pairs", True)))
     fixed_pairs = cfg.get("fixed_band_pairs_by_sensor", DEFAULT_CONFIG.get("fixed_band_pairs_by_sensor", {}))
@@ -2484,31 +4183,77 @@ def _collect_multiband_tiepoints(
         temp_nb_path = os.path.join(temp_folder, f"{sensor_tag}_{date_tag}_nb_{band_name}_c{cand_idx}.tif")
         temp_nb_coreg_path = os.path.join(temp_folder, f"{sensor_tag}_{date_tag}_nb_coreg_{band_name}_c{cand_idx}.tif")
         try:
-            resolution = _resolve_band_indices_for_matching(
+            resolution = _resolve_synthetic_s2_band_for_matching(
                 hs_wavelengths=hs_wl,
+                hs_fwhm=hs_fwhm,
                 target_wavelength_nm=target_wl,
                 band_label=band_name,
                 sensor_type=sensor_tag,
-                prefer_fixed_band_pairs=prefer_fixed_pairs,
-                fixed_band_pairs_by_sensor=fixed_pairs,
-                wavelength_window_nm=band_window_nm,
+                config={
+                    **cfg,
+                    "prefer_fixed_band_pairs": prefer_fixed_pairs,
+                    "fixed_band_pairs_by_sensor": fixed_pairs,
+                    "bandpair_wavelength_window_nm": band_window_nm,
+                },
             )
             result["band_match_modes"][band_name] = resolution.get("mode", "window")
             band_indices_1based = [int(i) for i in resolution.get("indices", []) if int(i) >= 1]
+            band_weights = resolution.get("weights")
+            if band_weights is not None:
+                result["band_weights"][band_name] = {
+                    "indices": list(band_indices_1based),
+                    "weights": [float(v) for v in band_weights],
+                    "mode": resolution.get("mode", "srf_weighted"),
+                    "platform": resolution.get("platform"),
+                }
             if not band_indices_1based:
                 result['tiepoint_counts'][band_name] = 0
                 continue
 
-            with rasterio.open(hs_path) as src:
-                selected_bands = src.read(band_indices_1based)
-            nb_avg = np.nanmean(selected_bands.astype(PROCESSING_DTYPE), axis=0)
-            del selected_bands
+            cache_nb_path = None
+            cache_hit = False
+            if cache_hs_narrowbands:
+                nb_cache_key = _build_hs_narrowband_cache_key(
+                    hs_path=hs_path,
+                    sensor_tag=sensor_tag,
+                    band_name=band_name,
+                    band_indices_1based=band_indices_1based,
+                    weights=band_weights,
+                    mode=str(resolution.get("mode", "window")),
+                )
+                cache_nb_path = os.path.join(hs_nb_cache_dir, f"{nb_cache_key}.tif")
+                if os.path.exists(cache_nb_path):
+                    shutil.copy2(cache_nb_path, temp_nb_path)
+                    result["narrowband_cache"]["hits"] = int(result["narrowband_cache"].get("hits", 0)) + 1
+                    cache_hit = True
 
-            profile_hs = hs_profile.copy()
-            profile_hs.update(count=1, dtype=PROCESSING_DTYPE)
-            with rasterio.open(temp_nb_path, 'w', **profile_hs) as dst:
-                dst.write(nb_avg.astype(PROCESSING_DTYPE), 1)
-            del nb_avg
+            if not cache_hit:
+                nb_write = _write_hs_narrowband_windowed(
+                    hs_path=hs_path,
+                    output_path=temp_nb_path,
+                    band_indices_1based=band_indices_1based,
+                    weights=band_weights,
+                    out_dtype=PROCESSING_DTYPE,
+                )
+                if not nb_write.get("ok", False):
+                    raise RuntimeError(
+                        f"narrowband synthesis failed for {band_name}: {nb_write.get('error', 'unknown error')}"
+                    )
+                if cache_nb_path:
+                    tmp_cache_path = f"{cache_nb_path}.{uuid.uuid4().hex}.tmp"
+                    try:
+                        shutil.copy2(temp_nb_path, tmp_cache_path)
+                        os.replace(tmp_cache_path, cache_nb_path)
+                        result["narrowband_cache"]["writes"] = int(
+                            result["narrowband_cache"].get("writes", 0)
+                        ) + 1
+                    except Exception as cache_exc:
+                        logger.debug("Failed to write hyperspectral narrowband cache %s: %s", cache_nb_path, cache_exc)
+                        try:
+                            if os.path.exists(tmp_cache_path):
+                                os.remove(tmp_cache_path)
+                        except Exception:
+                            pass
 
             hs_nodata = hs_profile.get('nodata') if hs_profile.get('nodata') is not None else PROCESSING_NODATA
             
@@ -2555,6 +4300,8 @@ def _collect_multiband_tiepoints(
                 tie_points_df['BAND_LABEL'] = band_name
                 tie_points_df['MATCH_MODE'] = resolution.get("mode", "window")
                 tie_points_df['MATCH_BAND_INDICES'] = ",".join(str(v) for v in band_indices_1based)
+                if band_weights is not None:
+                    tie_points_df['MATCH_BAND_WEIGHTS'] = ",".join(f"{float(v):.8g}" for v in band_weights)
                 if 'RELIABILITY' in tie_points_df.columns:
                     tie_points_df['RELIABILITY'] = tie_points_df['RELIABILITY'].replace([-9999, -9998], np.nan)
                     tie_points_df = tie_points_df[tie_points_df['RELIABILITY'].notna()]
@@ -2568,6 +4315,31 @@ def _collect_multiband_tiepoints(
                     result['tiepoint_counts'][band_name] = 0
             else:
                 result['tiepoint_counts'][band_name] = 0
+
+            if early_stop_enabled and result.get("all_tiepoints"):
+                stop_state = _tiepoint_early_stop_ready(
+                    result["all_tiepoints"],
+                    min_points=early_stop_min_points_i,
+                    min_cells=early_stop_min_cells_i,
+                    median_reliability_threshold=early_stop_reliability,
+                    grid_rows=early_stop_grid_rows,
+                    grid_cols=early_stop_grid_cols,
+                    min_band_support=early_stop_min_band_support,
+                    stratification_extent=early_stop_extent,
+                )
+                result["early_stop"]["last_state"] = stop_state
+                if stop_state.get("ready", False):
+                    result["early_stop"]["triggered"] = True
+                    result["early_stop"]["stopped_after_band"] = band_name
+                    logger.info(
+                        "Early-stopped multiband local tiepoint extraction after %s "
+                        "(points=%s, cells=%s, median_rel=%s).",
+                        band_name,
+                        stop_state.get("n_valid_tiepoints"),
+                        stop_state.get("occupied_grid_cells"),
+                        _format_optional_float(stop_state.get("median_reliability"), ".1f"),
+                    )
+                    break
         except Exception as e:
             logger.warning(f"  {band_name} error: {e}")
             result['tiepoint_counts'][band_name] = 0
@@ -2599,6 +4371,7 @@ def _merge_tiepoints(
     max_points_per_cell: int = 3,
     min_points_required: int = MIN_TIE_POINTS_FOR_POLYNOMIAL,
     spatial_fallback_min_distance: float = 60.0,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Merge tiepoints using consensus, composite scoring, and spatial stratification."""
     import pandas as pd
@@ -2613,6 +4386,7 @@ def _merge_tiepoints(
         'n_after_residual_trim': 0,
         'reliability_threshold_used': None,
         'residual_threshold_m': None,
+        'residual_basis': None,
         'error_message': None,
         'stage_counts': {},
         'fallback_notes': [],
@@ -2693,6 +4467,7 @@ def _merge_tiepoints(
             max_points_per_cell=max(1, int(max_points_per_cell)),
             min_points_required=max(1, int(min_points_required)),
             min_distance=float(spatial_fallback_min_distance),
+            stratification_extent=stratification_extent,
         )
         selected_df = strat.get("selected_df", scored_df)
         result["fallback_notes"].extend(strat.get("fallback_notes", []))
@@ -2725,21 +4500,41 @@ def _merge_tiepoints(
         result['stage_counts']['07_final_reliability_filter'] = int(len(selected_df))
 
         if trim_by_residual and len(selected_df) > max(3, int(min_points_required)):
-            if 'X_SHIFT_M' in selected_df.columns and 'Y_SHIFT_M' in selected_df.columns:
+            residuals = None
+            model_res = _tiepoint_model_residuals(selected_df, order=1)
+            if model_res.get("ok", False):
+                residuals = np.asarray(model_res.get("residuals"), dtype=float)
+                result["residual_basis"] = "model_residual_affine_m"
+            elif 'X_SHIFT_M' in selected_df.columns and 'Y_SHIFT_M' in selected_df.columns:
                 residuals = np.sqrt(selected_df['X_SHIFT_M'].values**2 + selected_df['Y_SHIFT_M'].values**2)
-                selected_df = selected_df.copy()
-                selected_df['_RESIDUAL_M'] = residuals
-                median_res = np.median(residuals)
-                mad = np.median(np.abs(residuals - median_res))
-                if mad > 0:
-                    threshold_m = median_res + float(residual_mad_factor) * 1.4826 * mad
-                    result['residual_threshold_m'] = float(threshold_m)
-                    trimmed_df = selected_df[selected_df['_RESIDUAL_M'] <= threshold_m]
-                    if len(trimmed_df) < int(max(1, min_points_required)):
-                        trimmed_df = selected_df.nsmallest(int(max(1, min_points_required)), '_RESIDUAL_M')
-                    selected_df = trimmed_df
-                if '_RESIDUAL_M' in selected_df.columns:
-                    selected_df = selected_df.drop(columns=['_RESIDUAL_M'])
+                result["residual_basis"] = "shift_magnitude_fallback_m"
+                result["fallback_notes"].append(
+                    f"model residual trim unavailable; using shift magnitude ({model_res.get('error')})"
+                )
+            elif 'ABS_SHIFT_M' in selected_df.columns:
+                residuals = np.asarray(selected_df['ABS_SHIFT_M'], dtype=float)
+                result["residual_basis"] = "abs_shift_fallback_m"
+                result["fallback_notes"].append(
+                    f"model residual trim unavailable; using ABS_SHIFT_M ({model_res.get('error')})"
+                )
+
+            if residuals is not None:
+                finite_mask = np.isfinite(residuals)
+                if np.any(finite_mask):
+                    selected_df = selected_df.copy()
+                    selected_df['_RESIDUAL_M'] = residuals
+                    finite_residuals = residuals[finite_mask]
+                    median_res = float(np.median(finite_residuals))
+                    mad = float(np.median(np.abs(finite_residuals - median_res)))
+                    if mad > 0:
+                        threshold_m = median_res + float(residual_mad_factor) * 1.4826 * mad
+                        result['residual_threshold_m'] = float(threshold_m)
+                        trimmed_df = selected_df[selected_df['_RESIDUAL_M'] <= threshold_m]
+                        if len(trimmed_df) < int(max(1, min_points_required)):
+                            trimmed_df = selected_df.nsmallest(int(max(1, min_points_required)), '_RESIDUAL_M')
+                        selected_df = trimmed_df
+                    if '_RESIDUAL_M' in selected_df.columns:
+                        selected_df = selected_df.drop(columns=['_RESIDUAL_M'])
 
         result['n_after_residual_trim'] = int(len(selected_df))
         result['stage_counts']['08_optional_residual_trim'] = int(len(selected_df))
@@ -2849,11 +4644,17 @@ def _decide_polynomial_order(
     min_cells_order2: int = 6,
     grid_rows: int = 4,
     grid_cols: int = 4,
+    stratification_extent: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Choose polynomial order with optional safety downgrade from 2->1."""
     order_target = 1 if int(preferred_order) <= 1 else 2
     n_gcps = int(len(merged_df)) if merged_df is not None else 0
-    occupied_cells = _count_occupied_cells(merged_df, grid_rows=max(1, int(grid_rows)), grid_cols=max(1, int(grid_cols)))
+    occupied_cells = _count_occupied_cells(
+        merged_df,
+        grid_rows=max(1, int(grid_rows)),
+        grid_cols=max(1, int(grid_cols)),
+        extent=stratification_extent,
+    )
     geom = _assess_gcp_geometry_for_order2(merged_df)
 
     decision = {
@@ -2919,11 +4720,13 @@ def _apply_polynomial_warp(
         return result
 
     temp_vrt = None
+    tmp_output = None
     try:
         from osgeo import gdal
         gdal.UseExceptions()
 
-        temp_vrt = output_raster.replace('.tif', '_gcps.vrt')
+        temp_vrt = _make_gdal_temp_path(output_raster, ".gcps.vrt")
+        tmp_output = _make_gdal_temp_path(output_raster, ".tmp.tif")
         ds_in = gdal.Open(input_raster, gdal.GA_ReadOnly)
         if ds_in is None:
             result['error_message'] = f"Failed to open input: {input_raster}"
@@ -2957,11 +4760,13 @@ def _apply_polynomial_warp(
         if s2_bounds is not None:
             minx, miny, maxx, maxy = s2_bounds
             cmd.extend(["-te", str(minx), str(miny), str(maxx), str(maxy)])
-        cmd.extend([temp_vrt, output_raster])
+        cmd.extend([temp_vrt, tmp_output])
 
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        if os.path.exists(output_raster):
+        if os.path.exists(tmp_output):
+            _validate_warp_output(tmp_output)
+            os.replace(tmp_output, output_raster)
             result['success'] = True
             result['output_path'] = output_raster
         else:
@@ -2976,6 +4781,7 @@ def _apply_polynomial_warp(
                 os.remove(temp_vrt)
             except Exception:
                 pass
+        _cleanup_raster_temp_outputs(tmp_output)
     return result
 
 
@@ -3195,7 +5001,11 @@ def _create_synthetic_s2_pan(
             )
 
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
                 dst.set_band_description(1, "S2_SYNTHETIC_PAN_B02_B03_B04_B08")
@@ -3607,11 +5417,13 @@ def _apply_tps_warp_from_gcps(
         return result
 
     temp_vrt = None
+    tmp_output = None
     try:
         from osgeo import gdal
 
         gdal.UseExceptions()
-        temp_vrt = output_raster.replace(".tif", "_gcps.vrt")
+        temp_vrt = _make_gdal_temp_path(output_raster, ".gcps.vrt")
+        tmp_output = _make_gdal_temp_path(output_raster, ".tmp.tif")
         ds_in = gdal.Open(input_raster, gdal.GA_ReadOnly)
         if ds_in is None:
             result["error_message"] = f"Failed to open input raster: {input_raster}"
@@ -3629,7 +5441,7 @@ def _apply_tps_warp_from_gcps(
         cmd = _build_gdalwarp_tps_command(
             gdalwarp_exe=gdalwarp_exe,
             temp_vrt=temp_vrt,
-            output_raster=output_raster,
+            output_raster=tmp_output,
             crs_wkt=crs_wkt,
             x_res=x_res,
             y_res=y_res,
@@ -3642,7 +5454,9 @@ def _apply_tps_warp_from_gcps(
         )
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        if os.path.exists(output_raster):
+        if os.path.exists(tmp_output):
+            _validate_warp_output(tmp_output)
+            os.replace(tmp_output, output_raster)
             result["success"] = True
             result["output_path"] = output_raster
         else:
@@ -3660,6 +5474,7 @@ def _apply_tps_warp_from_gcps(
                 os.remove(temp_vrt)
             except Exception:
                 pass
+        _cleanup_raster_temp_outputs(tmp_output)
 
     return result
 
@@ -3750,12 +5565,7 @@ def _validate_ancillary_raster(
                 out["error"] = f"CRS mismatch (expected {target_crs}, got {src.crs})."
                 return out
 
-            nodata_val = src.nodata
-            if nodata_val is not None:
-                try:
-                    nodata_val = float(nodata_val)
-                except Exception:
-                    nodata_val = None
+            nodata_values = resolve_raster_nodata_values(src)
 
             max_wins = int(max(0, int(max_windows)))
             windows_scanned = 0
@@ -3769,8 +5579,8 @@ def _validate_ancillary_raster(
                 band = src.read(1, window=window).astype(np.float32, copy=False)
                 total_pixels += int(band.size)
                 valid = np.isfinite(band)
-                if nodata_val is not None and np.isfinite(nodata_val):
-                    valid &= (band != nodata_val)
+                for nodata_candidate in nodata_values:
+                    valid &= band != float(nodata_candidate)
                 vcount = int(np.count_nonzero(valid))
                 valid_pixels += vcount
                 windows_scanned += 1
@@ -3888,8 +5698,18 @@ def _estimate_translation_phasecorr(
         py = int(peak_idx[0])
         px = int(peak_idx[1])
 
-        shift_y = py if py <= (h // 2) else py - h
-        shift_x = px if px <= (w // 2) else px - w
+        def _parabolic_delta(center: float, before: float, after: float) -> float:
+            denom = float(before) - 2.0 * float(center) + float(after)
+            if abs(denom) < 1e-12:
+                return 0.0
+            return float(np.clip(0.5 * (float(before) - float(after)) / denom, -1.0, 1.0))
+
+        dx_sub = _parabolic_delta(corr_abs[py, px], corr_abs[py, (px - 1) % w], corr_abs[py, (px + 1) % w])
+        dy_sub = _parabolic_delta(corr_abs[py, px], corr_abs[(py - 1) % h, px], corr_abs[(py + 1) % h, px])
+        peak_x = float(px) + float(dx_sub)
+        peak_y = float(py) + float(dy_sub)
+        shift_y = peak_y if peak_y <= (h / 2.0) else peak_y - float(h)
+        shift_x = peak_x if peak_x <= (w / 2.0) else peak_x - float(w)
         shift_mag = float(np.hypot(float(shift_x), float(shift_y)))
 
         out["ok"] = True
@@ -4121,6 +5941,69 @@ def _resolve_enmap_band_selection(
     return out
 
 
+def _resolve_selected_band_values(
+    values: Any,
+    source_band_count: int,
+    selected_bands_1based: Sequence[int],
+    default_value: float,
+    label: str,
+) -> np.ndarray:
+    """Resolve metadata values to the selected source-band order."""
+    selected = [int(b) for b in selected_bands_1based]
+    if values is None:
+        return np.full(len(selected), float(default_value), dtype=np.float32)
+
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.full(len(selected), float(default_value), dtype=np.float32)
+    if arr.size == 1:
+        return np.full(len(selected), float(arr[0]), dtype=np.float32)
+    if arr.size == int(source_band_count):
+        return np.asarray([arr[int(b) - 1] for b in selected], dtype=np.float32)
+    if arr.size == len(selected):
+        return arr.astype(np.float32, copy=False)
+
+    raise ValueError(
+        f"{label} length mismatch: got {int(arr.size)}, expected 1, "
+        f"{int(source_band_count)}, or {len(selected)}."
+    )
+
+
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(val):
+        return None
+    return val
+
+
+def _metadata_has_radiometric_transform(metadata: Optional[Dict[str, Any]]) -> bool:
+    """Return True when EnMAP metadata requests non-identity DN scaling."""
+    if not isinstance(metadata, dict):
+        return False
+
+    try:
+        gains = metadata.get("data_gain_values")
+        if gains is not None:
+            gain_arr = np.asarray(gains, dtype=float).reshape(-1)
+            gain_arr = gain_arr[np.isfinite(gain_arr)]
+            if gain_arr.size and np.any(np.abs(gain_arr - 1.0) > 1e-12):
+                return True
+
+        offsets = metadata.get("data_offset_values")
+        if offsets is not None:
+            offset_arr = np.asarray(offsets, dtype=float).reshape(-1)
+            offset_arr = offset_arr[np.isfinite(offset_arr)]
+            if offset_arr.size and np.any(np.abs(offset_arr) > 1e-12):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _stream_copy_raster_with_band_order(
     source_path: str,
     output_path: str,
@@ -4128,6 +6011,10 @@ def _stream_copy_raster_with_band_order(
     out_dtype: Any = PROCESSING_DTYPE,
     compress: Optional[str] = "NONE",
     tile_size: int = 512,
+    band_gains: Optional[Sequence[float]] = None,
+    band_offsets: Optional[Sequence[float]] = None,
+    source_nodata: Optional[float] = None,
+    output_nodata: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Copy and optionally reorder raster bands in a streaming, windowed pass."""
     out: Dict[str, Any] = {
@@ -4137,6 +6024,9 @@ def _stream_copy_raster_with_band_order(
         "output_bands": 0,
         "window_strategy": None,
         "window_count": 0,
+        "radiometric_scaling_applied": False,
+        "source_nodata": None,
+        "output_nodata": None,
     }
     try:
         src_bands = [int(b) for b in source_bands_1based]
@@ -4157,19 +6047,59 @@ def _stream_copy_raster_with_band_order(
                 )
                 return out
 
-            out_dtype_name = np.dtype(out_dtype).name
-            nodata_value = src.nodata
-            if nodata_value is None or not np.isfinite(float(nodata_value)):
-                nodata_value = float(PROCESSING_NODATA)
-            else:
-                nodata_value = float(nodata_value)
+            gain_values = _resolve_selected_band_values(
+                band_gains,
+                int(src.count),
+                src_bands,
+                1.0,
+                "EnMAP data gain values",
+            )
+            offset_values = _resolve_selected_band_values(
+                band_offsets,
+                int(src.count),
+                src_bands,
+                0.0,
+                "EnMAP data offset values",
+            )
+            apply_radiometry = bool(
+                (band_gains is not None or band_offsets is not None)
+                and (
+                    np.any(np.abs(gain_values.astype(float) - 1.0) > 1e-12)
+                    or np.any(np.abs(offset_values.astype(float)) > 1e-12)
+                )
+            )
+
+            requested_dtype = np.dtype(out_dtype)
+            out_dtype_name = (
+                np.dtype(np.float32).name
+                if apply_radiometry and not np.issubdtype(requested_dtype, np.floating)
+                else requested_dtype.name
+            )
+
+            src_nodata_values = resolve_raster_nodata_values(
+                src,
+                extra_values=[source_nodata],
+            )
+            src_nodata_value = src_nodata_values[0] if src_nodata_values else None
+
+            dst_nodata_value = _finite_float_or_none(output_nodata)
+            if dst_nodata_value is None:
+                dst_nodata_value = (
+                    float(src_nodata_value)
+                    if src_nodata_value is not None
+                    else float(PROCESSING_NODATA)
+                )
+
+            out["radiometric_scaling_applied"] = bool(apply_radiometry)
+            out["source_nodata"] = src_nodata_value
+            out["output_nodata"] = float(dst_nodata_value)
 
             profile = src.profile.copy()
             profile.update(
                 driver="GTiff",
                 count=len(src_bands),
                 dtype=out_dtype_name,
-                nodata=nodata_value,
+                nodata=float(dst_nodata_value),
                 tiled=True,
                 interleave="pixel",
                 BIGTIFF="YES",
@@ -4224,7 +6154,11 @@ def _stream_copy_raster_with_band_order(
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
 
@@ -4232,7 +6166,7 @@ def _stream_copy_raster_with_band_order(
                     desc = src.descriptions[src_bidx - 1]
                     if desc:
                         dst.set_band_description(out_bidx, desc)
-                    band_tags = src.tags(src_bidx)
+                    band_tags = filter_band_tags_for_raster_copy(src.tags(src_bidx))
                     if band_tags:
                         dst.update_tags(out_bidx, **band_tags)
 
@@ -4252,11 +6186,27 @@ def _stream_copy_raster_with_band_order(
                             f"output_driver={profile.get('driver')}, window={window_txt}): {io_err}"
                         ) from io_err
 
+                    valid = np.ones(block.shape, dtype=bool)
                     if np.issubdtype(block.dtype, np.floating):
-                        bad = ~np.isfinite(block)
-                        if np.any(bad):
-                            block = block.copy()
-                            block[bad] = nodata_value
+                        valid &= np.isfinite(block)
+                    for nodata_candidate in src_nodata_values:
+                        valid &= block != float(nodata_candidate)
+
+                    invalid = ~valid
+                    if apply_radiometry:
+                        block = block.astype(np.float32, copy=True)
+                        for band_pos in range(block.shape[0]):
+                            band_valid = valid[band_pos]
+                            if np.any(band_valid):
+                                block[band_pos][band_valid] = (
+                                    block[band_pos][band_valid] * gain_values[band_pos]
+                                    + offset_values[band_pos]
+                                )
+                        if np.any(invalid):
+                            block[invalid] = float(dst_nodata_value)
+                    elif np.any(invalid):
+                        block = block.copy()
+                        block[invalid] = float(dst_nodata_value)
 
                     try:
                         dst.write(block, window=window)
@@ -4288,9 +6238,14 @@ def _prepare_enmap_processing_source(
         "error": None,
         "path": source_path,
         "converted": False,
-        "metadata_injection_attempted": False,
-        "metadata_injected": False,
-        "metadata_injection_error": None,
+        "radiometric_scaling_required": False,
+        "radiometric_scaling_applied": False,
+        "source_nodata": None,
+        "output_nodata": None,
+        "metadata_staging_attempted": False,
+        "metadata_staged": False,
+        "metadata_staging_error": None,
+        "metadata_staging_result": {},
         "metadata_readback": None,
     }
     try:
@@ -4300,10 +6255,16 @@ def _prepare_enmap_processing_source(
 
         src_suffix = Path(source_path).suffix.lower()
         prepared_path = str(source_path)
-        if src_suffix == ".bsq":
+        meta = metadata if isinstance(metadata, dict) else {}
+        radiometric_scaling_required = _metadata_has_radiometric_transform(meta)
+        out["radiometric_scaling_required"] = bool(radiometric_scaling_required)
+
+        copy_required = bool(src_suffix == ".bsq" or radiometric_scaling_required)
+        if copy_required:
             with rasterio.open(source_path) as src:
                 src_band_count = int(src.count)
             src_bands_1based = list(range(1, src_band_count + 1))
+            source_nodata_value = _finite_float_or_none(meta.get("background_value"))
             copy_res = _stream_copy_raster_with_band_order(
                 source_path=source_path,
                 output_path=output_path,
@@ -4311,17 +6272,25 @@ def _prepare_enmap_processing_source(
                 out_dtype=PROCESSING_DTYPE,
                 compress="LZW",
                 tile_size=512,
+                band_gains=meta.get("data_gain_values") if radiometric_scaling_required else None,
+                band_offsets=meta.get("data_offset_values") if radiometric_scaling_required else None,
+                source_nodata=source_nodata_value,
+                output_nodata=PROCESSING_NODATA,
             )
             if not copy_res.get("ok", False):
                 out["error"] = (
-                    "Failed BSQ-to-GeoTIFF preparation copy: "
+                    "Failed EnMAP source preparation copy: "
                     f"{copy_res.get('error', 'unknown error')}"
                 )
                 return out
             prepared_path = str(output_path)
-            out["converted"] = True
+            out["converted"] = bool(src_suffix == ".bsq")
+            out["radiometric_scaling_applied"] = bool(
+                copy_res.get("radiometric_scaling_applied", False)
+            )
+            out["source_nodata"] = copy_res.get("source_nodata")
+            out["output_nodata"] = copy_res.get("output_nodata")
 
-        meta = metadata if isinstance(metadata, dict) else {}
         with rasterio.open(prepared_path, "r+") as dst:
             meta_crs = meta.get("crs")
             if dst.crs is None and meta_crs is not None and str(meta_crs).strip():
@@ -4352,6 +6321,17 @@ def _prepare_enmap_processing_source(
                         and int(dst.width) > 0
                         and int(dst.height) > 0
                     ):
+                        target_crs = dst.crs
+                        if target_crs is not None and not bool(getattr(target_crs, "is_geographic", False)):
+                            west, south, east, north = warp.transform_bounds(
+                                "EPSG:4326",
+                                target_crs,
+                                west,
+                                south,
+                                east,
+                                north,
+                                densify_pts=21,
+                            )
                         dst.transform = transform_from_bounds(
                             west,
                             south,
@@ -4369,13 +6349,14 @@ def _prepare_enmap_processing_source(
                     )
 
         if inject_metadata and meta:
-            out["metadata_injection_attempted"] = True
-            inject_res = inject_metadata_into_raster(prepared_path, meta)
+            out["metadata_staging_attempted"] = True
+            inject_res = stage_enmap_metadata_for_session(prepared_path, meta)
+            out["metadata_staging_result"] = dict(inject_res)
             if inject_res.get("ok", False):
-                out["metadata_injected"] = True
+                out["metadata_staged"] = True
                 out["metadata_readback"] = read_enmap_metadata_from_raster(prepared_path)
             else:
-                out["metadata_injection_error"] = inject_res.get("error")
+                out["metadata_staging_error"] = inject_res.get("error")
 
         out["path"] = prepared_path
         out["ok"] = True
@@ -4718,33 +6699,38 @@ def _resample_raster_to_shared_grid(
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
 
                 for bidx in range(1, int(src.count) + 1):
-                    dst_band = np.full(
-                        (int(target_height), int(target_width)),
-                        nodata_value,
-                        dtype=np.dtype(out_dtype_name),
-                    )
-                    warp.reproject(
-                        source=rasterio.band(src, bidx),
-                        destination=dst_band,
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        src_nodata=src_nodata,
-                        dst_transform=target_transform,
-                        dst_crs=target_crs_obj,
-                        dst_nodata=nodata_value,
-                        resampling=Resampling.bilinear,
-                    )
-                    dst.write(dst_band, bidx)
+                    for _block_idx, dst_window in dst.block_windows(bidx):
+                        dst_band = np.full(
+                            (int(dst_window.height), int(dst_window.width)),
+                            nodata_value,
+                            dtype=np.dtype(out_dtype_name),
+                        )
+                        dst_window_transform = rasterio.windows.transform(dst_window, target_transform)
+                        _reproject_source_window_to_destination(
+                            src,
+                            band_index=bidx,
+                            destination=dst_band,
+                            dst_transform=dst_window_transform,
+                            dst_crs=target_crs_obj,
+                            src_nodata=src_nodata,
+                            dst_nodata=nodata_value,
+                            resampling=Resampling.bilinear,
+                        )
+                        dst.write(dst_band, bidx, window=dst_window)
 
                     band_desc = src.descriptions[bidx - 1]
                     if band_desc:
                         dst.set_band_description(bidx, str(band_desc))
-                    band_tags = src.tags(bidx)
+                    band_tags = filter_band_tags_for_raster_copy(src.tags(bidx))
                     if band_tags:
                         dst.update_tags(bidx, **band_tags)
 
@@ -4926,8 +6912,10 @@ def _recombine_detector_branches_windowed(
     Recombine VNIR/SWIR warped branches with strict windowed IO.
 
     Critical spectral-integrity rule:
-    - If a pixel is invalid (nodata/non-finite) in either branch, it is forced
-      to nodata across *all* output bands (union nodata mask).
+    - If a pixel has no valid data in either detector branch, it is forced to
+      nodata across *all* output bands (union branch-coverage mask).
+    - Individual invalid bands remain nodata without invalidating otherwise
+      usable pixels across the full hyperspectral cube.
     """
     out: Dict[str, Any] = {
         "ok": False,
@@ -4978,7 +6966,11 @@ def _recombine_detector_branches_windowed(
 
             os.makedirs(os.path.dirname(output_raster_path) or ".", exist_ok=True)
             with rasterio.open(output_raster_path, "w", **profile) as dst:
-                src_tags = vsrc.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    vsrc.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(vsrc.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
 
@@ -5000,18 +6992,24 @@ def _recombine_detector_branches_windowed(
                     v_block = vsrc.read(window=window, out_dtype=out_dtype_name)
                     s_block = ssrc.read(window=window, out_dtype=out_dtype_name)
 
-                    # Branch-valid requires all branch bands finite and non-nodata.
-                    v_valid = np.all(np.isfinite(v_block), axis=0)
-                    s_valid = np.all(np.isfinite(s_block), axis=0)
+                    # Per-band validity is not the same as detector coverage. Requiring
+                    # every spectral band to be valid makes large EnMAP cubes collapse to
+                    # all-nodata whenever different bands have different masks.
+                    v_band_valid = np.isfinite(v_block)
+                    s_band_valid = np.isfinite(s_block)
                     if np.isfinite(v_nodata):
-                        v_valid &= np.all(v_block != v_nodata, axis=0)
+                        v_band_valid &= v_block != v_nodata
                     if np.isfinite(s_nodata):
-                        s_valid &= np.all(s_block != s_nodata, axis=0)
+                        s_band_valid &= s_block != s_nodata
 
+                    v_valid = np.any(v_band_valid, axis=0)
+                    s_valid = np.any(s_band_valid, axis=0)
                     invalid_union = (~v_valid) | (~s_valid)
                     if np.any(invalid_union):
                         union_count += int(np.count_nonzero(invalid_union))
 
+                    v_block[~v_band_valid] = nodata_value
+                    s_block[~s_band_valid] = nodata_value
                     out_block = np.concatenate([v_block, s_block], axis=0)
                     out_block[:, invalid_union] = nodata_value
                     dst.write(out_block, window=window)
@@ -5116,6 +7114,7 @@ def _process_detector_branch_candidate(
         "is_clustered": None,
         "quality_tier": None,
         "quality_score": None,
+        "stage_timings": {},
     }
     cfg = config or {}
     arosics_cpus = _resolve_arosics_cpu_count(
@@ -5164,6 +7163,7 @@ def _process_detector_branch_candidate(
     branch_order_decisions: Dict[str, Dict[str, Any]] = {}
     branch_paths_for_recombine: Dict[str, Optional[str]] = {"VNIR": None, "SWIR": None}
     branch_quality_flags: List[bool] = []
+    stage_timings: Dict[str, float] = {}
 
     for branch_name in ("VNIR", "SWIR"):
         branch_cfg = dict(plan_branches.get(branch_name, {}))
@@ -5228,6 +7228,7 @@ def _process_detector_branch_candidate(
         }
         branch_global_success = False
 
+        t0_branch_global = perf_counter()
         for g_idx, g_cfg in enumerate(global_ladder, 1):
             try:
                 with _ProgressHeartbeat(
@@ -5304,6 +7305,22 @@ def _process_detector_branch_candidate(
                     )
                 )
 
+        _record_stage_timing(
+            stage_timings,
+            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_global",
+            t0_branch_global,
+        )
+        try:
+            with rasterio.open(branch_global_out) as branch_global_src:
+                branch_extent_xy = (
+                    0.0,
+                    0.0,
+                    float(branch_global_src.width),
+                    float(branch_global_src.height),
+                )
+        except Exception:
+            branch_extent_xy = None
+
         merged_tp_result: Dict[str, Any] = {"merged_df": None, "stage_counts": {}}
         polynomial_order_decision: Dict[str, Any] = {
             "preferred_order": int(preferred_polynomial_order),
@@ -5321,6 +7338,7 @@ def _process_detector_branch_candidate(
         tps_error_message: Optional[str] = None
         CRL = None
 
+        t0_branch_local = perf_counter()
         with _ProgressHeartbeat(
             progress_callback,
             "Local coregistration (multi-band)",
@@ -5338,7 +7356,13 @@ def _process_detector_branch_candidate(
                 date_tag=date_tag,
                 cand_idx=candidate_idx,
                 s2_band_subset=branch_s2_subset,
+                hs_fwhm=branch_cfg.get("fwhm"),
                 config={
+                    "synthetic_s2_band_mode": config.get(
+                        "synthetic_s2_band_mode",
+                        DEFAULT_CONFIG.get("synthetic_s2_band_mode", "fixed_pair"),
+                    ),
+                    "s2_platform": config.get("s2_platform", "S2A"),
                     "prefer_fixed_band_pairs": prefer_fixed_band_pairs,
                     "fixed_band_pairs_by_sensor": fixed_band_pairs_by_sensor,
                     "bandpair_wavelength_window_nm": bandpair_wavelength_window_nm,
@@ -5353,6 +7377,39 @@ def _process_detector_branch_candidate(
                     "global_coreg_profiles_by_sensor": config.get("global_coreg_profiles_by_sensor"),
                     "global_coreg_attempt_ladder": config.get("global_coreg_attempt_ladder"),
                     "arosics_cpus": int(arosics_cpus),
+                    "min_band_support": int(min_band_support),
+                    "min_required_tiepoints": int(warp_min_points),
+                    "early_stop_enabled": bool(
+                        config.get(
+                            "local_tiepoint_early_stop",
+                            DEFAULT_CONFIG.get("local_tiepoint_early_stop", True),
+                        )
+                    ),
+                    "early_stop_min_points": config.get(
+                        "local_tiepoint_early_stop_min_points",
+                        DEFAULT_CONFIG.get("local_tiepoint_early_stop_min_points"),
+                    ),
+                    "early_stop_min_cells": config.get(
+                        "local_tiepoint_early_stop_min_cells",
+                        DEFAULT_CONFIG.get("local_tiepoint_early_stop_min_cells"),
+                    ),
+                    "early_stop_reliability": config.get(
+                        "local_tiepoint_early_stop_reliability",
+                        DEFAULT_CONFIG.get("local_tiepoint_early_stop_reliability", MIN_RELIABILITY_THRESHOLD),
+                    ),
+                    "early_stop_grid_rows": int(spatial_grid_rows),
+                    "early_stop_grid_cols": int(spatial_grid_cols),
+                    "early_stop_extent": branch_extent_xy,
+                    "cache_hs_narrowbands": bool(
+                        config.get(
+                            "cache_hs_narrowbands",
+                            DEFAULT_CONFIG.get("cache_hs_narrowbands", True),
+                        )
+                    ),
+                    "hs_narrowband_cache_dir": config.get(
+                        "hs_narrowband_cache_dir",
+                        DEFAULT_CONFIG.get("hs_narrowband_cache_dir"),
+                    ),
                 },
             )
 
@@ -5369,25 +7426,90 @@ def _process_detector_branch_candidate(
                     grid_cols=spatial_grid_cols,
                     max_points_per_cell=max_points_per_cell,
                     min_points_required=warp_min_points,
+                    stratification_extent=branch_extent_xy,
                 )
                 if merged_tp_result.get("success") and merged_tp_result.get("merged_df") is not None:
-                    polynomial_order_decision = _decide_polynomial_order(
-                        merged_df=merged_tp_result["merged_df"],
-                        preferred_order=preferred_polynomial_order,
-                        auto_downgrade=auto_downgrade_polynomial_order,
-                        min_gcps_order2=min_gcps_order2,
-                        min_cells_order2=min_cells_order2,
-                        grid_rows=spatial_grid_rows,
-                        grid_cols=spatial_grid_cols,
-                    )
+                    if str(config.get("transform_model_selection", "rule_based")).strip().lower() == "cv":
+                        cv_decision = _select_transform_model_cv(
+                            merged_tp_result["merged_df"],
+                            grid_rows=spatial_grid_rows,
+                            grid_cols=spatial_grid_cols,
+                            stratification_extent=branch_extent_xy,
+                            folds=int(config.get("transform_cv_folds", DEFAULT_CONFIG.get("transform_cv_folds", 5))),
+                            repeats=int(config.get("transform_cv_repeats", DEFAULT_CONFIG.get("transform_cv_repeats", 3))),
+                            holdout_fraction=float(
+                                config.get(
+                                    "transform_cv_holdout_fraction",
+                                    DEFAULT_CONFIG.get("transform_cv_holdout_fraction", 0.25),
+                                )
+                            ),
+                            seed=int(config.get("transform_cv_seed", DEFAULT_CONFIG.get("transform_cv_seed", 1337))),
+                            min_tps_gcps=int(
+                                config.get("transform_cv_min_tps_gcps", DEFAULT_CONFIG.get("transform_cv_min_tps_gcps", 20))
+                            ),
+                            min_tps_cells=int(
+                                config.get("transform_cv_min_tps_cells", DEFAULT_CONFIG.get("transform_cv_min_tps_cells", 8))
+                            ),
+                            tps_min_p90_improvement_m=float(
+                                config.get(
+                                    "transform_cv_tps_min_p90_improvement_m",
+                                    DEFAULT_CONFIG.get("transform_cv_tps_min_p90_improvement_m", 1.0),
+                                )
+                            ),
+                            edge_instability_factor=float(
+                                config.get(
+                                    "transform_cv_edge_instability_factor",
+                                    DEFAULT_CONFIG.get("transform_cv_edge_instability_factor", 2.5),
+                                )
+                            ),
+                        )
+                        if cv_decision.get("ok", False):
+                            polynomial_order_decision = cv_decision
+                        else:
+                            logger.info(
+                                "Candidate %d [%s]: CV transform selection unavailable (%s); using rule-based order selection.",
+                                candidate_idx + 1,
+                                branch_name,
+                                cv_decision.get("reason") or cv_decision.get("error") or "unknown",
+                            )
+                            polynomial_order_decision = _decide_polynomial_order(
+                                merged_df=merged_tp_result["merged_df"],
+                                preferred_order=preferred_polynomial_order,
+                                auto_downgrade=auto_downgrade_polynomial_order,
+                                min_gcps_order2=min_gcps_order2,
+                                min_cells_order2=min_cells_order2,
+                                grid_rows=spatial_grid_rows,
+                                grid_cols=spatial_grid_cols,
+                                stratification_extent=branch_extent_xy,
+                            )
+                            polynomial_order_decision["cv_fallback"] = cv_decision
+                    else:
+                        polynomial_order_decision = _decide_polynomial_order(
+                            merged_df=merged_tp_result["merged_df"],
+                            preferred_order=preferred_polynomial_order,
+                            auto_downgrade=auto_downgrade_polynomial_order,
+                            min_gcps_order2=min_gcps_order2,
+                            min_cells_order2=min_cells_order2,
+                            grid_rows=spatial_grid_rows,
+                            grid_cols=spatial_grid_cols,
+                            stratification_extent=branch_extent_xy,
+                        )
                     gcp_result = _build_gcps_from_tiepoints(merged_tp_result["merged_df"])
                     min_gcps_for_order = _minimum_gcps_for_polynomial_order(
                         int(polynomial_order_decision.get("order_used", 2))
                     )
-                    if gcp_result.get("success") and int(gcp_result.get("n_gcps", 0)) >= int(min_gcps_for_order):
+                    if bool(polynomial_order_decision.get("use_tps", False)):
+                        poly_error_message = "CV selected TPS transform model"
+                        logger.info(
+                            "Candidate %d [%s]: CV selected TPS; skipping polynomial warp.",
+                            candidate_idx + 1,
+                            branch_name,
+                        )
+                    elif gcp_result.get("success") and int(gcp_result.get("n_gcps", 0)) >= int(min_gcps_for_order):
                         hb_local.update(
                             substage=f"Candidate {candidate_idx + 1} [{branch_name}]: applying polynomial warp"
                         )
+                        t0_branch_warp = perf_counter()
                         poly_result = _apply_polynomial_warp(
                             input_raster=branch_global_out,
                             output_raster=branch_poly_out,
@@ -5401,6 +7523,14 @@ def _process_detector_branch_candidate(
                             gdalwarp_multi=bool(gdalwarp_multi),
                             gdalwarp_num_threads=gdalwarp_num_threads,
                         )
+                        warp_elapsed = _record_stage_timing(
+                            stage_timings,
+                            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_warp",
+                            t0_branch_warp,
+                        )
+                        stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
+                            stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
+                        ) + float(warp_elapsed)
                         if poly_result.get("success", False):
                             poly_success = True
                             shutil.move(branch_poly_out, branch_local_out)
@@ -5434,6 +7564,7 @@ def _process_detector_branch_candidate(
                             min_gcps=warp_min_points,
                         )
                         if tps_gcps_result.get("success", False):
+                            t0_branch_warp = perf_counter()
                             tps_result = _apply_tps_warp_from_gcps(
                                 input_raster=branch_global_out,
                                 output_raster=branch_tps_out,
@@ -5448,6 +7579,14 @@ def _process_detector_branch_candidate(
                                 gdalwarp_multi=bool(gdalwarp_multi),
                                 gdalwarp_num_threads=gdalwarp_num_threads,
                             )
+                            warp_elapsed = _record_stage_timing(
+                                stage_timings,
+                                f"candidate_{candidate_idx + 1}_{branch_name.lower()}_warp",
+                                t0_branch_warp,
+                            )
+                            stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
+                                stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
+                            ) + float(warp_elapsed)
                             if tps_result.get("success", False):
                                 tps_success = True
                                 shutil.move(branch_tps_out, branch_local_out)
@@ -5543,6 +7682,12 @@ def _process_detector_branch_candidate(
                 CRL = COREG_LOCAL(s2_raster_path, branch_global_out, **fallback_kwargs)
                 CRL.correct_shifts()
 
+        _record_stage_timing(
+            stage_timings,
+            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_local",
+            t0_branch_local,
+        )
+
         tie_points_df = None
         tie_points_viz_df = None
         if CRL is not None:
@@ -5608,6 +7753,8 @@ def _process_detector_branch_candidate(
             "polynomial_order_decision": dict(polynomial_order_decision),
             "merged_tiepoint_stages": dict(merged_tp_result.get("stage_counts", {})),
             "multiband_tiepoint_counts": dict(mb_counts),
+            "band_match_modes": dict(multiband_result.get("band_match_modes", {}) or {}),
+            "band_weights": dict(multiband_result.get("band_weights", {}) or {}),
             "local_tiepoints_df": tie_points_df,
             "local_tiepoints_visualization_df": tie_points_viz_df,
             "output_path": branch_output_path,
@@ -5627,6 +7774,7 @@ def _process_detector_branch_candidate(
         "vnir_path": vnir_path,
         "swir_path": swir_path,
     }
+    t0_recombine_warp = perf_counter()
     if vnir_path and swir_path:
         harmonize_result = _harmonize_detector_branch_grids(
             vnir_raster_path=vnir_path,
@@ -5668,6 +7816,9 @@ def _process_detector_branch_candidate(
                 candidate_idx + 1,
                 harmonize_result.get("error", "unknown error"),
             )
+    stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
+        stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
+    ) + float(max(0.0, perf_counter() - t0_recombine_warp))
     out["branch_harmonization"] = dict(harmonize_result)
     out["recombine_result"] = dict(recombine_result)
 
@@ -5781,6 +7932,7 @@ def _process_detector_branch_candidate(
     out["is_clustered"] = scene_quality_summary.get("is_clustered")
     out["quality_tier"] = scene_quality_summary.get("quality_tier")
     out["quality_score"] = scene_quality_summary.get("quality_score")
+    out["stage_timings"] = dict(stage_timings)
     return out
 
 
@@ -5815,11 +7967,7 @@ def _validate_coreg_raster_content(
                 out["error"] = "Invalid raster dimensions/count."
                 return out
 
-            nodata_val = src.nodata
-            if nodata_val is None or not np.isfinite(float(nodata_val)):
-                nodata_val = float(nodata)
-            else:
-                nodata_val = float(nodata_val)
+            nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata)
 
             valid_pixels = 0
             total_pixels = 0
@@ -5834,8 +7982,8 @@ def _validate_coreg_raster_content(
                     band = src.read(bidx, window=window).astype(np.float32, copy=False)
                     total_pixels += int(band.size)
                     valid = np.isfinite(band)
-                    if np.isfinite(nodata_val):
-                        valid &= (band != nodata_val)
+                    for nodata_candidate in nodata_values:
+                        valid &= band != float(nodata_candidate)
                     vcount = int(np.count_nonzero(valid))
                     valid_pixels += vcount
                     windows_scanned += 1
@@ -5894,11 +8042,8 @@ def _probe_raster_valid_pixels(
                 out["error"] = "Raster has no bands."
                 return out
 
-            nodata_val = src.nodata
-            if nodata_val is None or not np.isfinite(float(nodata_val)):
-                nodata_val = float(nodata_fallback)
-            else:
-                nodata_val = float(nodata_val)
+            nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata_fallback)
+            nodata_val = float(nodata_values[0]) if nodata_values else float(nodata_fallback)
             out["nodata"] = nodata_val
 
             sampled_bands: List[int] = []
@@ -5937,8 +8082,8 @@ def _probe_raster_valid_pixels(
                     resampling=Resampling.nearest,
                 ).astype(np.float32, copy=False)
                 valid = np.isfinite(band)
-                if np.isfinite(nodata_val):
-                    valid &= (band != nodata_val)
+                for nodata_candidate in nodata_values:
+                    valid &= band != float(nodata_candidate)
                 valid_count = int(np.count_nonzero(valid))
                 out["band_valid_pixels"][int(bidx)] = valid_count
                 if valid_count > 0:
@@ -5955,15 +8100,20 @@ def _probe_raster_valid_pixels(
 
 def _validate_local_s2_stack_override(
     local_s2_stack_path: Optional[str],
-    min_band_count: int = 6,
+    min_band_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Validate a local Sentinel-2 stack override path for offline runs."""
+    expected_count = int(min_band_count or _minimum_local_s2_stack_band_count())
+    expected_bands = tuple(
+        S2_L2A_REFERENCE_STACK_BANDS[: min(expected_count, len(S2_L2A_REFERENCE_STACK_BANDS))]
+    )
     out: Dict[str, Any] = {
         "ok": False,
         "error": None,
         "path": None,
         "crs": None,
         "band_count": 0,
+        "warnings": [],
     }
     path_raw = str(local_s2_stack_path or "").strip()
     if not path_raw:
@@ -5980,14 +8130,40 @@ def _validate_local_s2_stack_override(
         with rasterio.open(path_abs) as src:
             out["band_count"] = int(src.count)
             out["crs"] = src.crs
-            if src.count < int(max(1, int(min_band_count))):
+            if src.count < int(max(1, int(expected_count))):
                 out["error"] = (
-                    f"Local S2 stack has too few bands ({int(src.count)} < {int(min_band_count)})."
+                    f"Local S2 stack has too few bands ({int(src.count)} < {int(expected_count)})."
                 )
                 return out
             if src.crs is None:
                 out["error"] = "Local S2 stack CRS is missing."
                 return out
+            descriptions = [str(v or "").strip() for v in src.descriptions[:expected_count]]
+            if not any(descriptions):
+                out["warnings"].append(
+                    "Local S2 stack has no band descriptions; assuming canonical L2A order "
+                    f"{', '.join(expected_bands)}."
+                )
+            else:
+                for bidx, expected_label in enumerate(expected_bands, start=1):
+                    desc = descriptions[bidx - 1] if bidx - 1 < len(descriptions) else ""
+                    if not desc:
+                        out["warnings"].append(
+                            f"Local S2 stack band {bidx} has no description; assuming {expected_label}."
+                        )
+                        continue
+                    found_label = _normalize_s2_band_label(desc)
+                    if found_label != expected_label:
+                        out["error"] = (
+                            f"Local S2 stack band {bidx} should be {expected_label}, "
+                            f"but description is {desc!r}."
+                        )
+                        return out
+            if int(src.count) > expected_count:
+                out["warnings"].append(
+                    f"Local S2 stack has {int(src.count)} bands; coregistration will use the first "
+                    f"{expected_count} canonical L2A reflectance bands."
+                )
     except Exception as e:
         out["error"] = f"Failed to open local S2 stack override: {e}"
         return out
@@ -6074,11 +8250,8 @@ def _load_quicklook_band(
     """Load one band (optionally decimated) and return array, valid mask, and display metadata."""
     with rasterio.open(raster_path) as src:
         use_bidx = int(max(1, min(int(band_idx), int(src.count))))
-        nodata_val = src.nodata
-        if nodata_val is None or not np.isfinite(float(nodata_val)):
-            nodata_val = float(nodata)
-        else:
-            nodata_val = float(nodata_val)
+        nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata)
+        nodata_val = float(nodata_values[0]) if nodata_values else float(nodata)
 
         src_w = int(src.width)
         src_h = int(src.height)
@@ -6127,8 +8300,8 @@ def _load_quicklook_band(
         }
 
     valid = np.isfinite(band)
-    if np.isfinite(nodata_val):
-        valid &= (band != nodata_val)
+    for nodata_candidate in nodata_values:
+        valid &= band != float(nodata_candidate)
     return band, valid, info
 
 
@@ -6502,11 +8675,8 @@ def _load_quicklook_rgb_composite(
         band_count = int(src.count)
         use_indices = [int(max(1, min(band_count, int(b)))) for b in rgb_band_indices]
 
-        nodata_val = src.nodata
-        if nodata_val is None or not np.isfinite(float(nodata_val)):
-            nodata_val = float(nodata)
-        else:
-            nodata_val = float(nodata_val)
+        nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata)
+        nodata_val = float(nodata_values[0]) if nodata_values else float(nodata)
 
         max_dim = int(max(1, int(max_quicklook_dim)))
         longest = max(src_w, src_h)
@@ -6538,8 +8708,8 @@ def _load_quicklook_rgb_composite(
         crs_summary = _summarize_crs(src.crs)
 
     valid = np.all(np.isfinite(rgb_raw), axis=0)
-    if np.isfinite(nodata_val):
-        valid &= np.all(rgb_raw != nodata_val, axis=0)
+    for nodata_candidate in nodata_values:
+        valid &= np.all(rgb_raw != float(nodata_candidate), axis=0)
 
     stretched = np.zeros_like(rgb_raw, dtype=np.float32)
     channel_stats: List[Dict[str, Any]] = []
@@ -6617,19 +8787,19 @@ def _load_quicklook_rgb_composite(
         "pixel_size_x": px_x,
         "pixel_size_y": px_y,
         "nodata": nodata_val,
-            "x_scale": float(out_w) / float(src_w) if src_w > 0 else 1.0,
-            "y_scale": float(out_h) / float(src_h) if src_h > 0 else 1.0,
-            "x_offset": int(crop_x0),
-            "y_offset": int(crop_y0),
-            "affine_a": float(transform.a),
-            "affine_b": float(transform.b),
-            "affine_d": float(transform.d),
-            "affine_e": float(transform.e),
-            "decimated": bool(out_w != src_w or out_h != src_h),
-            "percentiles": (float(p_low), float(p_high)),
-            "gamma": float(gamma_v),
-            "channels": channel_stats,
-        }
+        "x_scale": float(out_w) / float(src_w) if src_w > 0 else 1.0,
+        "y_scale": float(out_h) / float(src_h) if src_h > 0 else 1.0,
+        "x_offset": int(crop_x0),
+        "y_offset": int(crop_y0),
+        "affine_a": float(transform.a),
+        "affine_b": float(transform.b),
+        "affine_d": float(transform.d),
+        "affine_e": float(transform.e),
+        "decimated": bool(out_w != src_w or out_h != src_h),
+        "percentiles": (float(p_low), float(p_high)),
+        "gamma": float(gamma_v),
+        "channels": channel_stats,
+    }
     return rgb, valid, info
 
 
@@ -8302,6 +10472,7 @@ def _coregister_enmap_auxiliary_outputs(
     hs_reference_raster_path: Optional[str] = None,
     gdalwarp_multi: bool = True,
     gdalwarp_num_threads: str = "ALL_CPUS",
+    coregister_ql: bool = True,
 ) -> Dict[str, Any]:
     """Generate coregistered EnMAP auxiliary outputs from QL rasters and sidecars."""
     result: Dict[str, Any] = {
@@ -8316,15 +10487,17 @@ def _coregister_enmap_auxiliary_outputs(
         },
         "warp_method": None,
         "tiepoints_used": 0,
+        "ql_coregistration_requested": bool(coregister_ql),
     }
     gdal_threads = _normalize_gdalwarp_num_threads(gdalwarp_num_threads)
 
     aux_inputs = _discover_enmap_auxiliary_inputs(enmap_spectral_image)
-    ql_rasters = list(aux_inputs.get("ql_rasters", []) or [])
+    ql_rasters_discovered = list(aux_inputs.get("ql_rasters", []) or [])
+    ql_rasters = ql_rasters_discovered if coregister_ql else []
     sidecars = dict(aux_inputs.get("sidecars", {}) or {})
     scene_prefix = str(aux_inputs.get("scene_prefix") or "").strip()
 
-    if not ql_rasters and not sidecars:
+    if not ql_rasters_discovered and not sidecars:
         result["status"] = "degraded"
         result["warnings"].append(
             _fmt_issue(
@@ -8335,7 +10508,15 @@ def _coregister_enmap_auxiliary_outputs(
         return result
 
     result["status"] = "ok"
-    if not ql_rasters:
+    if not sidecars:
+        result["status"] = "degraded"
+        result["warnings"].append(
+            _fmt_issue(
+                "ANCILLARY",
+                "No EnMAP XML/HDR sidecars were discovered for provenance copy.",
+            )
+        )
+    if coregister_ql and not ql_rasters:
         result["status"] = "degraded"
         result["warnings"].append(
             _fmt_issue(
@@ -8345,7 +10526,12 @@ def _coregister_enmap_auxiliary_outputs(
         )
 
     coreg_aux_dir = os.path.join(folder_struct["coreg"], "enmap_aux")
-    metadata_dir = os.path.join(coreg_aux_dir, "metadata")
+    reports_dir = folder_struct.get("reports")
+    metadata_dir = (
+        os.path.join(reports_dir, "provenance", "enmap_metadata")
+        if reports_dir
+        else os.path.join(coreg_aux_dir, "metadata")
+    )
     os.makedirs(coreg_aux_dir, exist_ok=True)
     os.makedirs(metadata_dir, exist_ok=True)
 
@@ -8361,6 +10547,10 @@ def _coregister_enmap_auxiliary_outputs(
             result["warnings"].append(
                 _fmt_issue("ANCILLARY", f"Failed to copy EnMAP sidecar '{sidecar_key}': {exc}")
             )
+
+    if not coregister_ql:
+        result["warp_method"] = "not_requested"
+        return result
 
     base_tie_points_df = None if best_candidate is None else best_candidate.get("local_tiepoints_df")
     if base_tie_points_df is None or len(base_tie_points_df) == 0:
@@ -8460,7 +10650,7 @@ def _coregister_enmap_auxiliary_outputs(
                 if "PIXELMASK" in str(src_name).upper()
                 else ARTIFACT_ROLE_NO_PIPELINE_SIDECAR
             )
-            sidecar_result = _finalize_legacy_sidecars(
+            sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=out_path,
                 sensor_type="ENMAP",
                 artifact_role=artifact_role,
@@ -8790,7 +10980,7 @@ def _coregister_prisma_ancillary_outputs(
             pan_check = _validate_ancillary_raster(pan_out, s2_crs)
             if not pan_check.get("ok", False):
                 raise RuntimeError(pan_check.get("error", "PAN output validation failed"))
-            pan_sidecar_result = _finalize_legacy_sidecars(
+            pan_sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=pan_out,
                 sensor_type="PRISMA",
                 artifact_role=ARTIFACT_ROLE_NO_PIPELINE_SIDECAR,
@@ -8935,7 +11125,7 @@ def _coregister_prisma_ancillary_outputs(
                 qm_check = _validate_ancillary_raster(out_path, s2_crs)
                 if not qm_check.get("ok", False):
                     raise RuntimeError(qm_check.get("error", f"{label} quality output validation failed"))
-                sidecar_result = _finalize_legacy_sidecars(
+                sidecar_result = _finalize_pipeline_sidecars(
                     tif_path=out_path,
                     sensor_type="PRISMA",
                     artifact_role=ARTIFACT_ROLE_QUALITY_MASK,
@@ -9074,7 +11264,7 @@ ARTIFACT_ROLE_MAIN_COREG_SPECTRAL = "main_coreg_spectral"
 ARTIFACT_ROLE_PRE_COREG_SPECTRAL = "pre_coreg_spectral"
 ARTIFACT_ROLE_QUALITY_MASK = "quality_mask"
 ARTIFACT_ROLE_NO_PIPELINE_SIDECAR = "no_pipeline_sidecar"
-LEGACY_HDR_ARTIFACT_ROLES = {
+PIPELINE_HDR_ARTIFACT_ROLES = {
     ARTIFACT_ROLE_MAIN_COREG_SPECTRAL,
     ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
     ARTIFACT_ROLE_QUALITY_MASK,
@@ -9354,7 +11544,7 @@ def _remove_sidecar_if_exists(path: str) -> Dict[str, Any]:
         return result
 
 
-def _finalize_legacy_sidecars(
+def _finalize_pipeline_sidecars(
     tif_path: str,
     sensor_type: str,
     artifact_role: str,
@@ -9365,12 +11555,12 @@ def _finalize_legacy_sidecars(
     strict_metadata: bool = True,
     label_precision: int = 2,
 ) -> Dict[str, Any]:
-    """Write or clean legacy sidecars for non-main outputs."""
+    """Write or clean pipeline sidecars for non-main outputs."""
     result = {"ok": False, "warnings": [], "errors": []}
     hdr_path = str(Path(tif_path).with_suffix(".hdr"))
     aux_path = str(Path(tif_path).with_suffix(".aux.xml"))
 
-    if str(artifact_role) in LEGACY_HDR_ARTIFACT_ROLES:
+    if str(artifact_role) in PIPELINE_HDR_ARTIFACT_ROLES:
         hdr_result = _write_envi_header(
             tif_path=tif_path,
             sensor_type=sensor_type,
@@ -9489,7 +11679,7 @@ def _envi_map_info_from_rasterio_dataset(src) -> Optional[str]:
         if (not np.isfinite(x_size)) or (not np.isfinite(y_size)) or x_size <= 0 or y_size <= 0:
             return None
 
-        # Match legacy MOARA/VALU headers by using the GeoTIFF transform origin.
+        # Match MOARA/VALU headers by using the GeoTIFF transform origin.
         x_ref = float(tr.c)
         y_ref = float(tr.f)
         if not np.all(np.isfinite([x_ref, y_ref])):
@@ -9776,11 +11966,16 @@ def _write_envi_header(
 
 def _iter_valid_band_values(src: rasterio.io.DatasetReader, bidx: int, nodata_value: Optional[float]):
     """Yield finite, non-nodata pixel chunks for a given band."""
+    nodata_values = resolve_raster_nodata_values(
+        src,
+        nodata_fallback=nodata_value,
+        extra_values=[nodata_value],
+    )
     for _, window in src.block_windows(bidx):
         band = src.read(bidx, window=window).astype(np.float64, copy=False)
         valid = np.isfinite(band)
-        if nodata_value is not None and np.isfinite(nodata_value):
-            valid &= (band != float(nodata_value))
+        for nodata_candidate in nodata_values:
+            valid &= band != float(nodata_candidate)
         if np.any(valid):
             yield band[valid]
 
@@ -9871,13 +12066,18 @@ def _compute_band_statistics_approx(
     sum_val = 0.0
     sum_sq = 0.0
 
+    nodata_values = resolve_raster_nodata_values(
+        src,
+        nodata_fallback=nodata_value,
+        extra_values=[nodata_value],
+    )
     for widx, (_, window) in enumerate(src.block_windows(bidx)):
         if (widx % step) != offset:
             continue
         band = src.read(bidx, window=window).astype(np.float64, copy=False)
         valid = np.isfinite(band)
-        if nodata_value is not None and np.isfinite(nodata_value):
-            valid &= (band != float(nodata_value))
+        for nodata_candidate in nodata_values:
+            valid &= band != float(nodata_candidate)
         vals = band[valid]
         if vals.size <= 0:
             continue
@@ -10244,16 +12444,100 @@ def _safe_dataset_file_stem(raw_value: Any, fallback: str = "scene") -> str:
     return text or fallback
 
 
-def _build_scene_output_name(source_path: str, hyp_type: Optional[str], acquisition_time: Any = None) -> str:
-    sensor = _infer_sensor_from_identifiers(hyp_type, None, Path(str(source_path)).name)
-    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
-    source_text = os.path.abspath(str(source_path)) if source_path else ""
-    token_src = source_text or str(source_path) or sensor_tag
-    token = hashlib.sha1(token_src.encode("utf-8", errors="ignore")).hexdigest()[:8].upper()
-    stem = _safe_dataset_file_stem(Path(str(source_path)).stem if source_path else "scene", fallback="scene")
+def _format_scene_datetime_tags(acquisition_time: Any) -> Tuple[Optional[str], Optional[str]]:
     if isinstance(acquisition_time, datetime):
-        return f"{sensor_tag}_{acquisition_time.strftime('%y%m%d')}_{stem}_{token}"
-    return f"{sensor_tag}_{stem}_{token}"
+        return acquisition_time.strftime("%y%m%d"), acquisition_time.strftime("%H_%M_%S")
+    return None, None
+
+
+def _build_scene_output_name(source_path: str, hyp_type: Optional[str], acquisition_time: Any = None) -> str:
+    sensor = _infer_sensor_from_identifiers(hyp_type, None, _portable_name(source_path))
+    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
+    date_tag, time_tag = _format_scene_datetime_tags(acquisition_time)
+    if date_tag and time_tag:
+        return f"{sensor_tag}_{date_tag}_{time_tag}"
+    stem = _safe_dataset_file_stem(_portable_stem(source_path, fallback="scene"), fallback="scene")
+    return f"{sensor_tag}_{stem}"
+
+
+def _build_scene_output_dir(
+    output_dir: str,
+    hyp_type: Optional[str],
+    acquisition_time: Any,
+    *,
+    create: bool = False,
+    fail_if_exists: bool = False,
+) -> str:
+    sensor = _infer_sensor_from_identifiers(hyp_type, None, None)
+    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
+    date_tag, time_tag = _format_scene_datetime_tags(acquisition_time)
+    if not (date_tag and time_tag):
+        return output_dir
+    scene_root = _build_scene_output_root(output_dir, sensor_tag, date_tag, time_tag)
+    if create:
+        try:
+            os.makedirs(scene_root, exist_ok=not fail_if_exists)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "Scene output folder already exists for this acquisition time: "
+                f"{scene_root}. Remove or rename the existing folder before rerunning."
+            ) from exc
+    return scene_root
+
+
+ENMAP_REPORT_METADATA_KEYS: Tuple[str, ...] = (
+    "enmap_id",
+    "enmap_date",
+    "enmap_processing_version",
+    "enmap_cloud_pct",
+    "enmap_haze_pct",
+    "enmap_cirrus_pct",
+    "enmap_snow_pct",
+    "enmap_water_pct",
+    "sun_elevation_angle",
+    "sun_zenith_angle",
+    "across_offnadir_angle",
+    "along_offnadir_angle",
+    "scene_azimuth_angle",
+)
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        parsed = float(value)
+        if np.isfinite(parsed):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _compute_enmap_total_cloud_pct(meta: Dict[str, Any]) -> Optional[float]:
+    cloud = _safe_float_or_none(meta.get("enmap_cloud_pct"))
+    if cloud is None:
+        cloud = _safe_float_or_none(meta.get("prisma_cloud_pct"))
+    if cloud is None:
+        return None
+    haze = _safe_float_or_none(meta.get("enmap_haze_pct")) or 0.0
+    cirrus = _safe_float_or_none(meta.get("enmap_cirrus_pct")) or 0.0
+    return float(min(100.0, cloud + haze + cirrus))
+
+
+def _build_enmap_report_fields(
+    extended_meta: Dict[str, Any],
+    *,
+    enmap_total_cloud_pct: Optional[float] = None,
+    input_cloud_threshold_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    fields = {key: extended_meta.get(key) for key in ENMAP_REPORT_METADATA_KEYS}
+    total_cloud = enmap_total_cloud_pct
+    if total_cloud is None:
+        total_cloud = _compute_enmap_total_cloud_pct(extended_meta)
+    fields["enmap_total_cloud_pct"] = total_cloud
+    fields["input_cloud_threshold_pct"] = input_cloud_threshold_pct
+    return fields
 
 
 def _batch_summary_identity_key(row: Dict[str, Any]) -> str:
@@ -10275,7 +12559,7 @@ def _resolve_dataset_scene_name(metrics_dict: Dict[str, Any]) -> str:
         return str(scene_name)
     filename = metrics_dict.get("filename")
     if filename:
-        return Path(str(filename)).stem
+        return _portable_stem(filename)
     return "scene"
 
 
@@ -10283,7 +12567,7 @@ def _build_dataset_xlsx_filename(scene_name: Optional[str], filename: Optional[s
     """Return the canonical per-scene dataset workbook filename."""
     label = scene_name
     if not label and filename:
-        label = Path(str(filename)).stem
+        label = _portable_stem(filename)
     safe_label = _safe_dataset_file_stem(label, fallback="scene")
     return f"{safe_label}_DATASET.xlsx"
 
@@ -10309,7 +12593,7 @@ def _infer_sensor_from_identifiers(
             return "ENMAP"
 
     if filename:
-        suffix = Path(str(filename)).suffix.lower()
+        suffix = _portable_suffix(filename).lower()
         if suffix == ".he5":
             return "PRISMA"
 
@@ -10317,7 +12601,7 @@ def _infer_sensor_from_identifiers(
 
 
 def _build_dataset_row(metrics_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Map scene metrics to one 43-column dataset row."""
+    """Map scene metrics to one schema-driven dataset row."""
     row = {column: None for column in DATASET_XLSX_COLUMNS}
     row["folder_name"] = _resolve_dataset_scene_name(metrics_dict)
 
@@ -10482,6 +12766,11 @@ def _write_batch_summary_txt(
         f.write(f"  Succeeded: {len(results.get('succeeded', []))}\n")
         f.write(f"  Skipped: {len(results.get('skipped', []))}\n")
         f.write(f"  Failed: {len(results.get('failed', []))}\n\n")
+        if results.get("aborted"):
+            f.write(f"Status: {results.get('status', 'ABORTED')}\n")
+            f.write(f"Abort scope: {results.get('abort_scope', 'n/a')}\n")
+            f.write(f"Abort pending: {results.get('abort_pending', 0)}\n")
+            f.write(f"Abort reason: {results.get('abort_reason', 'n/a')}\n\n")
 
         f.write("Scene details:\n")
         f.write("-" * 60 + "\n")
@@ -10526,6 +12815,11 @@ def _write_batch_summary_xlsx(
         ("Succeeded", len(results.get("succeeded", []))),
         ("Skipped", len(results.get("skipped", []))),
         ("Failed", len(results.get("failed", []))),
+        ("Status", results.get("status", "DONE")),
+        ("Aborted", bool(results.get("aborted", False))),
+        ("Abort scope", results.get("abort_scope")),
+        ("Abort pending", results.get("abort_pending")),
+        ("Abort reason", results.get("abort_reason")),
     )
     for row_idx, (label, value) in enumerate(overview_rows, 1):
         label_cell = ws_overview.cell(row=row_idx, column=1, value=label)
@@ -10555,9 +12849,189 @@ def _write_batch_summary_xlsx(
     wb.save(xlsx_path)
 
 
+def _batch_uses_remote_s2(config: Dict[str, Any]) -> bool:
+    """Return True when batch processing must use CDSE Sentinel-2 references."""
+    return not bool(str(config.get("local_s2_stack_path") or "").strip())
+
+
+def _resolve_effective_batch_workers(
+    config: Dict[str, Any],
+    requested_workers: int,
+    remote_s2_required: bool,
+) -> int:
+    """Apply batch worker safety constraints for prompt-driven CDSE auth."""
+    workers = max(1, int(requested_workers))
+    if workers > 1 and remote_s2_required and bool(config.get("allow_gui_prompt", False)):
+        logger.warning(
+            _fmt_issue(
+                "AUTH",
+                "GUI CDSE prompting is enabled for a remote Sentinel-2 batch; "
+                "forcing this run to sequential processing so the prompt and session stay in one process.",
+            )
+        )
+        return 1
+    return workers
+
+
+def _set_batch_auth_abort(results: Dict[str, Any], reason: str, pending: int) -> None:
+    """Annotate a batch result payload with systemic CDSE auth abort fields."""
+    results["status"] = "ABORTED_AUTH"
+    results["aborted"] = True
+    results["abort_scope"] = "AUTH"
+    results["abort_reason"] = str(reason)
+    results["abort_pending"] = max(0, int(pending))
+
+
+def _finalize_batch_results(
+    *,
+    output_dir: str,
+    results: Dict[str, Any],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+    scene_total: int,
+    progress_stage: str = "Batch completed",
+) -> Dict[str, Any]:
+    """Write final batch summaries and emit terminal progress."""
+    log_section_header("BATCH SUMMARY")
+    logger.info(
+        f"Total: {results['total']}, Success: {len(results['succeeded'])}, "
+        f"Skipped: {len(results['skipped'])}, Failed: {len(results['failed'])}"
+    )
+    if results.get("aborted"):
+        logger.error(
+            "Batch aborted (%s): %s; pending scenes: %s",
+            results.get("abort_scope", "UNKNOWN"),
+            results.get("abort_reason", "Unknown"),
+            results.get("abort_pending", 0),
+        )
+
+    grouped_rows = _collect_batch_summary_rows(results)
+    summary_path = os.path.join(output_dir, "batch_summary.txt")
+    _write_batch_summary_txt(summary_path=summary_path, results=results, grouped_rows=grouped_rows)
+    logger.info(f"Summary written: {summary_path}")
+    try:
+        xlsx_path = os.path.join(output_dir, "batch_summary.xlsx")
+        _write_batch_summary_xlsx(xlsx_path=xlsx_path, results=results, grouped_rows=grouped_rows)
+        logger.info(f"Excel summary written: {xlsx_path}")
+    except ImportError:
+        logger.debug("openpyxl not available, skipping Excel summary")
+
+    _emit_progress(
+        progress_callback,
+        progress_stage,
+        scene_idx=max(1, int(scene_total or 1)),
+        scene_total=max(1, int(scene_total or 1)),
+        status="aborted" if results.get("aborted") else "done",
+    )
+    return results
+
+
+def _write_failed_scene_artifacts(
+    *,
+    hs_file: str,
+    hyp_type: Optional[str],
+    config: Dict[str, Any],
+    folder_struct: Dict[str, str],
+    scene_name: str,
+    scene_idx: int,
+    scene_total: int,
+    reason: str,
+    hs_time: Optional[datetime] = None,
+    bbox: Any = None,
+    candidate_errors: Optional[List[Dict[str, Any]]] = None,
+    keep_temp_files: bool = False,
+) -> Dict[str, Any]:
+    """Write scene-local failure reports and clean temp output when a scene aborts."""
+    reports_dir = folder_struct.get("reports") or os.path.join(folder_struct.get("scene_root", ""), "04_reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    scene_root = folder_struct.get("scene_root")
+    filename = _portable_name(hs_file)
+    metrics_json_path = os.path.join(reports_dir, f"{scene_name}_metrics.json")
+    manifest_json_path = os.path.join(reports_dir, f"{scene_name}_run_manifest.json")
+    shift_report_path = os.path.join(reports_dir, f"{scene_name}_shift_report.txt")
+    dataset_xlsx_path = os.path.join(
+        reports_dir,
+        _build_dataset_xlsx_filename(scene_name=scene_name, filename=filename),
+    )
+
+    metrics = _build_failed_scene_metrics(hs_file, hyp_type, reason)
+    metrics.update(
+        {
+            "scene_name": scene_name,
+            "filename": filename,
+            "source_path": hs_file,
+            "hyp_type": _infer_sensor_from_identifiers(hyp_type, None, filename),
+            "status": "FAIL",
+            "reason": reason,
+            "error": reason,
+            "metadata_schema_version": METADATA_SCHEMA_VERSION,
+            "metadata_status": "failed",
+            "metadata_warnings": [],
+            "run_manifest_path": manifest_json_path,
+            "metrics_json_path": metrics_json_path,
+            "dataset_xlsx_path": dataset_xlsx_path,
+            "displacement_vectors_path": None,
+            "candidate_errors": list(candidate_errors or []),
+        }
+    )
+
+    manifest = {
+        "manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "FAIL",
+        "scene": {
+            "scene_name": scene_name,
+            "filename": filename,
+            "sensor_type": metrics.get("hyp_type"),
+            "scene_idx": int(scene_idx),
+            "scene_total": int(scene_total),
+        },
+        "paths": {
+            "scene_root": scene_root,
+            "shift_report": shift_report_path,
+            "metrics_json": metrics_json_path,
+            "dataset_xlsx": dataset_xlsx_path,
+            "run_manifest": manifest_json_path,
+        },
+        "input": {
+            "hs_file": hs_file,
+            "acquisition_time": hs_time.isoformat() if isinstance(hs_time, datetime) else None,
+            "bbox": list(bbox) if bbox is not None else None,
+        },
+        "config": _sanitize_config_for_manifest(config),
+        "summary": {
+            "reason": reason,
+            "candidate_errors": list(candidate_errors or []),
+        },
+    }
+
+    _write_shift_report(
+        shift_report_path,
+        f"COREG RESULT ({metrics.get('hyp_type') or 'UNKNOWN'})",
+        None,
+        ["Status: FAIL", reason],
+    )
+    _write_per_scene_metrics_json(metrics, metrics_json_path)
+    _write_scene_run_manifest(manifest, manifest_json_path)
+    _write_single_scene_dataset_xlsx(metrics, dataset_xlsx_path)
+    temp_dir = folder_struct.get("temp")
+    if temp_dir:
+        _cleanup_temp_folder(temp_dir, keep_temp_files=keep_temp_files)
+    return metrics
+
+
+def _candidate_passes_final_quality(candidate: Dict[str, Any]) -> bool:
+    """Return True only for candidates that passed final quality gating."""
+    if not candidate.get("final_quality_pass", False):
+        return False
+    validation = candidate.get("validation", {})
+    if isinstance(validation, dict) and validation.get("is_valid") is False:
+        return False
+    return True
+
+
 def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_message: str) -> Dict[str, Any]:
     """Create a minimal metrics payload for fallback FAIL dataset workbook rows."""
-    filename = os.path.basename(hs_file)
+    filename = _portable_name(hs_file)
     inferred_sensor = _infer_sensor_from_identifiers(hyp_type, None, filename)
     scene_name = _build_scene_output_name(hs_file, inferred_sensor)
     return {
@@ -10599,15 +13073,37 @@ def _build_skip_result(
 ) -> Dict[str, Any]:
     """Create metrics + manifest for early scene skip conditions."""
     scene_name = _build_scene_output_name(hs_file, hyp_type, hs_time)
-    skip_manifest_path = os.path.join(output_dir, f"{scene_name}_run_manifest.json")
+    filename = _portable_name(hs_file)
+    date_tag, time_tag = _format_scene_datetime_tags(hs_time)
+    sensor = _infer_sensor_from_identifiers(hyp_type, None, filename)
+    sensor_tag = str(sensor or hyp_type or "SCENE").upper().strip() or "SCENE"
+    if date_tag and time_tag:
+        skip_folders = _create_scene_folder_structure(
+            output_dir,
+            sensor_tag,
+            date_tag,
+            time_tag,
+            source_path=hs_file,
+        )
+        skip_scene_root = skip_folders["scene_root"]
+        if skip_folders.get("scene_suffix"):
+            scene_name = f"{scene_name}_{skip_folders['scene_suffix']}"
+        skip_reports_dir = skip_folders["reports"]
+    else:
+        skip_scene_root = output_dir
+        skip_reports_dir = output_dir
+        os.makedirs(skip_reports_dir, exist_ok=True)
+    os.makedirs(skip_reports_dir, exist_ok=True)
+    skip_manifest_path = os.path.join(skip_reports_dir, f"{scene_name}_run_manifest.json")
+    skip_metrics_json_path = os.path.join(skip_reports_dir, f"{scene_name}_metrics.json")
     skip_dataset_xlsx_path = os.path.join(
-        output_dir,
-        _build_dataset_xlsx_filename(scene_name=scene_name, filename=os.path.basename(hs_file)),
+        skip_reports_dir,
+        _build_dataset_xlsx_filename(scene_name=scene_name, filename=filename),
     )
     skip_metrics = {
         'status': status,
         'scene_name': scene_name,
-        'filename': os.path.basename(hs_file),
+        'filename': filename,
         'source_path': hs_file,
         'hyp_type': hyp_type,
         'reason': reason,
@@ -10638,6 +13134,7 @@ def _build_skip_result(
         },
         'ancillary_warnings': [],
         'run_manifest_path': skip_manifest_path,
+        'metrics_json_path': skip_metrics_json_path,
         'displacement_vectors_path': None,
         'dataset_xlsx_path': skip_dataset_xlsx_path,
     }
@@ -10650,13 +13147,15 @@ def _build_skip_result(
         "status": status,
         "scene": {
             "scene_name": scene_name,
-            "filename": os.path.basename(hs_file),
+            "filename": filename,
             "sensor_type": hyp_type,
             "scene_idx": int(scene_idx),
             "scene_total": int(scene_total),
         },
         "paths": {
             "output_dir": output_dir,
+            "scene_root": skip_scene_root,
+            "metrics_json": skip_metrics_json_path,
             "run_manifest": skip_manifest_path,
             "displacement_vectors_path": None,
             "dataset_xlsx": skip_dataset_xlsx_path,
@@ -10673,8 +13172,177 @@ def _build_skip_result(
         skip_manifest["summary"].update(dict(extra_summary))
 
     _write_scene_run_manifest(skip_manifest, skip_manifest_path)
+    _write_per_scene_metrics_json(skip_metrics, skip_metrics_json_path)
     _write_single_scene_dataset_xlsx(skip_metrics, skip_dataset_xlsx_path)
     return skip_metrics
+
+
+def _run_batch_scene_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Process one batch scene in a worker process without shared sessions or callbacks."""
+    hs_file = str(payload["hs_file"])
+    output_dir = str(payload["output_dir"])
+    scene_idx = int(payload.get("scene_idx", 1))
+    scene_total = int(payload.get("scene_total", 1))
+    scene_config = dict(payload.get("config", {}) or {})
+    scene_config.pop("_cdse_session", None)
+    scene_config.pop("prompt_userpass_fn", None)
+    source_key = str(os.path.normcase(os.path.abspath(hs_file)))
+    filename = _portable_name(hs_file)
+    scene_hyp_type: Optional[str] = None
+    auth_error = False
+    attached_metrics = None
+    userpass_credentials = payload.get("cdse_userpass_credentials")
+    if isinstance(userpass_credentials, (list, tuple)) and len(userpass_credentials) >= 2:
+        _cache_cdse_public_credentials(
+            username=str(userpass_credentials[0] or ""),
+            password=str(userpass_credentials[1] or ""),
+            totp=str(userpass_credentials[2]).strip() if len(userpass_credentials) >= 3 and userpass_credentials[2] else None,
+        )
+    try:
+        hyp_type = detect_hyp_type(hs_file)
+        scene_hyp_type = hyp_type
+        metrics_dict = run_coregistration(
+            hs_file,
+            hyp_type,
+            output_dir,
+            scene_config,
+            progress_callback=None,
+            scene_idx=scene_idx,
+            scene_total=scene_total,
+        )
+        if isinstance(metrics_dict, dict) and str(metrics_dict.get("status", "")).startswith("SKIPPED_"):
+            return {
+                "kind": "skipped",
+                "source_key": source_key,
+                "filename": filename,
+                "metrics": metrics_dict,
+                "reason": metrics_dict.get("reason", "Scene skipped"),
+            }
+        return {
+            "kind": "succeeded",
+            "source_key": source_key,
+            "filename": filename,
+            "metrics": metrics_dict,
+        }
+    except SentinelNotFoundError as exc:
+        msg = f"No Sentinel-2 match: {exc}"
+    except CDSEAuthenticationError as exc:
+        auth_error = True
+        msg = str(exc)
+    except Exception as exc:
+        msg = str(exc)
+        attached_metrics = getattr(exc, "metrics", None)
+
+    result = {
+        "kind": "failed",
+        "source_key": source_key,
+        "filename": filename,
+        "hyp_type": scene_hyp_type,
+        "error": msg,
+        "failed_metrics": (
+            dict(attached_metrics)
+            if isinstance(attached_metrics, dict)
+            else _build_failed_scene_metrics(hs_file, scene_hyp_type, msg)
+        ),
+    }
+    if auth_error:
+        result["auth_error"] = True
+    return result
+
+
+def _record_batch_scene_result(
+    *,
+    results: Dict[str, Any],
+    scene_result: Dict[str, Any],
+    output_dir: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+    scene_idx: int,
+    scene_total: int,
+) -> None:
+    """Fold a scene result into the aggregate batch payload."""
+    kind = str(scene_result.get("kind", "failed"))
+    source_key = str(scene_result.get("source_key", ""))
+    fname = str(scene_result.get("filename") or _portable_name(source_key))
+    if kind == "skipped":
+        metrics_dict = dict(scene_result.get("metrics", {}) or {})
+        results["skipped"].append(metrics_dict)
+        results["skip_reasons"][source_key] = scene_result.get("reason", "Scene skipped")
+        results.setdefault("scene_results", []).append(
+            {
+                "source_path": source_key,
+                "filename": fname,
+                "status": "skipped",
+                "metrics_path": metrics_dict.get("metrics_json_path") or metrics_dict.get("dataset_xlsx_path"),
+                "error": None,
+            }
+        )
+        _emit_progress(
+            progress_callback,
+            "Scene skipped",
+            scene_idx=scene_idx,
+            scene_total=scene_total,
+            substage=fname,
+            scene_status="skipped",
+        )
+        return
+    if kind == "succeeded":
+        metrics_dict = dict(scene_result.get("metrics", {}) or {})
+        results["succeeded"].append(fname)
+        results["metrics"].append(metrics_dict)
+        results.setdefault("scene_results", []).append(
+            {
+                "source_path": source_key,
+                "filename": fname,
+                "status": "succeeded",
+                "metrics_path": metrics_dict.get("metrics_json_path") or metrics_dict.get("dataset_xlsx_path"),
+                "error": None,
+            }
+        )
+        _emit_progress(
+            progress_callback,
+            "Scene completed",
+            scene_idx=scene_idx,
+            scene_total=scene_total,
+            substage=fname,
+            scene_status="success",
+        )
+        return
+
+    msg = str(scene_result.get("error", "Unknown scene failure"))
+    results["failed"].append(source_key)
+    results["errors"][source_key] = msg
+    failed_metrics = dict(scene_result.get("failed_metrics", {}) or {})
+    if not failed_metrics:
+        failed_metrics = _build_failed_scene_metrics(source_key, scene_result.get("hyp_type"), msg)
+    fallback_dataset_path = os.path.join(
+        output_dir,
+        _build_dataset_xlsx_filename(
+            scene_name=failed_metrics.get("scene_name"),
+            filename=failed_metrics.get("filename"),
+        ),
+    )
+    failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
+    _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
+    results["failed_details"].append(failed_metrics)
+    results.setdefault("scene_results", []).append(
+        {
+            "source_path": source_key,
+            "filename": fname,
+            "status": "failed",
+            "metrics_path": failed_metrics.get("metrics_json_path") or failed_metrics.get("dataset_xlsx_path"),
+            "error": msg,
+        }
+    )
+    logger.error("Failed: %s", msg)
+    _emit_progress(
+        progress_callback,
+        "Scene failed (continuing batch)",
+        scene_idx=scene_idx,
+        scene_total=scene_total,
+        substage=fname,
+        scene_status="failed",
+        error=msg,
+    )
 
 
 def _normalize_raster_bands_01_inplace(tif_path, nodata=PROCESSING_NODATA):
@@ -10849,7 +13517,7 @@ def _save_precoreg_output(
                 raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to save pre-coreg output: {err}"))
             if not os.path.exists(output_path):
                 raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to write pre-coreg output: {output_path}"))
-            sidecar_result = _finalize_legacy_sidecars(
+            sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=output_path,
                 sensor_type=str(sensor_type),
                 artifact_role=ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
@@ -10880,7 +13548,7 @@ def _save_precoreg_output(
             raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to save pre-coreg output: {err}"))
         if not os.path.exists(output_path):
             raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to write pre-coreg output: {output_path}"))
-        sidecar_result = _finalize_legacy_sidecars(
+        sidecar_result = _finalize_pipeline_sidecars(
             tif_path=output_path,
             sensor_type=str(sensor_type),
             artifact_role=ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
@@ -11306,15 +13974,63 @@ def _cleanup_temp_folder(temp_folder_path, keep_temp_files=False):
         return False
 
 
+def _ensure_s2_l2a_band_descriptions(path: str) -> None:
+    """Set canonical band descriptions on a Sentinel-2 L2A reference stack."""
+    try:
+        if not path or not os.path.exists(path):
+            return
+        with rasterio.open(path, "r+") as dst:
+            if int(dst.count) < _minimum_local_s2_stack_band_count():
+                return
+            labels = S2_L2A_REFERENCE_STACK_BANDS[: min(int(dst.count), len(S2_L2A_REFERENCE_STACK_BANDS))]
+            for bidx, band_name in enumerate(labels, start=1):
+                dst.set_band_description(bidx, str(band_name))
+        scrub_result = scrub_incomplete_raster_band_metadata_inplace(path)
+        if scrub_result.get("ok", False) and int(scrub_result.get("removed_items", 0) or 0) > 0:
+            logger.info(
+                _fmt_issue(
+                    "S2_REF",
+                    (
+                        f"Removed GeoArray-incompatible band metadata from Sentinel-2 stack "
+                        f"({scrub_result.get('removed_items')} items; keys={scrub_result.get('removed_keys')})."
+                    ),
+                )
+            )
+        elif not scrub_result.get("ok", False) and scrub_result.get("error"):
+            logger.warning(
+                _fmt_issue(
+                    "S2_REF",
+                    f"Could not scrub Sentinel-2 band metadata on {path}: {scrub_result.get('error')}",
+                )
+            )
+    except Exception as exc:
+        logger.warning(_fmt_issue("S2_REF", f"Could not set S2 band descriptions on {path}: {exc}"))
+
+
 def _promote_s2_stack(source_path, target_path, temp_root=None):
     """
     Promote selected S2 stack to reference location.
 
     Use move when source is inside temp workspace to avoid an extra full copy.
+    If a local override contains additional bands, persist only the canonical
+    Sentinel-2 L2A reference stack.
     """
     if not source_path or not target_path:
         return
     if os.path.abspath(source_path) == os.path.abspath(target_path):
+        target_abs = os.path.abspath(target_path)
+        try:
+            with rasterio.open(target_abs) as src:
+                target_count = int(src.count)
+        except Exception as exc:
+            raise RuntimeError(f"Could not inspect Sentinel-2 reference stack at {target_abs}: {exc}") from exc
+        minimum_count = _minimum_local_s2_stack_band_count()
+        if target_count < minimum_count:
+            raise RuntimeError(
+                f"Sentinel-2 reference stack has too few bands ({target_count} < {minimum_count}) "
+                f"at {target_abs}."
+            )
+        _ensure_s2_l2a_band_descriptions(target_path)
         return
 
     target_dir = os.path.dirname(target_path) or "."
@@ -11323,6 +14039,57 @@ def _promote_s2_stack(source_path, target_path, temp_root=None):
     source_abs = os.path.abspath(source_path)
     target_abs = os.path.abspath(target_path)
     temp_abs = os.path.abspath(temp_root) if temp_root else None
+    minimum_count = _minimum_local_s2_stack_band_count()
+    expected_count = _expected_s2_l2a_output_band_count()
+    try:
+        with rasterio.open(source_abs) as src:
+            source_count = int(src.count)
+    except Exception as exc:
+        raise RuntimeError(f"Could not inspect S2 reference stack before promotion: {source_abs}: {exc}") from exc
+    if source_count < minimum_count:
+        raise RuntimeError(
+            f"Sentinel-2 reference stack selected for promotion has too few bands "
+            f"({source_count} < {minimum_count}) at {source_abs}."
+        )
+    promoted_count = expected_count if source_count >= expected_count else minimum_count
+
+    if source_abs.lower().endswith(".vrt"):
+        try:
+            from osgeo import gdal
+
+            gdal.UseExceptions()
+            opts = gdal.TranslateOptions(
+                format="GTiff",
+                bandList=list(range(1, promoted_count + 1)),
+                creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+            )
+            ds = gdal.Translate(target_abs, source_abs, options=opts)
+            if ds is None:
+                raise RuntimeError("GDAL Translate returned no dataset")
+            ds = None
+            _ensure_s2_l2a_band_descriptions(target_abs)
+            return
+        except Exception as e:
+            logger.warning(f"Could not materialize S2 VRT to reference GeoTIFF; falling back to copy ({e})")
+
+    try:
+        with rasterio.open(source_abs) as src:
+            source_dtype = np.dtype(src.dtypes[0]).name if src.count else "uint16"
+    except Exception as exc:
+        raise RuntimeError(f"Could not inspect S2 reference stack before promotion: {source_abs}: {exc}") from exc
+
+    if source_count > promoted_count:
+        copy_result = _stream_copy_raster_with_band_order(
+            source_path=source_abs,
+            output_path=target_abs,
+            source_bands_1based=list(range(1, promoted_count + 1)),
+            out_dtype=source_dtype,
+            compress="LZW",
+        )
+        if not copy_result.get("ok", False):
+            raise RuntimeError(copy_result.get("error", "failed to normalize S2 reference stack"))
+        _ensure_s2_l2a_band_descriptions(target_abs)
+        return
 
     should_move = False
     if temp_abs:
@@ -11334,11 +14101,13 @@ def _promote_s2_stack(source_path, target_path, temp_root=None):
     if should_move:
         try:
             shutil.move(source_abs, target_abs)
+            _ensure_s2_l2a_band_descriptions(target_abs)
             return
         except Exception as e:
             logger.warning(f"Could not move S2 stack to reference location; falling back to copy ({e})")
 
     shutil.copy2(source_abs, target_abs)
+    _ensure_s2_l2a_band_descriptions(target_abs)
 
 
 def _emit_progress(
@@ -11492,12 +14261,19 @@ def run_coregistration(
         ValueError: If input file is invalid
     """
     _emit_progress(progress_callback, "Initializing", scene_idx=scene_idx, scene_total=scene_total)
-    log_section_header(f"COREGISTRATION: {os.path.basename(hs_file)}")
+    hs_filename = _portable_name(hs_file)
+    log_section_header(f"COREGISTRATION: {hs_filename}")
 
     logger.info(f"Sensor type: {hyp_type}")
     logger.info(f"Output directory: {output_dir}")
 
     os.makedirs(output_dir, exist_ok=True)
+    config, cpu_guard_warnings = apply_cpu_oversubscription_guard(
+        config,
+        explicit_keys=config.get("_cpu_guard_explicit_keys", set()) if isinstance(config, dict) else set(),
+    )
+    for warning_msg in cpu_guard_warnings:
+        logger.warning(warning_msg)
 
     # Extract config parameters with defaults
     days_window = config.get('days_window', 30)
@@ -11763,6 +14539,19 @@ def run_coregistration(
         'progress_heartbeat_interval_s',
     )
     progress_heartbeat_interval_s = max(1.0, progress_heartbeat_interval_s)
+    timed_stages: Dict[str, float] = {}
+    s2_cache_info: Dict[str, Any] = {}
+    s2_stack_cache_enabled = bool(config.get("s2_stack_cache", DEFAULT_CONFIG.get("s2_stack_cache", True)))
+    s2_cache_dir = _resolve_cache_dir(
+        config.get("s2_cache_dir", DEFAULT_CONFIG.get("s2_cache_dir")),
+        "s2_stacks",
+    )
+    s2_stack_mode = str(config.get("s2_stack_mode", DEFAULT_CONFIG.get("s2_stack_mode", "materialized"))).lower()
+    if s2_stack_mode not in {"materialized", "vrt"}:
+        s2_stack_mode = "materialized"
+    s2_scl_exclude_classes = _coerce_scl_exclude_classes(
+        config.get("scl_exclude_classes", DEFAULT_CONFIG.get("scl_exclude_classes"))
+    )
     matcher_profile = _resolve_sensor_matcher_profile(config, hyp_type)
     pan_local_grid_res = _safe_parse_int(
         config.get(
@@ -11809,8 +14598,12 @@ def run_coregistration(
         pan_local_max_iter = None
 
     s2_ref_wl = S2_BANDS.get(s2_ref_band, {}).get('wavelength', S2_BAND08_CENTER_WL_NM)
-    s2_stack_band_map = {2: 1, 3: 2, 4: 3, 8: 4, 11: 5, 12: 6}
-    s2_stack_idx = s2_stack_band_map.get(s2_ref_band, 4)
+    s2_stack_band_map = {
+        int(label[1:]): int(idx)
+        for label, idx in S2_L2A_OUTPUT_BAND_INDEX.items()
+        if label.startswith("B") and label[1:].isdigit()
+    }
+    s2_stack_idx = s2_stack_band_map.get(s2_ref_band, int(S2_L2A_OUTPUT_BAND_INDEX["B08"]))
 
     logger.info(f"Parameters: days_window={days_window}, max_cloud={max_cloud}, "
                 f"residual_threshold={residual_threshold}, "
@@ -11913,12 +14706,12 @@ def run_coregistration(
         injected_meta: Dict[str, Any] = {}
         hs_suffix = Path(hs_file).suffix.lower()
         if hs_suffix in {".tif", ".tiff"}:
-            inject_result = inject_metadata_into_raster(hs_file, enmap_meta)
+            inject_result = stage_enmap_metadata_for_session(hs_file, enmap_meta)
             if not inject_result.get("ok", False):
                 logger.warning(
                     _fmt_issue(
                         "METADATA",
-                        f"Failed to inject EnMAP metadata into raster header: {inject_result.get('error', 'unknown error')}",
+                        f"Failed to stage EnMAP metadata for processing: {inject_result.get('error', 'unknown error')}",
                     )
                 )
             else:
@@ -11926,9 +14719,10 @@ def run_coregistration(
                     _fmt_issue(
                         "METADATA",
                         (
-                            "Injected EnMAP metadata into source raster "
+                            "Staged EnMAP metadata for processing "
                             f"(band_tags={int(inject_result.get('bands_updated', 0))}, "
-                            f"dataset_tags={int(inject_result.get('dataset_tags_updated', 0))})."
+                            f"dataset_tags={int(inject_result.get('dataset_tags_updated', 0))}, "
+                            f"source_mutated={bool(inject_result.get('source_mutated', False))})."
                         ),
                     )
                 )
@@ -11938,7 +14732,7 @@ def run_coregistration(
                 _fmt_issue(
                     "METADATA",
                     (
-                        "Deferring EnMAP metadata injection until BSQ source is converted "
+                        "Deferring EnMAP metadata staging until BSQ source is converted "
                         f"to temporary GeoTIFF: {hs_file}"
                     ),
                 )
@@ -11947,7 +14741,7 @@ def run_coregistration(
             logger.info(
                 _fmt_issue(
                     "METADATA",
-                    f"Skipping EnMAP metadata injection for unsupported source extension: {hs_file}",
+                    f"Skipping EnMAP metadata staging for unsupported source extension: {hs_file}",
                 )
             )
 
@@ -11996,6 +14790,8 @@ def run_coregistration(
             remove_detector_overlap=remove_detector_overlap_bands,
             enmap_processing_version=enmap_meta_merged.get("enmap_processing_version"),
         )
+        if len(band_table) == 0:
+            raise ValueError("No valid spectral bands after filtering invalid wavelengths")
         wl = band_table.wavelengths
         fwhm = band_table.fwhm
         band_names = band_table.band_names
@@ -12003,9 +14799,13 @@ def run_coregistration(
         cube = None
         diagnose_raster(hs_file, "INPUT ENMAP")
         extended_meta = {
+            'enmap_id': enmap_meta_merged.get('enmap_id'),
+            'enmap_date': enmap_meta_merged.get('enmap_date'),
+            'enmap_processing_version': enmap_meta_merged.get('enmap_processing_version'),
             'prisma_id': enmap_meta_merged.get('enmap_id'),
             'prisma_date': enmap_meta_merged.get('enmap_date'),
             'prisma_cloud_pct': enmap_meta_merged.get('prisma_cloud_pct'),
+            'prisma_sea_pct': enmap_meta_merged.get('enmap_water_pct'),
             'enmap_cloud_pct': enmap_meta_merged.get('enmap_cloud_pct'),
             'enmap_haze_pct': enmap_meta_merged.get('enmap_haze_pct'),
             'enmap_cirrus_pct': enmap_meta_merged.get('enmap_cirrus_pct'),
@@ -12018,15 +14818,22 @@ def run_coregistration(
             'along_offnadir_angle': enmap_meta_merged.get('along_offnadir_angle'),
             'scene_azimuth_angle': enmap_meta_merged.get('scene_azimuth_angle'),
             'observation_angle': enmap_meta_merged.get('observation_angle'),
+            'solar_zenith_angle': enmap_meta_merged.get('sun_zenith_angle'),
+            'view_zenith_angle': enmap_meta_merged.get('observation_angle'),
         }
         if extended_meta.get('prisma_cloud_pct') is None and enmap_meta_merged.get('enmap_cloud_pct') is not None:
             extended_meta['prisma_cloud_pct'] = enmap_meta_merged.get('enmap_cloud_pct')
         matching_probe_bidx = int(np.argmin(np.abs(wl - s2_ref_wl))) + 1
         probe_bands = sorted({1, int(max(1, matching_probe_bidx)), int(max(1, len(wl)))})
+        enmap_source_nodata_fallback = _finite_float_or_none(enmap_meta_merged.get("background_value"))
         integrity = _probe_raster_valid_pixels(
             hs_file,
             bands_1based=probe_bands,
-            nodata_fallback=PROCESSING_NODATA,
+            nodata_fallback=(
+                enmap_source_nodata_fallback
+                if enmap_source_nodata_fallback is not None
+                else PROCESSING_NODATA
+            ),
             sample_max_dim=512,
         )
         if not integrity.get("ok", False):
@@ -12054,6 +14861,11 @@ def run_coregistration(
 
     # Check cloud threshold
     cloud_passed, cloud_pct, cloud_reason = check_cloud_threshold(extended_meta, max_input_cloud, hyp_type)
+    enmap_total_cloud_pct = cloud_pct if hyp_type == "ENMAP" else None
+    if hyp_type == "ENMAP":
+        if enmap_total_cloud_pct is None:
+            enmap_total_cloud_pct = _compute_enmap_total_cloud_pct(extended_meta)
+        extended_meta["enmap_total_cloud_pct"] = enmap_total_cloud_pct
     if not cloud_passed:
         logger.warning(f"Skipping image due to cloud threshold: {cloud_reason}")
         _emit_progress(
@@ -12099,25 +14911,69 @@ def run_coregistration(
             extra_summary={
                 "cloud_pct": cloud_pct,
                 "cloud_threshold_pct": max_input_cloud,
+                "input_cloud_threshold_pct": max_input_cloud,
             },
             extra_metrics={
                 "cloud_pct": cloud_pct,
+                "input_cloud_pct": cloud_pct,
+                "input_cloud_threshold_pct": max_input_cloud,
                 "threshold": max_input_cloud,
+                **(
+                    _build_enmap_report_fields(
+                        extended_meta,
+                        enmap_total_cloud_pct=enmap_total_cloud_pct,
+                        input_cloud_threshold_pct=max_input_cloud,
+                    )
+                    if hyp_type == "ENMAP"
+                    else {}
+                ),
             },
         )
 
     # Create scene identifiers
     sensor_tag = hyp_type.upper()
     date_tag = hs_time.strftime("%y%m%d")
-    unique_hex = uuid.uuid4().hex[:3].upper()
-    scene_name = f"{sensor_tag}_{date_tag}_{unique_hex}"
+    time_tag = hs_time.strftime("%H_%M_%S")
+    scene_name = f"{sensor_tag}_{date_tag}_{time_tag}"
 
-    folder_struct = _create_scene_folder_structure(output_dir, sensor_tag, date_tag, unique_hex)
+    folder_struct = _create_scene_folder_structure(
+        output_dir,
+        sensor_tag,
+        date_tag,
+        time_tag,
+        source_path=hs_file,
+    )
+    if folder_struct.get("scene_suffix"):
+        scene_name = f"{scene_name}_{folder_struct['scene_suffix']}"
     scene_folder = folder_struct['scene_root']
+    candidate_errors: List[Dict[str, Any]] = []
+
+    def _raise_scene_failure(reason: str, exc_cls: type[Exception] = SceneProcessingError) -> None:
+        metrics = _write_failed_scene_artifacts(
+            hs_file=hs_file,
+            hyp_type=hyp_type,
+            config=config,
+            folder_struct=folder_struct,
+            scene_name=scene_name,
+            scene_idx=scene_idx,
+            scene_total=scene_total,
+            reason=str(reason),
+            hs_time=hs_time if isinstance(hs_time, datetime) else None,
+            bbox=bbox,
+            candidate_errors=candidate_errors,
+            keep_temp_files=bool(keep_temp_files),
+        )
+        if exc_cls is SceneProcessingError:
+            raise SceneProcessingError(str(reason), metrics=metrics)
+        raise exc_cls(str(reason))
 
     if hyp_type == "ENMAP":
         enmap_processing_source_path = hs_file
-        if Path(hs_file).suffix.lower() == ".bsq":
+        enmap_needs_source_prep = bool(
+            Path(hs_file).suffix.lower() == ".bsq"
+            or _metadata_has_radiometric_transform(enmap_meta_merged)
+        )
+        if enmap_needs_source_prep:
             prepared_source_path = os.path.join(
                 folder_struct["temp"],
                 f"{scene_name}_ENMAP_SOURCE_PREP.tif",
@@ -12129,19 +14985,30 @@ def run_coregistration(
                 inject_metadata=True,
             )
             if not prep_result.get("ok", False):
-                raise RuntimeError(
+                _raise_scene_failure(
                     _fmt_issue(
                         "HS_PREP",
-                        f"Failed EnMAP BSQ preparation: {prep_result.get('error', 'unknown error')}",
+                        f"Failed EnMAP source preparation: {prep_result.get('error', 'unknown error')}",
                     )
                 )
             enmap_processing_source_path = str(prep_result.get("path", prepared_source_path))
-            if prep_result.get("metadata_injection_attempted", False):
-                if prep_result.get("metadata_injected", False):
+            if prep_result.get("radiometric_scaling_applied", False):
+                logger.info(
+                    _fmt_issue(
+                        "HS_PREP",
+                        (
+                            "Applied EnMAP radiometric gain/offset during source preparation "
+                            f"(source_nodata={prep_result.get('source_nodata')}, "
+                            f"output_nodata={prep_result.get('output_nodata')})."
+                        ),
+                    )
+                )
+            if prep_result.get("metadata_staging_attempted", False):
+                if prep_result.get("metadata_staged", False):
                     logger.info(
                         _fmt_issue(
                             "METADATA",
-                            f"Injected EnMAP metadata into prepared source raster: {enmap_processing_source_path}",
+                            f"Staged EnMAP metadata for prepared source raster: {enmap_processing_source_path}",
                         )
                     )
                 else:
@@ -12149,8 +15016,8 @@ def run_coregistration(
                         _fmt_issue(
                             "METADATA",
                             (
-                                "Failed metadata injection for prepared EnMAP source raster: "
-                                f"{prep_result.get('metadata_injection_error', 'unknown error')}"
+                                "Failed metadata staging for prepared EnMAP source raster: "
+                                f"{prep_result.get('metadata_staging_error', 'unknown error')}"
                             ),
                         )
                     )
@@ -12167,8 +15034,9 @@ def run_coregistration(
         band_detectors=band_detectors,
         sensor_type=hyp_type,
     )
+    detector_plan = _apply_s2_band_subset_overrides(detector_plan, config)
     if not detector_plan.get("ok", False):
-        raise RuntimeError(
+        _raise_scene_failure(
             _fmt_issue(
                 "HS_PREP",
                 f"Failed detector branch planning: {detector_plan.get('error', 'unknown error')}",
@@ -12207,10 +15075,10 @@ def run_coregistration(
     if local_s2_stack_path:
         local_s2_validation = _validate_local_s2_stack_override(
             local_s2_stack_path,
-            min_band_count=6,
+            min_band_count=_minimum_local_s2_stack_band_count(),
         )
         if not local_s2_validation.get("ok", False):
-            raise RuntimeError(
+            _raise_scene_failure(
                 _fmt_issue(
                     "S2_REF",
                     str(local_s2_validation.get("error", "invalid local S2 stack override")),
@@ -12218,36 +15086,87 @@ def run_coregistration(
             )
         local_s2_path = str(local_s2_validation["path"])
         logger.info("Using local S2 override stack: %s", local_s2_path)
+        for warning_msg in local_s2_validation.get("warnings", []):
+            logger.warning(_fmt_issue("S2_REF", str(warning_msg)))
         s2_candidates_list.append({'type': 'local_override', 'path': local_s2_path, 'Name': 'Local Override'})
         s2_crs = local_s2_validation.get("crs")
     elif os.path.isfile(s2_path):
-        logger.info(f"S2 stack exists: {s2_path}")
-        s2_candidates_list.append({'type': 'local', 'path': s2_path, 'Name': 'Local File'})
-        with rasterio.open(s2_path) as src:
-            s2_crs = src.crs
-    else:
-        if session is None:
-            session = _create_cdse_session_with_retry(
+        try:
+            _require_s2_l2a_output_band_count(
+                s2_path,
+                context="Existing Sentinel-2 reference stack",
+            )
+            _ensure_s2_l2a_band_descriptions(s2_path)
+            logger.info(f"S2 stack exists: {s2_path}")
+            s2_candidates_list.append({'type': 'local', 'path': s2_path, 'Name': 'Local File'})
+            with rasterio.open(s2_path) as src:
+                s2_crs = src.crs
+        except Exception as exc:
+            logger.warning(
+                _fmt_issue(
+                    "S2_REF",
+                    (
+                        "Ignoring existing incomplete Sentinel-2 reference stack and "
+                        f"searching for a full L2A stack: {exc}"
+                    ),
+                )
+            )
+
+    if not s2_candidates_list:
+        t0_s2_search = perf_counter()
+        try:
+            if session is None:
+                session = _create_cdse_session_with_retry(
+                    allow_gui_prompt=allow_gui_prompt,
+                    prompt_userpass_fn=prompt_userpass_fn,
+                )
+            config["_cdse_session"] = session
+            items, session = _query_s2_with_retry(
+                session,
+                hs_time,
+                bbox,
+                days_window,
+                max_cloud,
                 allow_gui_prompt=allow_gui_prompt,
                 prompt_userpass_fn=prompt_userpass_fn,
             )
-        config["_cdse_session"] = session
-        items, session = _query_s2_with_retry(
-            session,
-            hs_time,
-            bbox,
-            days_window,
-            max_cloud,
-            allow_gui_prompt=allow_gui_prompt,
-            prompt_userpass_fn=prompt_userpass_fn,
-        )
-        config["_cdse_session"] = session
-        if items:
-            s2_candidates_list = _rank_s2_candidates(items, hs_time, bbox, min_overlap)
+            config["_cdse_session"] = session
+            if items:
+                s2_candidates_list = _rank_s2_candidates(items, hs_time, bbox, min_overlap)
+                config["_cdse_session"] = session
+        except CDSEAuthenticationError as exc:
+            _emit_progress(
+                progress_callback,
+                "Failed: CDSE authentication",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                status="error",
+            )
+            _raise_scene_failure(str(exc), CDSEAuthenticationError)
+        except SentinelNotFoundError as exc:
+            _emit_progress(
+                progress_callback,
+                "Failed: Sentinel-2 reference",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                status="error",
+            )
+            _raise_scene_failure(str(exc), SentinelNotFoundError)
+        except Exception as exc:
+            _emit_progress(
+                progress_callback,
+                "Failed: Sentinel-2 reference",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                status="error",
+            )
+            _raise_scene_failure(_fmt_issue("S2_REF", f"Sentinel-2 reference retrieval failed: {exc}"))
+        finally:
+            _record_stage_timing(timed_stages, "s2_search", t0_s2_search)
 
     if not s2_candidates_list:
         _emit_progress(progress_callback, "Failed: no Sentinel-2 candidates", scene_idx=scene_idx, scene_total=scene_total, status="error")
-        raise SentinelNotFoundError("No suitable Sentinel-2 candidates found.")
+        _raise_scene_failure("No suitable Sentinel-2 candidates found.", SentinelNotFoundError)
 
     # Process candidates
     final_success = False
@@ -12261,6 +15180,7 @@ def run_coregistration(
     quicklook_metadata: Dict[str, Any] = {}
     displacement_vectors_written_path: Optional[str] = None
     enmap_source_cache_by_crs: Dict[str, Dict[str, Any]] = {}
+    s2_cache_events: List[Dict[str, Any]] = []
     final_output_validation: Dict[str, Any] = {
         "ok": False,
         "valid_pixels": 0,
@@ -12275,31 +15195,75 @@ def run_coregistration(
         try:
             # Prepare S2 stack
             if s2_candidate.get('type') in {'local', 'local_override'}:
-                current_s2_path = s2_candidate['path']
+                if s2_candidate.get('type') == 'local_override':
+                    override_source_path = str(s2_candidate['path'])
+                    current_s2_path = os.path.join(
+                        folder_struct['temp'], f"{scene_name}_S2_local_override_c{cand_idx}.tif"
+                    )
+                    _promote_s2_stack(
+                        override_source_path,
+                        current_s2_path,
+                        temp_root=folder_struct.get('temp'),
+                    )
+                else:
+                    current_s2_path = s2_candidate['path']
+                    _ensure_s2_l2a_band_descriptions(current_s2_path)
                 with rasterio.open(current_s2_path) as src:
                     s2_crs = src.crs
                 selected_s2_metadata = {'product_id': os.path.basename(current_s2_path)}
             else:
                 current_s2_path = os.path.join(folder_struct['temp'], f"{scene_name}_S2_cand{cand_idx}.tif")
                 s2_prod_name = s2_candidate.get('Name', 'Unknown')
-                selected_s2_metadata = {'product_id': s2_prod_name}
+                selected_s2_metadata = _selected_s2_metadata_from_candidate(s2_candidate)
+                config["s2_platform"] = _s2_platform_from_product_name(s2_prod_name)
 
-                if not os.path.exists(current_s2_path):
+                rebuild_existing_candidate_stack = False
+                if os.path.exists(current_s2_path):
+                    try:
+                        _require_s2_l2a_output_band_count(
+                            current_s2_path,
+                            context=f"Existing Sentinel-2 candidate stack {cand_idx + 1}",
+                        )
+                        _ensure_s2_l2a_band_descriptions(current_s2_path)
+                    except Exception as exc:
+                        rebuild_existing_candidate_stack = True
+                        logger.warning(
+                            _fmt_issue(
+                                "S2_REF",
+                                (
+                                    f"Rebuilding incomplete Sentinel-2 candidate stack {cand_idx + 1}: "
+                                    f"{exc}"
+                                ),
+                            )
+                        )
+
+                if rebuild_existing_candidate_stack or not os.path.exists(current_s2_path):
                     if session is None:
                         session = _create_cdse_session_with_retry(
                             allow_gui_prompt=allow_gui_prompt,
                             prompt_userpass_fn=prompt_userpass_fn,
                         )
                         config["_cdse_session"] = session
-                    zip_path, session = _download_s2_product(
-                        session, s2_candidate, folder_struct['temp'],
-                        allow_gui_prompt=allow_gui_prompt,
-                        progress_callback=progress_callback,
-                        scene_idx=scene_idx,
-                        scene_total=scene_total,
-                        prompt_userpass_fn=prompt_userpass_fn,
-                    )
-                    config["_cdse_session"] = session
+                    t0_s2_download = perf_counter()
+                    zip_path = s2_candidate.get("_zip_path")
+                    if zip_path and os.path.exists(str(zip_path)):
+                        zip_path = str(zip_path)
+                        download_elapsed = 0.0
+                        logger.info("Reusing existing Sentinel-2 ZIP: %s", zip_path)
+                    else:
+                        zip_path, session = _download_s2_product(
+                            session, s2_candidate, folder_struct['temp'],
+                            allow_gui_prompt=allow_gui_prompt,
+                            progress_callback=progress_callback,
+                            scene_idx=scene_idx,
+                            scene_total=scene_total,
+                            prompt_userpass_fn=prompt_userpass_fn,
+                        )
+                        download_elapsed = _record_stage_timing(timed_stages, "s2_download", t0_s2_download)
+                        config["_cdse_session"] = session
+                    timed_stages[f"candidate_{cand_idx + 1}_s2_download"] = float(download_elapsed)
+                    t0_s2_stack = perf_counter()
+                    candidate_s2_cache_info: Dict[str, Any] = {"candidate_idx": int(cand_idx)}
                     with _ProgressHeartbeat(
                         progress_callback,
                         "Building Sentinel-2 stack",
@@ -12315,11 +15279,21 @@ def run_coregistration(
                             progress_callback=progress_callback,
                             scene_idx=scene_idx,
                             scene_total=scene_total,
+                            product_id=s2_prod_name,
+                            cache_dir=s2_cache_dir,
+                            use_cache=s2_stack_cache_enabled,
+                            cache_info=candidate_s2_cache_info,
+                            stack_mode=s2_stack_mode,
+                            scl_exclude_classes=s2_scl_exclude_classes,
                         )
-                    try:
-                        os.remove(zip_path)
-                    except Exception:
-                        pass
+                    stack_elapsed = _record_stage_timing(timed_stages, "s2_stack_build", t0_s2_stack)
+                    timed_stages[f"candidate_{cand_idx + 1}_s2_stack_build"] = float(stack_elapsed)
+                    s2_cache_events.append(candidate_s2_cache_info)
+                    if bool(candidate_s2_cache_info.get("source_zip_can_delete", True)):
+                        try:
+                            os.remove(zip_path)
+                        except Exception:
+                            pass
                 else:
                     with rasterio.open(current_s2_path) as src:
                         s2_crs = src.crs
@@ -12425,6 +15399,7 @@ def run_coregistration(
                             band_detectors=band_detectors,
                             sensor_type=hyp_type,
                         )
+                        detector_plan = _apply_s2_band_subset_overrides(detector_plan, config)
                         if not detector_plan.get("ok", False):
                             raise RuntimeError(
                                 _fmt_issue(
@@ -12633,6 +15608,12 @@ def run_coregistration(
                 config=config,
             )
 
+            for stage_name, seconds in dict(branch_eval.get("stage_timings", {})).items():
+                try:
+                    timed_stages[str(stage_name)] = float(timed_stages.get(str(stage_name), 0.0)) + float(seconds)
+                except Exception:
+                    continue
+
             validation = dict(branch_eval.get("validation", {}))
             final_quality_pass = bool(branch_eval.get("final_quality_pass", False))
             candidate_results.append({
@@ -12674,6 +15655,7 @@ def run_coregistration(
                 "is_clustered": branch_eval.get("is_clustered"),
                 "quality_tier": branch_eval.get("quality_tier"),
                 "quality_score": branch_eval.get("quality_score"),
+                "stage_timings": dict(branch_eval.get("stage_timings", {})),
             })
 
             if final_quality_pass:
@@ -12692,6 +15674,13 @@ def run_coregistration(
 
         except Exception as e:
             logger.error(f"Critical error with candidate {cand_idx + 1}: {e}")
+            candidate_errors.append(
+                {
+                    "candidate_index": int(cand_idx + 1),
+                    "product_id": s2_candidate.get("product_id") or s2_candidate.get("id"),
+                    "error": str(e),
+                }
+            )
             import traceback
             traceback.print_exc()
 
@@ -12703,6 +15692,8 @@ def run_coregistration(
             if not output_path or not os.path.exists(output_path):
                 continue
             if not cand.get("output_content_valid", False):
+                continue
+            if not _candidate_passes_final_quality(cand):
                 continue
             valid_candidates.append(cand)
 
@@ -12769,32 +15760,36 @@ def run_coregistration(
             substage="Writing final raster and metadata",
             interval_s=progress_heartbeat_interval_s,
         ):
-            finalize_result = _finalize_coreg_output(
-                final_source_path,
-                coreg_out,
-                hyp_type,
-                wl,
-                fwhm,
-                band_names,
-                band_detectors,
-                source_bands_1based=(
-                    best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
-                ),
-                remove_source=True,
-                normalization_params=normalization_params,
-                build_overviews=bool(build_overviews),
-                remove_detector_overlap=remove_detector_overlap_bands,
-                strict_metadata=bool(strict_metadata),
-                metadata_extension_level=metadata_extension_level,
-                metadata_stats_mode=metadata_stats_mode,
-                metadata_stats_sample_windows=metadata_stats_sample_windows,
-                metadata_stats_seed=metadata_stats_seed,
-                metadata_histogram_buckets=metadata_histogram_buckets,
-                metadata_label_precision=metadata_label_precision,
-                timing_logs=timing_logs,
-            )
+            try:
+                finalize_result = _finalize_coreg_output(
+                    final_source_path,
+                    coreg_out,
+                    hyp_type,
+                    wl,
+                    fwhm,
+                    band_names,
+                    band_detectors,
+                    source_bands_1based=(
+                        best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
+                    ),
+                    remove_source=True,
+                    normalization_params=normalization_params,
+                    build_overviews=bool(build_overviews),
+                    remove_detector_overlap=remove_detector_overlap_bands,
+                    strict_metadata=bool(strict_metadata),
+                    metadata_extension_level=metadata_extension_level,
+                    metadata_stats_mode=metadata_stats_mode,
+                    metadata_stats_sample_windows=metadata_stats_sample_windows,
+                    metadata_stats_seed=metadata_stats_seed,
+                    metadata_histogram_buckets=metadata_histogram_buckets,
+                    metadata_label_precision=metadata_label_precision,
+                    timing_logs=timing_logs,
+                )
+            except Exception as exc:
+                _raise_scene_failure(str(exc))
         finalize_elapsed_s = perf_counter() - t0_finalize
         post_accept_stage_timings["finalize_write_metadata_s"] = float(finalize_elapsed_s)
+        timed_stages["finalize"] = float(finalize_elapsed_s)
         if isinstance(finalize_result, dict):
             metadata_status = finalize_result.get("metadata_status", metadata_status)
             metadata_warnings = list(finalize_result.get("metadata_warnings", []))
@@ -12861,7 +15856,7 @@ def run_coregistration(
             )
         post_accept_stage_timings["final_output_validation_s"] = float(perf_counter() - t0_final_validation)
         if not final_output_validation.get("ok", False):
-            raise RuntimeError(
+            _raise_scene_failure(
                 _fmt_issue(
                     "QUALITY",
                     f"Final output is empty/invalid: {final_output_validation.get('error', 'unknown error')}",
@@ -12870,7 +15865,7 @@ def run_coregistration(
 
         if save_pre:
             if best_candidate is None or not best_candidate.get("pre_coreg_source_path"):
-                raise RuntimeError(_fmt_issue("PRE_COREG", "No candidate pre-coreg source available."))
+                _raise_scene_failure(_fmt_issue("PRE_COREG", "No candidate pre-coreg source available."))
             pre_coreg_output_path = os.path.join(folder_struct['inputs'], f"{scene_name}_pre_coreg.tif")
             _save_precoreg_output(
                 best_candidate.get("pre_coreg_source_path"),
@@ -13025,7 +16020,7 @@ def run_coregistration(
             )
             for anc_warning in ancillary_result.get("warnings", []):
                 logger.warning(anc_warning)
-        elif hyp_type == "ENMAP" and save_quality_mask:
+        elif hyp_type == "ENMAP":
             ancillary_result = _coregister_enmap_auxiliary_outputs(
                 scene_name=scene_name,
                 enmap_spectral_image=hs_file,
@@ -13035,6 +16030,7 @@ def run_coregistration(
                 hs_reference_raster_path=coreg_out,
                 gdalwarp_multi=bool(gdalwarp_multi),
                 gdalwarp_num_threads=gdalwarp_num_threads,
+                coregister_ql=bool(save_quality_mask),
             )
             for anc_warning in ancillary_result.get("warnings", []):
                 logger.warning(anc_warning)
@@ -13042,7 +16038,7 @@ def run_coregistration(
     else:
         status_code = "FAIL"
         _emit_progress(progress_callback, "Failed: no valid output produced", scene_idx=scene_idx, scene_total=scene_total, status="error")
-        raise RuntimeError("Coregistration failed: no valid output produced.")
+        _raise_scene_failure("Coregistration failed: no valid output produced.")
 
     ordered_post_accept_stages = sorted(
         ((str(stage), float(seconds)) for stage, seconds in post_accept_stage_timings.items()),
@@ -13087,15 +16083,32 @@ def run_coregistration(
 
     metrics_dict = {
         'scene_name': scene_name,
-        'filename': os.path.basename(hs_file),
+        'filename': hs_filename,
         'hyp_type': hyp_type,
         'prisma_id': extended_meta.get('prisma_id'),
         'prisma_date': extended_meta.get('prisma_date'),
         'prisma_cloud_pct': extended_meta.get('prisma_cloud_pct'),
         'prisma_sea_pct': extended_meta.get('prisma_sea_pct'),
+        'enmap_id': extended_meta.get('enmap_id'),
+        'enmap_date': extended_meta.get('enmap_date'),
+        'enmap_processing_version': extended_meta.get('enmap_processing_version'),
+        'enmap_cloud_pct': extended_meta.get('enmap_cloud_pct'),
+        'enmap_haze_pct': extended_meta.get('enmap_haze_pct'),
+        'enmap_cirrus_pct': extended_meta.get('enmap_cirrus_pct'),
+        'enmap_snow_pct': extended_meta.get('enmap_snow_pct'),
+        'enmap_water_pct': extended_meta.get('enmap_water_pct'),
+        'enmap_total_cloud_pct': extended_meta.get('enmap_total_cloud_pct'),
+        'cloud_pct': cloud_pct,
+        'input_cloud_pct': cloud_pct,
+        'input_cloud_threshold_pct': max_input_cloud,
         'observation_angle': extended_meta.get('observation_angle'),
         'rel_azimuth_angle': extended_meta.get('rel_azimuth_angle'),
         'sun_azimuth_angle': extended_meta.get('sun_azimuth_angle'),
+        'sun_elevation_angle': extended_meta.get('sun_elevation_angle'),
+        'sun_zenith_angle': extended_meta.get('sun_zenith_angle'),
+        'across_offnadir_angle': extended_meta.get('across_offnadir_angle'),
+        'along_offnadir_angle': extended_meta.get('along_offnadir_angle'),
+        'scene_azimuth_angle': extended_meta.get('scene_azimuth_angle'),
         'solar_zenith_angle': extended_meta.get('solar_zenith_angle'),
         'view_zenith_angle': extended_meta.get('view_zenith_angle'),
         'bbox_top_left_x': bbox_top_left_x,
@@ -13201,9 +16214,11 @@ def run_coregistration(
         'ancillary_warnings': list(ancillary_result.get("warnings", [])),
         'finalize_timings': finalize_timings,
         'finalize_raster_passes': finalize_raster_passes,
+        'timed_stages': dict(timed_stages),
         'post_accept_stage_timings': dict(post_accept_stage_timings),
         'post_accept_slowest_stages': list(post_accept_slowest_stages),
         'run_manifest_path': manifest_json_path,
+        'metrics_json_path': metrics_json_path,
         'dataset_xlsx_path': dataset_xlsx_path,
         'displacement_vectors_path': displacement_vectors_written_path,
     }
@@ -13244,7 +16259,7 @@ def run_coregistration(
         "status": status_code,
         "scene": {
             "scene_name": scene_name,
-            "filename": os.path.basename(hs_file),
+            "filename": hs_filename,
             "sensor_type": hyp_type,
             "scene_idx": int(scene_idx),
             "scene_total": int(scene_total),
@@ -13272,6 +16287,7 @@ def run_coregistration(
             "candidate_count": len(s2_candidates_list),
             "best_candidate_index": (best_candidate.get("idx", -1) + 1) if best_candidate else None,
         },
+        "timed_stages": dict(timed_stages),
         "processing": {
             "metadata_status": metadata_status,
             "metadata_warnings": metadata_warnings,
@@ -13370,6 +16386,13 @@ def run_coregistration(
             "cleanup_elapsed_s": cleanup_elapsed_s,
             "finalize_timings": finalize_timings,
             "finalize_raster_passes": finalize_raster_passes,
+            "timed_stages": dict(timed_stages),
+            "s2_cache": {
+                "enabled": bool(s2_stack_cache_enabled),
+                "cache_dir": s2_cache_dir,
+                "stack_mode": s2_stack_mode,
+                "events": list(s2_cache_events),
+            },
             "post_accept_stage_timings": dict(post_accept_stage_timings),
             "post_accept_slowest_stages": list(post_accept_slowest_stages),
         },
@@ -13412,6 +16435,13 @@ def run_batch_coregistration(
     logger.info(f"Output directory: {output_dir}")
 
     os.makedirs(output_dir, exist_ok=True)
+    caller_config = config if isinstance(config, dict) else None
+    config, cpu_guard_warnings = apply_cpu_oversubscription_guard(
+        config,
+        explicit_keys=config.get("_cpu_guard_explicit_keys", set()) if isinstance(config, dict) else set(),
+    )
+    for warning_msg in cpu_guard_warnings:
+        logger.warning(warning_msg)
 
     # Find all hyperspectral files (recursive)
     all_files = []
@@ -13435,7 +16465,7 @@ def run_batch_coregistration(
         _emit_progress(progress_callback, "No valid scenes found", scene_idx=1, scene_total=1, status="error")
         return {
             'total': 0, 'succeeded': [], 'failed': [], 'skipped': [],
-            'metrics': [], 'errors': {}, 'failed_details': []
+            'metrics': [], 'errors': {}, 'failed_details': [], 'scene_results': []
         }
 
     logger.info(f"Found {len(all_files)} files")
@@ -13450,11 +16480,162 @@ def run_batch_coregistration(
         'errors': {},
         'skip_reasons': {},
         'failed_details': [],
+        'scene_results': [],
     }
     shared_session = config.get("_cdse_session")
+    batch_workers = _safe_parse_int(
+        config.get("batch_workers", DEFAULT_CONFIG.get("batch_workers", 1)),
+        int(DEFAULT_CONFIG.get("batch_workers", 1)),
+        "batch_workers",
+    )
+    remote_s2_required = _batch_uses_remote_s2(config)
+    batch_workers = _resolve_effective_batch_workers(
+        config=config,
+        requested_workers=batch_workers,
+        remote_s2_required=remote_s2_required,
+    )
+
+    if remote_s2_required and shared_session is None:
+        logger.info("Preflighting CDSE authentication before remote Sentinel-2 batch processing.")
+        try:
+            shared_session = _create_cdse_session_with_retry(
+                allow_gui_prompt=bool(config.get("allow_gui_prompt", False)),
+                prompt_userpass_fn=config.get("prompt_userpass_fn"),
+            )
+            config["_cdse_session"] = shared_session
+            if caller_config is not None:
+                caller_config["_cdse_session"] = shared_session
+        except CDSEAuthenticationError as exc:
+            reason = str(exc)
+            _set_batch_auth_abort(results, reason=reason, pending=len(all_files))
+            logger.error("Batch aborted before scene processing due to CDSE authentication failure: %s", reason)
+            _emit_progress(
+                progress_callback,
+                "Batch aborted",
+                scene_idx=1,
+                scene_total=len(all_files),
+                status="error",
+                abort_scope="AUTH",
+                error=reason,
+            )
+            return _finalize_batch_results(
+                output_dir=output_dir,
+                results=results,
+                progress_callback=progress_callback,
+                scene_total=len(all_files),
+                progress_stage="Batch aborted",
+            )
+
+    if batch_workers > 1 and len(all_files) > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        worker_count = min(batch_workers, len(all_files))
+        logger.info("Running batch with %d worker processes.", worker_count)
+        if shared_session is not None:
+            logger.info("Batch workers will create independent CDSE sessions; shared sessions are not sent across processes.")
+        worker_base_config = dict(config)
+        worker_base_config.pop("_cdse_session", None)
+        worker_base_config.pop("prompt_userpass_fn", None)
+        cdse_userpass_credentials = _get_cached_cdse_public_credentials()
+        executor = ProcessPoolExecutor(max_workers=worker_count)
+        abort_executor = False
+        try:
+            future_map = {}
+            for i, hs_file in enumerate(all_files, 1):
+                payload = {
+                    "hs_file": hs_file,
+                    "output_dir": output_dir,
+                    "config": dict(worker_base_config),
+                    "scene_idx": i,
+                    "scene_total": len(all_files),
+                }
+                if cdse_userpass_credentials is not None:
+                    payload["cdse_userpass_credentials"] = tuple(cdse_userpass_credentials)
+                future = executor.submit(_run_batch_scene_worker, payload)
+                future_map[future] = (i, hs_file)
+
+            completed = 0
+            pending_futures = set(future_map)
+            for future in as_completed(future_map):
+                scene_i, hs_file = future_map[future]
+                pending_futures.discard(future)
+                completed += 1
+                _emit_progress(
+                    progress_callback,
+                    "Batch worker completed",
+                    scene_idx=completed,
+                    scene_total=len(all_files),
+                    substage=_portable_name(hs_file),
+                )
+                try:
+                    scene_result = future.result()
+                except CDSEAuthenticationError as exc:
+                    source_key = str(os.path.normcase(os.path.abspath(hs_file)))
+                    scene_result = {
+                        "kind": "failed",
+                        "source_key": source_key,
+                        "filename": _portable_name(hs_file),
+                        "hyp_type": None,
+                        "error": str(exc),
+                        "auth_error": True,
+                        "failed_metrics": _build_failed_scene_metrics(hs_file, None, str(exc)),
+                    }
+                except Exception as exc:
+                    source_key = str(os.path.normcase(os.path.abspath(hs_file)))
+                    scene_result = {
+                        "kind": "failed",
+                        "source_key": source_key,
+                        "filename": _portable_name(hs_file),
+                        "hyp_type": None,
+                        "error": str(exc),
+                        "failed_metrics": _build_failed_scene_metrics(hs_file, None, str(exc)),
+                    }
+                _record_batch_scene_result(
+                    results=results,
+                    scene_result=scene_result,
+                    output_dir=output_dir,
+                    progress_callback=progress_callback,
+                    scene_idx=scene_i,
+                    scene_total=len(all_files),
+                )
+                if scene_result.get("auth_error"):
+                    reason = str(scene_result.get("error", "CDSE authentication failed."))
+                    _set_batch_auth_abort(results, reason=reason, pending=len(all_files) - completed)
+                    logger.error("Batch aborted due to CDSE authentication failure: %s", reason)
+                    for pending_future in pending_futures:
+                        pending_future.cancel()
+                    abort_executor = True
+                    for proc in list((getattr(executor, "_processes", {}) or {}).values()):
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    _emit_progress(
+                        progress_callback,
+                        "Batch aborted",
+                        scene_idx=completed,
+                        scene_total=len(all_files),
+                        status="error",
+                        abort_scope="AUTH",
+                        error=reason,
+                    )
+                    break
+        finally:
+            if not abort_executor:
+                executor.shutdown(wait=True)
+
+        return _finalize_batch_results(
+            output_dir=output_dir,
+            results=results,
+            progress_callback=progress_callback,
+            scene_total=len(all_files),
+            progress_stage="Batch aborted" if results.get("aborted") else "Batch completed",
+        )
 
     for i, hs_file in enumerate(all_files, 1):
-        logger.info(f"\n[{i}/{len(all_files)}] Processing: {os.path.basename(hs_file)}")
+        fname = _portable_name(hs_file)
+        logger.info(f"\n[{i}/{len(all_files)}] Processing: {fname}")
         _emit_progress(progress_callback, "Initializing", scene_idx=i, scene_total=len(all_files))
 
         scene_config = dict(config)
@@ -13477,9 +16658,15 @@ def run_batch_coregistration(
             )
 
             if isinstance(metrics_dict, dict) and str(metrics_dict.get('status', '')).startswith('SKIPPED_'):
-                fname = os.path.basename(hs_file)
                 results['skipped'].append(metrics_dict)
                 results['skip_reasons'][source_key] = metrics_dict.get('reason', 'Scene skipped')
+                results["scene_results"].append({
+                    "source_path": source_key,
+                    "filename": fname,
+                    "status": "skipped",
+                    "metrics_path": metrics_dict.get("metrics_json_path") or metrics_dict.get("dataset_xlsx_path"),
+                    "error": None,
+                })
                 _emit_progress(
                     progress_callback,
                     "Scene skipped",
@@ -13489,20 +16676,61 @@ def run_batch_coregistration(
                     scene_status="skipped",
                 )
             else:
-                results['succeeded'].append(os.path.basename(hs_file))
+                results['succeeded'].append(fname)
                 results['metrics'].append(metrics_dict)
+                metrics_for_record = metrics_dict if isinstance(metrics_dict, dict) else {}
+                results["scene_results"].append({
+                    "source_path": source_key,
+                    "filename": fname,
+                    "status": "succeeded",
+                    "metrics_path": metrics_for_record.get("metrics_json_path") or metrics_for_record.get("dataset_xlsx_path"),
+                    "error": None,
+                })
                 _emit_progress(
                     progress_callback,
                     "Scene completed",
                     scene_idx=i,
                     scene_total=len(all_files),
-                    substage=os.path.basename(hs_file),
+                    substage=fname,
                     scene_status="success",
                 )
 
+        except CDSEAuthenticationError as e:
+            msg = str(e)
+            scene_result = {
+                "kind": "failed",
+                "source_key": source_key,
+                "filename": fname,
+                "hyp_type": scene_hyp_type,
+                "error": msg,
+                "auth_error": True,
+                "failed_metrics": _build_failed_scene_metrics(hs_file, scene_hyp_type, msg),
+            }
+            _record_batch_scene_result(
+                results=results,
+                scene_result=scene_result,
+                output_dir=output_dir,
+                progress_callback=progress_callback,
+                scene_idx=i,
+                scene_total=len(all_files),
+            )
+            _set_batch_auth_abort(results, reason=msg, pending=len(all_files) - i)
+            logger.error("Batch aborted due to CDSE authentication failure: %s", msg)
+            _emit_progress(
+                progress_callback,
+                "Batch aborted",
+                scene_idx=i,
+                scene_total=len(all_files),
+                substage=fname,
+                status="error",
+                scene_status="failed",
+                abort_scope="AUTH",
+                error=msg,
+            )
+            break
+
         except SentinelNotFoundError as e:
             msg = f"No Sentinel-2 match: {e}"
-            fname = os.path.basename(hs_file)
             results['failed'].append(source_key)
             results['errors'][source_key] = msg
             failed_metrics = _build_failed_scene_metrics(hs_file, scene_hyp_type, msg)
@@ -13516,6 +16744,13 @@ def run_batch_coregistration(
             failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
             _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
             results["failed_details"].append(failed_metrics)
+            results["scene_results"].append({
+                "source_path": source_key,
+                "filename": fname,
+                "status": "failed",
+                "metrics_path": failed_metrics.get("metrics_json_path") or failed_metrics.get("dataset_xlsx_path"),
+                "error": msg,
+            })
             logger.warning(msg)
             _emit_progress(
                 progress_callback,
@@ -13529,7 +16764,6 @@ def run_batch_coregistration(
 
         except Exception as e:
             msg = str(e)
-            fname = os.path.basename(hs_file)
             results['failed'].append(source_key)
             results['errors'][source_key] = msg
             failed_metrics = _build_failed_scene_metrics(hs_file, scene_hyp_type, msg)
@@ -13543,6 +16777,13 @@ def run_batch_coregistration(
             failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
             _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
             results["failed_details"].append(failed_metrics)
+            results["scene_results"].append({
+                "source_path": source_key,
+                "filename": fname,
+                "status": "failed",
+                "metrics_path": failed_metrics.get("metrics_json_path") or failed_metrics.get("dataset_xlsx_path"),
+                "error": msg,
+            })
             logger.error(f"Failed: {e}")
             _emit_progress(
                 progress_callback,
@@ -13557,37 +16798,17 @@ def run_batch_coregistration(
             shared_session = scene_config.get("_cdse_session", shared_session)
             if shared_session is not None:
                 config["_cdse_session"] = shared_session
+                if caller_config is not None:
+                    caller_config["_cdse_session"] = shared_session
 
-    # Summary
-    log_section_header("BATCH SUMMARY")
-    logger.info(
-        f"Total: {results['total']}, Success: {len(results['succeeded'])}, "
-        f"Skipped: {len(results['skipped'])}, Failed: {len(results['failed'])}"
-    )
-
-    grouped_rows = _collect_batch_summary_rows(results)
-
-    # Write summary file
-    summary_path = os.path.join(output_dir, "batch_summary.txt")
-    _write_batch_summary_txt(summary_path=summary_path, results=results, grouped_rows=grouped_rows)
-    logger.info(f"Summary written: {summary_path}")
-
-    # Write Excel summary if openpyxl is available
-    try:
-        xlsx_path = os.path.join(output_dir, "batch_summary.xlsx")
-        _write_batch_summary_xlsx(xlsx_path=xlsx_path, results=results, grouped_rows=grouped_rows)
-        logger.info(f"Excel summary written: {xlsx_path}")
-    except ImportError:
-        logger.debug("openpyxl not available, skipping Excel summary")
-
-    _emit_progress(
-        progress_callback,
-        "Batch completed",
-        scene_idx=len(all_files),
+    return _finalize_batch_results(
+        output_dir=output_dir,
+        results=results,
+        progress_callback=progress_callback,
         scene_total=len(all_files),
-        status="done",
+        progress_stage="Batch aborted" if results.get("aborted") else "Batch completed",
     )
-    return results
+
 
 
 

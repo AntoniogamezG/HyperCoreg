@@ -119,6 +119,8 @@ class SpectralBandTable:
         Returns:
             tuple: (band_index_0based, wavelength, difference_nm)
         """
+        if not self.bands:
+            raise ValueError("Cannot find closest band in an empty SpectralBandTable")
         wl = self.wavelengths
         idx = int(np.argmin(np.abs(wl - target_wl)))
         return idx, wl[idx], abs(wl[idx] - target_wl)
@@ -233,6 +235,19 @@ def _remove_detector_overlap(
     keep_mask = np.ones(len(bands), dtype=bool)
     vnir_indices = [i for i, b in enumerate(bands) if b.detector == "VNIR"]
     swir_indices = [i for i, b in enumerate(bands) if b.detector == "SWIR"]
+
+    if vnir_indices and swir_indices:
+        vnir_wl = [float(bands[i].wavelength) for i in vnir_indices]
+        swir_wl = [float(bands[i].wavelength) for i in swir_indices]
+        center_overlap_min = max(min(vnir_wl), min(swir_wl))
+        center_overlap_max = min(max(vnir_wl), max(swir_wl))
+        if center_overlap_min <= center_overlap_max:
+            for i in vnir_indices:
+                band = bands[i]
+                if np.isfinite(band.fwhm) and band.fwhm > 0:
+                    continue
+                if center_overlap_min <= float(band.wavelength) <= center_overlap_max:
+                    keep_mask[i] = False
 
     for i in vnir_indices:
         if not keep_mask[i]:
@@ -400,7 +415,7 @@ def build_prisma_band_table(
     Build SpectralBandTable from PRISMA VNIR/SWIR arrays.
 
     Ensures wavelengths are in ascending order.
-    Filters out invalid bands (wavelength <= 0).
+    Filters out invalid bands (non-finite or wavelength <= 0).
 
     Args:
         vnir_wl: VNIR wavelength array
@@ -416,13 +431,21 @@ def build_prisma_band_table(
     """
     bands = []
     original_indices = []  # Track original band indices in merged cube
+    vnir_fwhm_arr = None if vnir_fwhm is None else np.asarray(vnir_fwhm, dtype=float).reshape(-1)
+    swir_fwhm_arr = None if swir_fwhm is None else np.asarray(swir_fwhm, dtype=float).reshape(-1)
+
+    def _fwhm_at(values: Optional[np.ndarray], idx: int) -> float:
+        if values is None or idx >= len(values):
+            return np.nan
+        val = float(values[idx])
+        return val if np.isfinite(val) else np.nan
 
     # Build VNIR bands (filter invalid wavelengths)
     vnir_valid_count = 0
     for i, wl in enumerate(vnir_wl):
-        if wl <= 0:  # Skip invalid wavelengths
+        if not np.isfinite(float(wl)) or float(wl) <= 0:  # Skip invalid wavelengths
             continue
-        fwhm_val = float(vnir_fwhm[i]) if vnir_fwhm is not None else np.nan
+        fwhm_val = _fwhm_at(vnir_fwhm_arr, i)
         bands.append(SpectralBandInfo(
             index=len(bands) + 1,
             wavelength=float(wl),
@@ -437,9 +460,9 @@ def build_prisma_band_table(
     vnir_total = len(vnir_wl)  # Total VNIR bands in original cube
     swir_valid_count = 0
     for i, wl in enumerate(swir_wl):
-        if wl <= 0:  # Skip invalid wavelengths
+        if not np.isfinite(float(wl)) or float(wl) <= 0:  # Skip invalid wavelengths
             continue
-        fwhm_val = float(swir_fwhm[i]) if swir_fwhm is not None else np.nan
+        fwhm_val = _fwhm_at(swir_fwhm_arr, i)
         bands.append(SpectralBandInfo(
             index=len(bands) + 1,
             wavelength=float(wl),
@@ -456,7 +479,7 @@ def build_prisma_band_table(
     if vnir_filtered > 0 or swir_filtered > 0:
         logger.info(
             f"Filtered invalid bands: VNIR={vnir_filtered}, "
-            f"SWIR={swir_filtered} (wavelength <= 0)"
+            f"SWIR={swir_filtered} (non-finite or wavelength <= 0)"
         )
 
     original_indices = np.array(original_indices, dtype=int)

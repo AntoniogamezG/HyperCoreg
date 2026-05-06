@@ -7,6 +7,7 @@ reservoir sampling per band.
 """
 
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from time import perf_counter
@@ -16,9 +17,10 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 
-from hypercoreg.pipeline.raster_io import _sanitize_raster_nonfinite_inplace
+from hypercoreg.pipeline.raster_sanitize import _sanitize_raster_nonfinite_inplace
 
 ALLOWED_NORMALIZATION_MODES = {"none", "minmax", "percentile"}
+STALE_DERIVED_RASTER_BAND_METADATA_PREFIXES = ("STATISTICS_",)
 
 
 @dataclass
@@ -233,11 +235,98 @@ def _apply_output_profile_overrides(
     return out_profile
 
 
-def _is_valid_mask(block: np.ndarray, nodata_value: Optional[float]) -> np.ndarray:
-    """Return validity mask (finite and != nodata)."""
+NODATA_METADATA_KEYS = {
+    "nodata",
+    "no_data",
+    "no_data_value",
+    "data_ignore_value",
+    "dataignorevalue",
+    "background_value",
+    "backgroundvalue",
+    "fill_value",
+    "_fillvalue",
+}
+
+
+def _normalize_metadata_key(key: Any) -> str:
+    return str(key or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _finite_float_from_metadata(value: Any) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        text = str(value or "").strip().strip("{}[]()").strip().strip("'\"")
+        try:
+            val = float(text)
+        except Exception:
+            match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", text)
+            if match is None:
+                return None
+            try:
+                val = float(match.group(0))
+            except Exception:
+                return None
+    return float(val) if np.isfinite(float(val)) else None
+
+
+def _append_unique_float(values: List[float], value: Any) -> None:
+    val = _finite_float_from_metadata(value)
+    if val is None:
+        return
+    if not any(abs(float(existing) - float(val)) <= 1e-9 for existing in values):
+        values.append(float(val))
+
+
+def resolve_raster_nodata_values(
+    src: rasterio.io.DatasetReader,
+    nodata_fallback: Optional[float] = None,
+    extra_values: Optional[Sequence[Any]] = None,
+) -> Tuple[float, ...]:
+    """Resolve primary and alias no-data values from raster metadata.
+
+    Some EnMAP rasters carry both a processing no-data value and a native
+    background/data-ignore value. Treat all finite aliases as invalid during
+    streaming reads, while preserving the first value as the output no-data.
+    """
+    values: List[float] = []
+    for value in list(extra_values or []):
+        _append_unique_float(values, value)
+
+    try:
+        _append_unique_float(values, src.nodata)
+    except Exception:
+        pass
+
+    tag_sets: List[Dict[str, Any]] = []
+    for namespace in (None, "ENVI"):
+        try:
+            tag_sets.append(src.tags() if namespace is None else src.tags(ns=namespace))
+        except Exception:
+            pass
+    for tags in tag_sets:
+        for key, value in dict(tags or {}).items():
+            if _normalize_metadata_key(key) in NODATA_METADATA_KEYS:
+                _append_unique_float(values, value)
+
+    if not values:
+        _append_unique_float(values, nodata_fallback)
+    return tuple(values)
+
+
+def _is_valid_mask(block: np.ndarray, nodata_value: Optional[Any]) -> np.ndarray:
+    """Return validity mask (finite and not equal to any no-data marker)."""
     valid = np.isfinite(block)
-    if nodata_value is not None and np.isfinite(float(nodata_value)):
-        valid &= (block != float(nodata_value))
+    if nodata_value is None:
+        return valid
+    if isinstance(nodata_value, (list, tuple, set, np.ndarray)):
+        nodata_values = list(nodata_value)
+    else:
+        nodata_values = [nodata_value]
+    for value in nodata_values:
+        parsed = _finite_float_from_metadata(value)
+        if parsed is not None:
+            valid &= block != float(parsed)
     return valid
 
 
@@ -424,13 +513,129 @@ def _finalize_stats_payload(
     return band_stats, validation
 
 
+def _is_stale_derived_raster_metadata_key(key: Any) -> bool:
+    key_upper = str(key or "").strip().upper()
+    return any(key_upper.startswith(prefix) for prefix in STALE_DERIVED_RASTER_BAND_METADATA_PREFIXES)
+
+
+def filter_dataset_tags_for_raster_copy(
+    tags: Optional[Dict[str, Any]],
+    *,
+    output_band_count: Optional[int] = None,
+    source_band_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return dataset tags safe to carry onto a derived raster."""
+    safe_tags = dict(tags or {})
+    output_count = int(output_band_count) if output_band_count is not None else None
+    source_count = int(source_band_count) if source_band_count is not None else None
+    band_count_changed = (
+        output_count is not None and source_count is not None and int(output_count) != int(source_count)
+    )
+    for key in list(safe_tags):
+        key_text = str(key).strip()
+        match = re.fullmatch(r"Band_(\d+)", key_text, flags=re.IGNORECASE)
+        if match is not None and output_count is not None and int(match.group(1)) > output_count:
+            safe_tags.pop(key, None)
+            continue
+        if band_count_changed and _is_stale_derived_raster_metadata_key(key):
+            safe_tags.pop(key, None)
+    return safe_tags
+
+
+def filter_band_tags_for_raster_copy(tags: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return per-band tags safe to copy after resampling, subsetting, or rewriting."""
+    safe_tags = dict(tags or {})
+    for key in list(safe_tags):
+        if _is_stale_derived_raster_metadata_key(key):
+            safe_tags.pop(key, None)
+    return safe_tags
+
+
+def scrub_incomplete_raster_band_metadata_inplace(path: str) -> Dict[str, Any]:
+    """
+    Remove band metadata that GeoArray cannot read safely.
+
+    GeoArray expects every per-band metadata key to be present on every band.
+    QGIS/SNAP GeoTIFFs can carry STATISTICS_* tags on only inspected bands,
+    which makes GeoArray raise before AROSICS can start matching.
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "path": path,
+        "removed_keys": [],
+        "removed_items": 0,
+        "warnings": [],
+        "error": None,
+    }
+    if not path or not os.path.exists(path):
+        result["error"] = f"Raster not found: {path}"
+        return result
+
+    try:
+        from osgeo import gdal
+
+        gdal.UseExceptions()
+        ds = gdal.Open(str(path), gdal.GA_Update)
+        if ds is None:
+            result["error"] = f"GDAL could not open raster for metadata update: {path}"
+            return result
+
+        try:
+            band_count = int(ds.RasterCount)
+            key_counts: Dict[str, int] = {}
+            for bidx in range(1, band_count + 1):
+                band = ds.GetRasterBand(bidx)
+                metadata = dict(band.GetMetadata() or {})
+                for key in metadata:
+                    key_counts[str(key)] = int(key_counts.get(str(key), 0)) + 1
+
+            keys_to_remove = {
+                key
+                for key, count in key_counts.items()
+                if _is_stale_derived_raster_metadata_key(key) or int(count) != band_count
+            }
+
+            removed_items = 0
+            for bidx in range(1, band_count + 1):
+                band = ds.GetRasterBand(bidx)
+                metadata = dict(band.GetMetadata() or {})
+                for key in keys_to_remove:
+                    if key in metadata:
+                        band.SetMetadataItem(key, None)
+                        removed_items += 1
+                band = None
+
+            ds.FlushCache()
+            result["ok"] = True
+            result["removed_keys"] = sorted(keys_to_remove)
+            result["removed_items"] = int(removed_items)
+            return result
+        finally:
+            ds = None
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
 def _copy_dataset_metadata(
     src: rasterio.io.DatasetReader,
     dst: rasterio.io.DatasetWriter,
     source_band_indexes: Sequence[int],
 ) -> None:
     """Copy dataset-level tags and per-band descriptions/tags using a source-band mapping."""
-    src_tags = src.tags()
+    src_tags = filter_dataset_tags_for_raster_copy(
+        src.tags(),
+        output_band_count=int(dst.count),
+        source_band_count=int(src.count),
+    )
+    src_tags["n_rows"] = str(int(dst.height))
+    src_tags["n_cols"] = str(int(dst.width))
+    src_tags["n_bands"] = str(int(dst.count))
+    if dst.nodata is not None and np.isfinite(float(dst.nodata)):
+        nodata_text = f"{float(dst.nodata):.10g}"
+        src_tags["data_ignore_value"] = nodata_text
+        if "background_value" in src_tags:
+            src_tags["background_value"] = nodata_text
     if src_tags:
         dst.update_tags(**src_tags)
     for out_bidx, src_bidx in enumerate(source_band_indexes, start=1):
@@ -438,7 +643,7 @@ def _copy_dataset_metadata(
         desc = src.descriptions[src_bidx - 1]
         if desc:
             dst.set_band_description(out_bidx, desc)
-        band_tags = src.tags(src_bidx)
+        band_tags = filter_band_tags_for_raster_copy(src.tags(src_bidx))
         if band_tags:
             dst.update_tags(out_bidx, **band_tags)
 
@@ -527,11 +732,8 @@ def stream_copy_raster_to_path(
             result["source_bands"] = src_bands
             result["output_bands"] = keep_bands
 
-            nodata_val = src.nodata
-            if nodata_val is None or not np.isfinite(float(nodata_val)):
-                nodata_val = float(nodata_fallback)
-            else:
-                nodata_val = float(nodata_val)
+            nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata_fallback)
+            nodata_val = float(nodata_values[0]) if nodata_values else float(nodata_fallback)
 
             width = int(src.width)
             height = int(src.height)
@@ -574,7 +776,7 @@ def stream_copy_raster_to_path(
                 for window in window_iter:
                     window_count += 1
                     block = src.read(indexes=read_indexes, window=window).astype(np.float32, copy=False)
-                    valid = _is_valid_mask(block, nodata_val)
+                    valid = _is_valid_mask(block, nodata_values)
                     _sanitize_block_for_write(block, valid, nodata_val)
                     dst.write(block, window=window)
                     for b in range(keep_bands):
@@ -596,8 +798,6 @@ def stream_copy_raster_to_path(
                 result["window_count"] = int(window_count)
 
             result["timings"]["copy_s"] = perf_counter() - t0_copy
-
-        _sanitize_raster_nonfinite_inplace(temp_output_path, nodata=float(nodata_val))
 
         os.replace(temp_output_path, output_path)
         temp_output_path = None
@@ -691,10 +891,25 @@ def normalize_raster_to_path(
     result["warnings"].extend(sanitize_warnings)
 
     if params.mode == "none":
-        result["ok"] = True
-        result["warnings"].append("Normalization mode is 'none'; no normalization was applied.")
-        result["timings"]["total_s"] = perf_counter() - t0_total
-        return result
+        copy_result = stream_copy_raster_to_path(
+            source_path=source_path,
+            output_path=output_path,
+            nodata_fallback=nodata_fallback,
+            expected_band_count=expected_band_count,
+            source_bands_1based=source_bands_1based,
+            output_profile_overrides=output_profile_overrides,
+            collect_band_stats=True,
+        )
+        copy_result["mode"] = params.mode
+        copy_result.setdefault("warnings", [])
+        copy_result["warnings"] = (
+            list(result["warnings"])
+            + ["Normalization mode is 'none'; copied source raster without radiometric normalization."]
+            + list(copy_result.get("warnings", []))
+        )
+        copy_result.setdefault("timings", {})
+        copy_result["timings"]["total_s"] = perf_counter() - t0_total
+        return copy_result
 
     temp_output_path: Optional[str] = None
     try:
@@ -738,11 +953,8 @@ def normalize_raster_to_path(
                 result["errors"].append("Source raster has no bands.")
                 return result
 
-            nodata_val = src.nodata
-            if nodata_val is None or not np.isfinite(float(nodata_val)):
-                nodata_val = float(nodata_fallback)
-            else:
-                nodata_val = float(nodata_val)
+            nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata_fallback)
+            nodata_val = float(nodata_values[0]) if nodata_values else float(nodata_fallback)
 
             width = int(src.width)
             height = int(src.height)
@@ -771,7 +983,7 @@ def normalize_raster_to_path(
             for window in estimate_windows:
                 estimate_count += 1
                 block = src.read(indexes=read_indexes, window=window).astype(np.float32, copy=False)
-                valid = _is_valid_mask(block, nodata_val)
+                valid = _is_valid_mask(block, nodata_values)
 
                 for b in range(n_bands):
                     vb = valid[b]
@@ -865,7 +1077,7 @@ def normalize_raster_to_path(
                 for window in apply_windows:
                     apply_count += 1
                     block = src.read(indexes=read_indexes, window=window).astype(np.float32, copy=False)
-                    valid = _is_valid_mask(block, nodata_val)
+                    valid = _is_valid_mask(block, nodata_values)
 
                     for b in range(n_bands):
                         vb = valid[b]
@@ -896,8 +1108,6 @@ def normalize_raster_to_path(
                     dst.write(block, window=window)
                 result["window_count_estimate_pass2"] = int(apply_count)
             result["timings"]["apply_s"] = perf_counter() - t0_apply
-
-        _sanitize_raster_nonfinite_inplace(temp_output_path, nodata=float(nodata_val))
 
         os.replace(temp_output_path, output_path)
         temp_output_path = None

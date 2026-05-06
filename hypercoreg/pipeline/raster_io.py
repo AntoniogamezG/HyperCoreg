@@ -7,20 +7,31 @@ import re
 import shutil
 import subprocess
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+from affine import Affine
 
-from hypercoreg import _legacy_coreg as _legacy
 from hypercoreg.config import (
     CPUS_FOR_AROSICS,
     LOCAL_GRID_RES_M,
     MIN_RELIABILITY_THRESHOLD,
     MULTIBAND_S2_WAVELENGTHS,
+    S2_L2A_ANCILLARY_BANDS,
+    S2_L2A_OUTPUT_BANDS,
+    S2_L2A_REFERENCE_STACK_BANDS,
     PROCESSING_NODATA,
 )
+from hypercoreg.normalization import (
+    filter_band_tags_for_raster_copy,
+    filter_dataset_tags_for_raster_copy,
+    resolve_raster_nodata_values,
+)
 from hypercoreg.pipeline import coreg_math
+from hypercoreg.pipeline import runtime as _runtime
+from hypercoreg.pipeline.raster_sanitize import _sanitize_raster_nonfinite_inplace
 from hypercoreg.utils import resolve_gdalwarp_exe
 
 logger = logging.getLogger("COREG_PROCESSING")
@@ -29,7 +40,7 @@ ARTIFACT_ROLE_QUALITY_MASK = "quality_mask"
 ARTIFACT_ROLE_NO_PIPELINE_SIDECAR = "no_pipeline_sidecar"
 ARTIFACT_ROLE_MAIN_COREG_SPECTRAL = "main_coreg_spectral"
 ARTIFACT_ROLE_PRE_COREG_SPECTRAL = "pre_coreg_spectral"
-LEGACY_HDR_ARTIFACT_ROLES = {
+PIPELINE_HDR_ARTIFACT_ROLES = {
     ARTIFACT_ROLE_MAIN_COREG_SPECTRAL,
     ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
     ARTIFACT_ROLE_QUALITY_MASK,
@@ -38,6 +49,14 @@ LEGACY_HDR_ARTIFACT_ROLES = {
 
 def _fmt_issue(scope: str, message: str) -> str:
     return f"[{scope}] {message}"
+
+
+def _compat_attr(name: str) -> Any:
+    if name in globals():
+        return globals()[name]
+    value = getattr(_runtime, name)
+    globals()[name] = value
+    return value
 
 
 def _supports_constructor_kwarg(target: Any, kwarg_name: str) -> bool:
@@ -55,6 +74,44 @@ def _supports_constructor_kwarg(target: Any, kwarg_name: str) -> bool:
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
+def _make_gdal_temp_path(output_raster: str, suffix: str) -> str:
+    out_path = Path(output_raster)
+    out_dir = out_path.parent if str(out_path.parent) else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{out_path.stem}.", suffix=suffix, dir=str(out_dir))
+    os.close(fd)
+    try:
+        os.remove(temp_path)
+    except FileNotFoundError:
+        pass
+    return temp_path
+
+
+def _cleanup_raster_temp_outputs(path: Optional[str]) -> None:
+    if not path:
+        return
+    candidates = [
+        path,
+        f"{path}.aux.xml",
+        f"{path}.ovr",
+        f"{path}.msk",
+    ]
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        except Exception:
+            pass
+
+
+def _validate_warp_output(path: str) -> None:
+    import rasterio
+
+    with rasterio.open(path) as ds:
+        if int(ds.width) <= 0 or int(ds.height) <= 0 or int(ds.count) <= 0:
+            raise RuntimeError("Warped raster is invalid")
+
+
 def _remove_sidecar_if_exists(path: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {"ok": True, "error": None, "removed": False}
     try:
@@ -68,7 +125,7 @@ def _remove_sidecar_if_exists(path: str) -> Dict[str, Any]:
         return result
 
 
-def _finalize_legacy_sidecars(
+def _finalize_pipeline_sidecars(
     tif_path: str,
     sensor_type: str,
     artifact_role: str,
@@ -83,7 +140,7 @@ def _finalize_legacy_sidecars(
     hdr_path = str(Path(tif_path).with_suffix(".hdr"))
     aux_path = str(Path(tif_path).with_suffix(".aux.xml"))
 
-    if str(artifact_role) in LEGACY_HDR_ARTIFACT_ROLES:
+    if str(artifact_role) in PIPELINE_HDR_ARTIFACT_ROLES:
         hdr_result = _write_envi_header(
             tif_path=tif_path,
             sensor_type=sensor_type,
@@ -315,51 +372,25 @@ def _summarize_raster_grid(path: Optional[str]) -> Dict[str, Any]:
         return out
 
 
-def _sanitize_raster_nonfinite_inplace(
-    path: str,
-    nodata: float = PROCESSING_NODATA,
-) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "ok": False,
-        "error": None,
-        "nonfinite_replaced": 0,
-        "bands": 0,
-    }
+def _normalize_s2_band_label(value: Any) -> Optional[str]:
+    text = str(value or "").upper().strip()
+    if not text:
+        return None
+    for ancillary_label in S2_L2A_ANCILLARY_BANDS:
+        if ancillary_label in text:
+            return ancillary_label
+    if "B8A" in text:
+        return "B8A"
+    match = re.search(r"\bB0?([1-9])\b|\bB(1[12])\b", text)
+    if not match:
+        return None
+    number = match.group(1) or match.group(2)
+    if number is None:
+        return None
     try:
-        import rasterio
-
-        if not os.path.exists(path):
-            result["error"] = f"Raster not found: {path}"
-            return result
-        with rasterio.open(path, "r+") as dst:
-            result["bands"] = int(dst.count)
-            if dst.count < 1:
-                result["error"] = "Raster has no bands."
-                return result
-
-            src_nodata = dst.nodata
-            write_nodata = float(src_nodata) if src_nodata is not None else float(nodata)
-            if src_nodata is None or not np.isfinite(float(src_nodata)):
-                dst.nodata = float(write_nodata)
-
-            replaced_total = 0
-            for bidx in range(1, int(dst.count) + 1):
-                for _, window in dst.block_windows(bidx):
-                    band = dst.read(bidx, window=window)
-                    bad = ~np.isfinite(band)
-                    if not np.any(bad):
-                        continue
-                    band = band.astype(np.float32, copy=False)
-                    band[bad] = write_nodata
-                    dst.write(band, bidx, window=window)
-                    replaced_total += int(np.count_nonzero(bad))
-
-        result["ok"] = True
-        result["nonfinite_replaced"] = replaced_total
-        return result
-    except Exception as exc:
-        result["error"] = str(exc)
-        return result
+        return f"B{int(number):02d}"
+    except Exception:
+        return None
 
 
 def _probe_raster_valid_pixels(
@@ -395,11 +426,8 @@ def _probe_raster_valid_pixels(
                 out["error"] = "Raster has no bands."
                 return out
 
-            nodata_val = src.nodata
-            if nodata_val is None or not np.isfinite(float(nodata_val)):
-                nodata_val = float(nodata_fallback)
-            else:
-                nodata_val = float(nodata_val)
+            nodata_values = resolve_raster_nodata_values(src, nodata_fallback=nodata_fallback)
+            nodata_val = float(nodata_values[0]) if nodata_values else float(nodata_fallback)
             out["nodata"] = nodata_val
 
             sampled_bands: list[int] = []
@@ -438,8 +466,8 @@ def _probe_raster_valid_pixels(
                     resampling=Resampling.nearest,
                 ).astype(np.float32, copy=False)
                 valid = np.isfinite(band)
-                if np.isfinite(nodata_val):
-                    valid &= band != nodata_val
+                for nodata_candidate in nodata_values:
+                    valid &= band != float(nodata_candidate)
                 valid_count = int(np.count_nonzero(valid))
                 out["band_valid_pixels"][int(bidx)] = valid_count
                 if valid_count > 0:
@@ -454,6 +482,44 @@ def _probe_raster_valid_pixels(
         return out
 
 
+def _resolve_selected_band_values(
+    values: Any,
+    source_band_count: int,
+    selected_bands_1based: Sequence[int],
+    default_value: float,
+    label: str,
+) -> np.ndarray:
+    selected = [int(b) for b in selected_bands_1based]
+    if values is None:
+        return np.full(len(selected), float(default_value), dtype=np.float32)
+
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.full(len(selected), float(default_value), dtype=np.float32)
+    if arr.size == 1:
+        return np.full(len(selected), float(arr[0]), dtype=np.float32)
+    if arr.size == int(source_band_count):
+        return np.asarray([arr[int(b) - 1] for b in selected], dtype=np.float32)
+    if arr.size == len(selected):
+        return arr.astype(np.float32, copy=False)
+
+    raise ValueError(
+        f"{label} length mismatch: got {int(arr.size)}, expected 1, "
+        f"{int(source_band_count)}, or {len(selected)}."
+    )
+
+
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(val):
+        return None
+    return val
+
+
 def _stream_copy_raster_with_band_order(
     source_path: str,
     output_path: str,
@@ -461,6 +527,10 @@ def _stream_copy_raster_with_band_order(
     out_dtype: Any = np.float32,
     compress: Optional[str] = "NONE",
     tile_size: int = 512,
+    band_gains: Optional[Sequence[float]] = None,
+    band_offsets: Optional[Sequence[float]] = None,
+    source_nodata: Optional[float] = None,
+    output_nodata: Optional[float] = None,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "ok": False,
@@ -469,6 +539,9 @@ def _stream_copy_raster_with_band_order(
         "output_bands": 0,
         "window_strategy": None,
         "window_count": 0,
+        "radiometric_scaling_applied": False,
+        "source_nodata": None,
+        "output_nodata": None,
     }
     try:
         import rasterio
@@ -493,19 +566,59 @@ def _stream_copy_raster_with_band_order(
                 )
                 return out
 
-            out_dtype_name = np.dtype(out_dtype).name
-            nodata_value = src.nodata
-            if nodata_value is None or not np.isfinite(float(nodata_value)):
-                nodata_value = float(PROCESSING_NODATA)
-            else:
-                nodata_value = float(nodata_value)
+            gain_values = _resolve_selected_band_values(
+                band_gains,
+                int(src.count),
+                src_bands,
+                1.0,
+                "EnMAP data gain values",
+            )
+            offset_values = _resolve_selected_band_values(
+                band_offsets,
+                int(src.count),
+                src_bands,
+                0.0,
+                "EnMAP data offset values",
+            )
+            apply_radiometry = bool(
+                (band_gains is not None or band_offsets is not None)
+                and (
+                    np.any(np.abs(gain_values.astype(float) - 1.0) > 1e-12)
+                    or np.any(np.abs(offset_values.astype(float)) > 1e-12)
+                )
+            )
+
+            requested_dtype = np.dtype(out_dtype)
+            out_dtype_name = (
+                np.dtype(np.float32).name
+                if apply_radiometry and not np.issubdtype(requested_dtype, np.floating)
+                else requested_dtype.name
+            )
+
+            src_nodata_values = resolve_raster_nodata_values(
+                src,
+                extra_values=[source_nodata],
+            )
+            src_nodata_value = src_nodata_values[0] if src_nodata_values else None
+
+            dst_nodata_value = _finite_float_or_none(output_nodata)
+            if dst_nodata_value is None:
+                dst_nodata_value = (
+                    float(src_nodata_value)
+                    if src_nodata_value is not None
+                    else float(PROCESSING_NODATA)
+                )
+
+            out["radiometric_scaling_applied"] = bool(apply_radiometry)
+            out["source_nodata"] = src_nodata_value
+            out["output_nodata"] = float(dst_nodata_value)
 
             profile = src.profile.copy()
             profile.update(
                 driver="GTiff",
                 count=len(src_bands),
                 dtype=out_dtype_name,
-                nodata=nodata_value,
+                nodata=float(dst_nodata_value),
                 tiled=True,
                 interleave="pixel",
                 BIGTIFF="YES",
@@ -557,7 +670,11 @@ def _stream_copy_raster_with_band_order(
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
 
@@ -565,7 +682,7 @@ def _stream_copy_raster_with_band_order(
                     desc = src.descriptions[src_bidx - 1]
                     if desc:
                         dst.set_band_description(out_bidx, desc)
-                    band_tags = src.tags(src_bidx)
+                    band_tags = filter_band_tags_for_raster_copy(src.tags(src_bidx))
                     if band_tags:
                         dst.update_tags(out_bidx, **band_tags)
 
@@ -585,11 +702,27 @@ def _stream_copy_raster_with_band_order(
                             f"output_driver={profile.get('driver')}, window={window_txt}): {io_err}"
                         ) from io_err
 
+                    valid = np.ones(block.shape, dtype=bool)
                     if np.issubdtype(block.dtype, np.floating):
-                        bad = ~np.isfinite(block)
-                        if np.any(bad):
-                            block = block.copy()
-                            block[bad] = nodata_value
+                        valid &= np.isfinite(block)
+                    for nodata_candidate in src_nodata_values:
+                        valid &= block != float(nodata_candidate)
+
+                    invalid = ~valid
+                    if apply_radiometry:
+                        block = block.astype(np.float32, copy=True)
+                        for band_pos in range(block.shape[0]):
+                            band_valid = valid[band_pos]
+                            if np.any(band_valid):
+                                block[band_pos][band_valid] = (
+                                    block[band_pos][band_valid] * gain_values[band_pos]
+                                    + offset_values[band_pos]
+                                )
+                        if np.any(invalid):
+                            block[invalid] = float(dst_nodata_value)
+                    elif np.any(invalid):
+                        block = block.copy()
+                        block[invalid] = float(dst_nodata_value)
 
                     try:
                         dst.write(block, window=window)
@@ -611,14 +744,19 @@ def _stream_copy_raster_with_band_order(
 
 def _validate_local_s2_stack_override(
     local_s2_stack_path: Optional[str],
-    min_band_count: int = 6,
+    min_band_count: Optional[int] = None,
 ) -> Dict[str, Any]:
+    expected_count = int(min_band_count or len(S2_L2A_OUTPUT_BANDS))
+    expected_bands = tuple(
+        S2_L2A_REFERENCE_STACK_BANDS[: min(expected_count, len(S2_L2A_REFERENCE_STACK_BANDS))]
+    )
     out: Dict[str, Any] = {
         "ok": False,
         "error": None,
         "path": None,
         "crs": None,
         "band_count": 0,
+        "warnings": [],
     }
     path_raw = str(local_s2_stack_path or "").strip()
     if not path_raw:
@@ -637,14 +775,40 @@ def _validate_local_s2_stack_override(
         with rasterio.open(path_abs) as src:
             out["band_count"] = int(src.count)
             out["crs"] = src.crs
-            if int(src.count) < int(max(1, int(min_band_count))):
+            if int(src.count) < int(max(1, int(expected_count))):
                 out["error"] = (
-                    f"Local S2 stack has too few bands ({int(src.count)} < {int(min_band_count)})."
+                    f"Local S2 stack has too few bands ({int(src.count)} < {int(expected_count)})."
                 )
                 return out
             if src.crs is None:
                 out["error"] = "Local S2 stack CRS is missing."
                 return out
+            descriptions = [str(v or "").strip() for v in src.descriptions[:expected_count]]
+            if not any(descriptions):
+                out["warnings"].append(
+                    "Local S2 stack has no band descriptions; assuming canonical L2A order "
+                    f"{', '.join(expected_bands)}."
+                )
+            else:
+                for bidx, expected_label in enumerate(expected_bands, start=1):
+                    desc = descriptions[bidx - 1] if bidx - 1 < len(descriptions) else ""
+                    if not desc:
+                        out["warnings"].append(
+                            f"Local S2 stack band {bidx} has no description; assuming {expected_label}."
+                        )
+                        continue
+                    found_label = _normalize_s2_band_label(desc)
+                    if found_label != expected_label:
+                        out["error"] = (
+                            f"Local S2 stack band {bidx} should be {expected_label}, "
+                            f"but description is {desc!r}."
+                        )
+                        return out
+            if int(src.count) > expected_count:
+                out["warnings"].append(
+                    f"Local S2 stack has {int(src.count)} bands; coregistration will use the first "
+                    f"{expected_count} canonical L2A reflectance bands."
+                )
     except Exception as exc:
         out["error"] = f"Failed to open local S2 stack override: {exc}"
         return out
@@ -781,12 +945,20 @@ def _resolve_quicklook_rgb_bands(
     return indices, [None, None, None], "fallback_assumed_400_2500nm"
 
 
-def _iter_valid_band_values(src: Any, bidx: int, nodata_value: Optional[float]):
+def _iter_valid_band_values(src: Any, bidx: int, nodata_value: Optional[Any]):
+    if isinstance(nodata_value, (list, tuple, set, np.ndarray)):
+        nodata_values = tuple(float(v) for v in nodata_value if v is not None and np.isfinite(float(v)))
+    else:
+        nodata_values = resolve_raster_nodata_values(
+            src,
+            nodata_fallback=nodata_value,
+            extra_values=[nodata_value],
+        )
     for _, window in src.block_windows(bidx):
         band = src.read(bidx, window=window).astype(np.float64, copy=False)
         valid = np.isfinite(band)
-        if nodata_value is not None and np.isfinite(nodata_value):
-            valid &= band != float(nodata_value)
+        for nodata_candidate in nodata_values:
+            valid &= band != float(nodata_candidate)
         if np.any(valid):
             yield band[valid]
 
@@ -859,7 +1031,6 @@ def _estimate_prisma_geotransform_safe(
     use_geolocation_mesh: bool = False,
     geolocation_mesh_stride: int = 32,
 ):
-    from affine import Affine
     from pyproj import Transformer
 
     tr = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
@@ -956,11 +1127,13 @@ def _apply_polynomial_warp(
         return result
 
     temp_vrt = None
+    tmp_output = None
     try:
         from osgeo import gdal
 
         gdal.UseExceptions()
-        temp_vrt = output_raster.replace(".tif", "_gcps.vrt")
+        temp_vrt = _make_gdal_temp_path(output_raster, ".gcps.vrt")
+        tmp_output = _make_gdal_temp_path(output_raster, ".tmp.tif")
         ds_in = gdal.Open(input_raster, gdal.GA_ReadOnly)
         if ds_in is None:
             result["error_message"] = f"Failed to open input: {input_raster}"
@@ -1011,10 +1184,12 @@ def _apply_polynomial_warp(
         if s2_bounds is not None:
             minx, miny, maxx, maxy = s2_bounds
             cmd.extend(["-te", str(minx), str(miny), str(maxx), str(maxy)])
-        cmd.extend([temp_vrt, output_raster])
+        cmd.extend([temp_vrt, tmp_output])
 
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        if os.path.exists(output_raster):
+        if os.path.exists(tmp_output):
+            _validate_warp_output(tmp_output)
+            os.replace(tmp_output, output_raster)
             result["success"] = True
             result["output_path"] = output_raster
         else:
@@ -1029,6 +1204,7 @@ def _apply_polynomial_warp(
                 os.remove(temp_vrt)
             except Exception:
                 pass
+        _cleanup_raster_temp_outputs(tmp_output)
     return result
 
 
@@ -1055,7 +1231,6 @@ def _estimate_transform_from_corner_coords(corner_info: Dict[str, Any], target_c
     if rows <= 1 or cols <= 1:
         raise RuntimeError(f"Invalid raster shape for corner transform ({rows}, {cols}).")
 
-    from affine import Affine
     from pyproj import CRS, Transformer
 
     target = CRS.from_user_input(target_crs)
@@ -1256,7 +1431,11 @@ def _create_synthetic_s2_pan(
             )
 
             with rasterio.open(output_path, "w", **profile) as dst:
-                src_tags = src.tags()
+                src_tags = filter_dataset_tags_for_raster_copy(
+                    src.tags(),
+                    output_band_count=int(dst.count),
+                    source_band_count=int(src.count),
+                )
                 if src_tags:
                     dst.update_tags(**src_tags)
                 dst.set_band_description(1, "S2_SYNTHETIC_PAN_B02_B03_B04_B08")
@@ -1331,6 +1510,8 @@ def _collect_pan_tiepoints_with_synthetic_reference(
     }
     effective_arosics_cpus = max(1, int(arosics_cpus))
     supports_kwarg = _supports_constructor_kwarg
+    coreg_cls = _compat_attr("COREG")
+    coreg_local_cls = _compat_attr("COREG_LOCAL")
 
     try:
         global_kwargs = {
@@ -1348,10 +1529,10 @@ def _collect_pan_tiepoints_with_synthetic_reference(
             "v": False,
             "q": True,
         }
-        if supports_kwarg(COREG, "CPUs"):
+        if supports_kwarg(coreg_cls, "CPUs"):
             global_kwargs["CPUs"] = int(effective_arosics_cpus)
         with contextlib.redirect_stdout(io.StringIO()):
-            crg = COREG(synthetic_s2_pan_path, pan_source_path, **global_kwargs)
+            crg = coreg_cls(synthetic_s2_pan_path, pan_source_path, **global_kwargs)
             crg.correct_shifts()
         if os.path.exists(pan_global_path):
             out["global_path"] = pan_global_path
@@ -1359,7 +1540,8 @@ def _collect_pan_tiepoints_with_synthetic_reference(
         out["warnings"].append(f"PAN global synthetic-reference alignment failed: {exc}")
 
     if not os.path.exists(out["global_path"]):
-        copy_res = stream_copy_raster_to_path(
+        copy_to_path = _compat_attr("stream_copy_raster_to_path")
+        copy_res = copy_to_path(
             source_path=pan_source_path,
             output_path=pan_global_path,
             nodata_fallback=float(source_nodata),
@@ -1372,7 +1554,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
             return out
         out["global_path"] = pan_global_path
 
-    supports_local_max_iter = supports_kwarg(COREG_LOCAL, "max_iter")
+    supports_local_max_iter = supports_kwarg(coreg_local_cls, "max_iter")
     local_kwargs = {
         "grid_res": int(max(30, int(grid_res))),
         "window_size": tuple(ws),
@@ -1397,7 +1579,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
 
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            crl = COREG_LOCAL(
+            crl = coreg_local_cls(
                 synthetic_s2_pan_path,
                 out["global_path"],
                 **local_kwargs,
@@ -1472,12 +1654,7 @@ def _validate_ancillary_raster(
                 out["error"] = f"CRS mismatch (expected {expected_crs}, got {src.crs})."
                 return out
 
-            nodata_val = src.nodata
-            if nodata_val is not None:
-                try:
-                    nodata_val = float(nodata_val)
-                except Exception:
-                    nodata_val = None
+            nodata_values = resolve_raster_nodata_values(src)
 
             max_wins = int(max(0, int(max_windows)))
             windows_scanned = 0
@@ -1491,8 +1668,8 @@ def _validate_ancillary_raster(
                 band = src.read(1, window=window).astype(np.float32, copy=False)
                 total_pixels += int(band.size)
                 valid = np.isfinite(band)
-                if nodata_val is not None and np.isfinite(nodata_val):
-                    valid &= band != nodata_val
+                for nodata_candidate in nodata_values:
+                    valid &= band != float(nodata_candidate)
                 vcount = int(np.count_nonzero(valid))
                 valid_pixels += vcount
                 windows_scanned += 1
@@ -1536,11 +1713,13 @@ def _apply_tps_warp_from_gcps(
         return result
 
     temp_vrt = None
+    tmp_output = None
     try:
         from osgeo import gdal
 
         gdal.UseExceptions()
-        temp_vrt = output_raster.replace(".tif", "_gcps.vrt")
+        temp_vrt = _make_gdal_temp_path(output_raster, ".gcps.vrt")
+        tmp_output = _make_gdal_temp_path(output_raster, ".tmp.tif")
         ds_in = gdal.Open(input_raster, gdal.GA_ReadOnly)
         if ds_in is None:
             result["error_message"] = f"Failed to open input raster: {input_raster}"
@@ -1555,10 +1734,11 @@ def _apply_tps_warp_from_gcps(
         ds_in = None
 
         gdalwarp_exe = resolve_gdalwarp_exe()
-        cmd = _build_gdalwarp_tps_command(
+        build_gdalwarp_tps_command = _compat_attr("_build_gdalwarp_tps_command")
+        cmd = build_gdalwarp_tps_command(
             gdalwarp_exe=gdalwarp_exe,
             temp_vrt=temp_vrt,
-            output_raster=output_raster,
+            output_raster=tmp_output,
             crs_wkt=crs_wkt,
             x_res=x_res,
             y_res=y_res,
@@ -1571,7 +1751,9 @@ def _apply_tps_warp_from_gcps(
         )
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        if os.path.exists(output_raster):
+        if os.path.exists(tmp_output):
+            _validate_warp_output(tmp_output)
+            os.replace(tmp_output, output_raster)
             result["success"] = True
             result["output_path"] = output_raster
         else:
@@ -1589,6 +1771,7 @@ def _apply_tps_warp_from_gcps(
                 os.remove(temp_vrt)
             except Exception:
                 pass
+        _cleanup_raster_temp_outputs(tmp_output)
 
     return result
 
@@ -1659,6 +1842,7 @@ def _coregister_enmap_auxiliary_outputs(
     hs_reference_raster_path: Optional[str] = None,
     gdalwarp_multi: bool = True,
     gdalwarp_num_threads: str = "ALL_CPUS",
+    coregister_ql: bool = True,
 ) -> Dict[str, Any]:
     """Generate coregistered EnMAP auxiliary outputs from QL rasters and sidecars."""
     result: Dict[str, Any] = {
@@ -1673,16 +1857,19 @@ def _coregister_enmap_auxiliary_outputs(
         },
         "warp_method": None,
         "tiepoints_used": 0,
+        "ql_coregistration_requested": bool(coregister_ql),
     }
     gdal_threads = _normalize_gdalwarp_num_threads(gdalwarp_num_threads)
 
-    aux_inputs = _discover_enmap_auxiliary_inputs(enmap_spectral_image)
-    ql_rasters = list(aux_inputs.get("ql_rasters", []) or [])
+    discover_enmap_auxiliary_inputs = _compat_attr("_discover_enmap_auxiliary_inputs")
+    aux_inputs = discover_enmap_auxiliary_inputs(enmap_spectral_image)
+    ql_rasters_discovered = list(aux_inputs.get("ql_rasters", []) or [])
+    ql_rasters = ql_rasters_discovered if coregister_ql else []
     sidecars = dict(aux_inputs.get("sidecars", {}) or {})
     scene_prefix = str(aux_inputs.get("scene_prefix") or "").strip()
 
     fmt_issue = _fmt_issue
-    if not ql_rasters and not sidecars:
+    if not ql_rasters_discovered and not sidecars:
         result["status"] = "degraded"
         result["warnings"].append(
             fmt_issue(
@@ -1693,7 +1880,15 @@ def _coregister_enmap_auxiliary_outputs(
         return result
 
     result["status"] = "ok"
-    if not ql_rasters:
+    if not sidecars:
+        result["status"] = "degraded"
+        result["warnings"].append(
+            fmt_issue(
+                "ANCILLARY",
+                "No EnMAP XML/HDR sidecars were discovered for provenance copy.",
+            )
+        )
+    if coregister_ql and not ql_rasters:
         result["status"] = "degraded"
         result["warnings"].append(
             fmt_issue(
@@ -1703,7 +1898,12 @@ def _coregister_enmap_auxiliary_outputs(
         )
 
     coreg_aux_dir = os.path.join(folder_struct["coreg"], "enmap_aux")
-    metadata_dir = os.path.join(coreg_aux_dir, "metadata")
+    reports_dir = folder_struct.get("reports")
+    metadata_dir = (
+        os.path.join(reports_dir, "provenance", "enmap_metadata")
+        if reports_dir
+        else os.path.join(coreg_aux_dir, "metadata")
+    )
     os.makedirs(coreg_aux_dir, exist_ok=True)
     os.makedirs(metadata_dir, exist_ok=True)
 
@@ -1719,6 +1919,10 @@ def _coregister_enmap_auxiliary_outputs(
             result["warnings"].append(
                 fmt_issue("ANCILLARY", f"Failed to copy EnMAP sidecar '{sidecar_key}': {exc}")
             )
+
+    if not coregister_ql:
+        result["warp_method"] = "not_requested"
+        return result
 
     base_tie_points_df = None if best_candidate is None else best_candidate.get("local_tiepoints_df")
     if base_tie_points_df is None or len(base_tie_points_df) == 0:
@@ -1825,7 +2029,7 @@ def _coregister_enmap_auxiliary_outputs(
                 if "PIXELMASK" in str(src_name).upper()
                 else ARTIFACT_ROLE_NO_PIPELINE_SIDECAR
             )
-            sidecar_result = _finalize_legacy_sidecars(
+            sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=out_path,
                 sensor_type="ENMAP",
                 artifact_role=artifact_role,
@@ -2073,7 +2277,10 @@ def _coregister_prisma_ancillary_outputs(
             pan_res = float(0.5 * (pan_xres + pan_yres))
             if norm_pan_gcp_mode == "scaled_image":
                 if hs_reference_raster_path and os.path.exists(hs_reference_raster_path):
-                    hs_xres, hs_yres = infer_res(hs_reference_raster_path, fallback=30.0)
+                    hs_xres, hs_yres = _infer_raster_native_resolution(
+                        hs_reference_raster_path,
+                        fallback=30.0,
+                    )
                     hs_res = float(0.5 * (hs_xres + hs_yres))
                 else:
                     hs_res = 30.0
@@ -2083,7 +2290,8 @@ def _coregister_prisma_ancillary_outputs(
                             "HS reference path missing for PAN scaled-image GCP mode; using 30m fallback.",
                         )
                     )
-                pan_gcps = build_pan_gcps_from_tiepoints(
+                build_pan_gcps = _compat_attr("build_pan_gcps_from_tiepoints")
+                pan_gcps = build_pan_gcps(
                     tiepoints_df=pan_selected_df,
                     hs_pixel_size_m=hs_res,
                     pan_pixel_size_m=pan_res,
@@ -2164,7 +2372,7 @@ def _coregister_prisma_ancillary_outputs(
             pan_check = _validate_ancillary_raster(pan_out, s2_crs)
             if not pan_check.get("ok", False):
                 raise RuntimeError(pan_check.get("error", "PAN output validation failed"))
-            pan_sidecar_result = _finalize_legacy_sidecars(
+            pan_sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=pan_out,
                 sensor_type="PRISMA",
                 artifact_role=ARTIFACT_ROLE_NO_PIPELINE_SIDECAR,
@@ -2298,7 +2506,7 @@ def _coregister_prisma_ancillary_outputs(
                 qm_check = _validate_ancillary_raster(out_path, s2_crs)
                 if not qm_check.get("ok", False):
                     raise RuntimeError(qm_check.get("error", f"{label} quality output validation failed"))
-                sidecar_result = _finalize_legacy_sidecars(
+                sidecar_result = _finalize_pipeline_sidecars(
                     tif_path=out_path,
                     sensor_type="PRISMA",
                     artifact_role=ARTIFACT_ROLE_QUALITY_MASK,
@@ -2342,7 +2550,7 @@ __all__ = [
     "_estimate_transform_from_corner_coords",
     "_export_displacement_shapefile_from_df",
     "_finalize_coreg_output",
-    "_finalize_legacy_sidecars",
+    "_finalize_pipeline_sidecars",
     "_remove_sidecar_if_exists",
     "_generate_mandatory_quicklooks",
     "_harmonize_detector_branch_grids",
@@ -2399,7 +2607,7 @@ _LOCAL_EXPORTS = {
     "_write_georeferenced_raster",
     "_normalize_pan_gcp_mode",
     "_normalize_pan_dxdy_source",
-    "_finalize_legacy_sidecars",
+    "_finalize_pipeline_sidecars",
     "_probe_raster_valid_pixels",
     "_remove_sidecar_if_exists",
     "_sanitize_raster_nonfinite_inplace",
@@ -2413,16 +2621,6 @@ for _name in __all__:
     if _name in _LOCAL_EXPORTS:
         continue
     try:
-        globals()[_name] = getattr(_legacy, _name)
+        globals()[_name] = getattr(_runtime, _name)
     except AttributeError:
-        # `_legacy_coreg` imports this module while it is still initializing.
-        # Defer unresolved compatibility exports until first access.
         continue
-
-
-def __getattr__(name: str):
-    if name not in __all__ or name in _LOCAL_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(_legacy, name)
-    globals()[name] = value
-    return value

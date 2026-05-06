@@ -15,6 +15,7 @@ from hypercoreg.config import (
     DEFAULT_GDALWARP_NAME,
     S2_BANDS,
     MULTIBAND_S2_WAVELENGTHS,
+    S2_L2A_OUTPUT_BAND_INDEX,
 )
 
 logger = logging.getLogger("COREG_PROCESSING")
@@ -22,6 +23,11 @@ logger = logging.getLogger("COREG_PROCESSING")
 
 class SentinelNotFoundError(Exception):
     """Exception raised when no suitable Sentinel-2 scene is found for a product."""
+    pass
+
+
+class CDSEAuthenticationError(RuntimeError):
+    """Exception raised for systemic CDSE authentication failures."""
     pass
 
 
@@ -166,7 +172,7 @@ def get_s2_band_for_wavelength(target_wl: float) -> int:
     """
     Get the S2 band index (in multi-band stack) for a target wavelength.
 
-    The S2 stack contains: B02(1), B03(2), B04(3), B08(4), B11(5), B12(6)
+    The persisted S2 L2A stack follows ``S2_L2A_OUTPUT_BANDS`` order.
 
     Args:
         target_wl: Target wavelength in nm
@@ -174,18 +180,13 @@ def get_s2_band_for_wavelength(target_wl: float) -> int:
     Returns:
         int: Band index (1-based) in the stack, or 4 (B08) as default
     """
-    # Map target wavelength to available bands
     stack_bands = {
-        490.0: 1,   # B02 Blue
-        560.0: 2,   # B03 Green
-        665.0: 3,   # B04 Red
-        842.0: 4,   # B08 NIR
-        1610.0: 5,  # B11 SWIR1
-        2190.0: 6,  # B12 SWIR2
+        float(info["wavelength"]): int(info["stack_idx"])
+        for info in MULTIBAND_S2_WAVELENGTHS.values()
     }
 
     # Find closest match
-    best_band = 4  # Default to B08
+    best_band = int(S2_L2A_OUTPUT_BAND_INDEX["B08"])
     best_diff = float('inf')
 
     for wl, band_idx in stack_bands.items():

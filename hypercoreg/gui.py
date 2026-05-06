@@ -12,6 +12,7 @@ import queue
 import threading
 import traceback
 import tkinter as tk
+from collections.abc import Mapping
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Any, Optional, List
 
@@ -22,6 +23,7 @@ from hypercoreg.config import (
     DEFAULT_S2_BAND,
 )
 from hypercoreg.logging_config import setup_logging, log_section_header
+from hypercoreg.result_status import describe_result_failure
 from hypercoreg.utils import detect_hyp_type
 
 logger = logging.getLogger("COREG_PROCESSING")
@@ -89,9 +91,15 @@ def _build_gui_runtime_config(
         'max_s2_candidates': config_vars['max_s2_candidates'].get(),
         'residual_mad_factor': config_vars['residual_mad_factor'].get(),
         's2_ref_band': config_vars['s2_ref_band'].get(),
+        's2_stack_cache': DEFAULT_CONFIG['s2_stack_cache'],
+        's2_cache_dir': DEFAULT_CONFIG['s2_cache_dir'],
         'prefer_fixed_band_pairs': DEFAULT_CONFIG['prefer_fixed_band_pairs'],
         'fixed_band_pairs_by_sensor': DEFAULT_CONFIG['fixed_band_pairs_by_sensor'],
         'bandpair_wavelength_window_nm': DEFAULT_CONFIG['bandpair_wavelength_window_nm'],
+        's2_band_subset_by_branch': DEFAULT_CONFIG['s2_band_subset_by_branch'],
+        'local_tiepoint_early_stop': DEFAULT_CONFIG['local_tiepoint_early_stop'],
+        'cache_hs_narrowbands': DEFAULT_CONFIG['cache_hs_narrowbands'],
+        'hs_narrowband_cache_dir': DEFAULT_CONFIG['hs_narrowband_cache_dir'],
         'min_band_support': DEFAULT_CONFIG['min_band_support'],
         'allow_single_band_fallback': DEFAULT_CONFIG['allow_single_band_fallback'],
         'consensus_group_rounding_px': DEFAULT_CONFIG['consensus_group_rounding_px'],
@@ -146,9 +154,7 @@ def _build_gui_runtime_config(
         'allow_gui_prompt': True,
         'defer_temp_cleanup_gui': True,
         'timing_logs': True,
-        'use_pipeline_native': DEFAULT_CONFIG['use_pipeline_native'],
-        'enable_legacy_fallback': DEFAULT_CONFIG['enable_legacy_fallback'],
-        'assert_legacy_parity': DEFAULT_CONFIG['assert_legacy_parity'],
+        'batch_workers': DEFAULT_CONFIG['batch_workers'],
     }
 
 
@@ -673,6 +679,12 @@ def _show_parameter_dialog(
     button_frame.pack(fill='x', padx=10, pady=10)
 
     def on_run():
+        try:
+            for _name, var in config_vars.items():
+                var.get()
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Invalid parameter", f"Invalid parameter value: {exc}")
+            return
         result_config['cancelled'] = False
         param_root.destroy()
 
@@ -745,16 +757,21 @@ def run_gui_worker_pipeline(
     worker_config = dict(config)
     worker_config["prompt_userpass_fn"] = request_userpass_fn
     if config["batch_mode"]:
-        run_batch_coregistration(
+        result = run_batch_coregistration(
             config["input_path"],
             config["output_dir"],
             worker_config,
             progress_callback=progress_callback,
         )
+        if not isinstance(result, Mapping):
+            raise RuntimeError("Batch runner returned no result payload.")
+        failure_reason = describe_result_failure(result, "batch")
+        if failure_reason:
+            raise RuntimeError(failure_reason)
         return
 
     hyp_type = detect_hyp_type(config["input_path"])
-    run_coregistration(
+    result = run_coregistration(
         config["input_path"],
         hyp_type,
         config["output_dir"],
@@ -763,6 +780,11 @@ def run_gui_worker_pipeline(
         scene_idx=1,
         scene_total=1,
     )
+    if not isinstance(result, Mapping):
+        raise RuntimeError("Single-scene runner returned no result payload.")
+    failure_reason = describe_result_failure(result, "single")
+    if failure_reason:
+        raise RuntimeError(failure_reason)
 
 
 def main() -> int:
@@ -831,12 +853,7 @@ def main() -> int:
             with prompt_lock:
                 pending_prompt_requests.append(req)
             event_queue.put(("prompt_userpass", req))
-            if not req["done"].wait(timeout=GUI_PROMPT_WAIT_TIMEOUT_S):
-                _unregister_prompt_request(req)
-                raise RuntimeError(
-                    "Timed out waiting for GUI credential prompt response "
-                    f"after {GUI_PROMPT_WAIT_TIMEOUT_S} seconds."
-                )
+            req["done"].wait()
             _unregister_prompt_request(req)
             if req["error"] is not None:
                 raise RuntimeError(str(req["error"]))

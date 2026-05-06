@@ -23,16 +23,15 @@ HyperCoreg is a Python tool that automatically aligns hyperspectral satellite im
 ### Recommended: Conda (handles GDAL dependencies)
 
 ```bash
-# Clone the repository
-git clone https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP.git
-cd HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP
+# Open this folder
+cd Hypercoreg_StandardUser
 
 # Create conda environment
 conda env create -f environment.yml
 conda activate hypercoreg
 
-# Install package in development mode
-pip install -e .
+# Install package
+pip install .
 ```
 
 ### Alternative: pip (requires GDAL pre-installed)
@@ -40,7 +39,7 @@ pip install -e .
 ```bash
 # Ensure GDAL is installed system-wide or via conda first
 pip install -r requirements.txt
-pip install -e .
+pip install .
 ```
 
 ## Quick Start
@@ -65,6 +64,12 @@ python runCLI.py single -i /path/to/image.he5 -o /path/to/output
 
 # Batch processing
 python runCLI.py batch -i /path/to/input_folder -o /path/to/output
+
+# Accuracy-first processing
+python runCLI.py single -i image.he5 -o ./output --preset accuracy
+
+# Faster production processing
+python runCLI.py batch -i /path/to/input_folder -o ./output --preset fast
 
 # With custom parameters
 python runCLI.py single -i image.he5 -o ./output \
@@ -100,6 +105,7 @@ metrics = run_coregistration("/path/to/image.he5", hyp_type, "/path/to/output", 
 | `min_overlap` | 0.5 | Minimum spatial overlap with S2 (0-1) |
 | `max_cloud` | 20 | Maximum cloud cover for S2 reference (%) |
 | `max_input_cloud_cover` | 70 | Skip input if cloud cover exceeds (%) |
+| `local_s2_stack_path` | `None` | Optional local Sentinel-2 L2A stack in canonical output order |
 | `residual_threshold` | 25 | Maximum acceptable tie point residual (m) |
 | `min_tie_points` | 10 | Minimum required tie points |
 | `max_s2_candidates` | 3 | Maximum S2 candidates to evaluate |
@@ -111,12 +117,15 @@ metrics = run_coregistration("/path/to/image.he5", hyp_type, "/path/to/output", 
 | `metadata_stats_mode` | `approx` | PAM stats strategy: `exact`, `approx`, or `none` |
 | `enmap_metadata_stats_mode` | `none` | EnMAP-only PAM stats strategy override (`none` by default for faster EnMAP output) |
 | `validation_max_windows` | `64` | Final validation scan cap (`0` = full scan) |
-| `pan_gcp_mode` | `map_inverse` | PAN TPS GCP mode: `map_inverse` (legacy) or `scaled_image` |
+| `preset` | `default` | Named runtime preset: `default`, `fast`, or `accuracy`; explicit CLI flags override preset values |
+| `pan_gcp_mode` | `map_inverse` | PAN TPS GCP mode: `map_inverse` or `scaled_image` |
 | `pan_map_dxdy_source` | `auto` | Map-shift source for PAN scaled GCPs: `auto`, `xy_shift_m`, `zero` |
 | `pan_target_aligned_pixels` | `False` | Use GDAL `-tap` in PAN warp |
 | `pan_residual_check` | `False` | Optional post-warp PAN residual translation estimate |
 
 By default, ancillary outputs such as PRISMA PAN and quality auxiliaries are disabled. Enable them explicitly with `save_pan`, `save_quality_mask`, `--save-pan`, or `--save-quality-mask`.
+
+Sentinel-2 reference outputs are written as 12-band L2A spectral GeoTIFF stacks in this order: `B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12`. `B10` is not included because Sentinel-2 Level-2A products do not provide it as surface reflectance. SCL is used internally for masking and valid-pixel scoring, but it is not persisted as a band in the reference stack.
 
 ## CDSE Credentials
 

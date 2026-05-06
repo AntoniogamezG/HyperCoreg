@@ -8,7 +8,7 @@ for the coregistration pipeline.
 import sys
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Sequence
 
 import numpy as np
 
@@ -43,14 +43,85 @@ S2_BANDS: Dict[int, Dict[str, Any]] = {
     13: {"name": "B12 (SWIR 2)", "wavelength": 2190.0, "resolution": 20},
 }
 
+# Approximate MSI band FWHM values used only as a deterministic fallback when
+# bundled/tabulated SRF curves do not overlap a hyperspectral band table.
+S2_APPROX_FWHM_NM: Dict[str, float] = {
+    "B01": 20.0,
+    "B02": 65.0,
+    "B03": 35.0,
+    "B04": 30.0,
+    "B05": 15.0,
+    "B06": 15.0,
+    "B07": 20.0,
+    "B08": 115.0,
+    "B8A": 20.0,
+    "B09": 20.0,
+    "B10": 30.0,
+    "B11": 90.0,
+    "B12": 180.0,
+}
+
+# Sentinel-2 L2A surface-reflectance bands available in CDSE S2MSI2A products.
+# B10 is intentionally absent from L2A because it is not a BOA reflectance band.
+S2_L2A_OUTPUT_BANDS: Tuple[str, ...] = (
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B8A",
+    "B09",
+    "B11",
+    "B12",
+)
+S2_L2A_ANCILLARY_BANDS: Tuple[str, ...] = (
+    "SCL",
+    "AOT",
+    "WVP",
+)
+S2_L2A_REFERENCE_STACK_BANDS: Tuple[str, ...] = (
+    *S2_L2A_OUTPUT_BANDS,
+    *S2_L2A_ANCILLARY_BANDS,
+)
+S2_L2A_OUTPUT_BAND_INDEX: Dict[str, int] = {
+    band: idx for idx, band in enumerate(S2_L2A_OUTPUT_BANDS, start=1)
+}
+
 # Multi-band S2 wavelengths used in coregistration stack
 MULTIBAND_S2_WAVELENGTHS: Dict[str, Dict[str, Any]] = {
-    'B02': {'wavelength': 490.0, 'stack_idx': 1, 'name': 'Blue'},
-    'B03': {'wavelength': 560.0, 'stack_idx': 2, 'name': 'Green'},
-    'B04': {'wavelength': 665.0, 'stack_idx': 3, 'name': 'Red'},
-    'B08': {'wavelength': 842.0, 'stack_idx': 4, 'name': 'NIR'},
-    'B11': {'wavelength': 1610.0, 'stack_idx': 5, 'name': 'SWIR1'},
-    'B12': {'wavelength': 2190.0, 'stack_idx': 6, 'name': 'SWIR2'},
+    'B02': {
+        'wavelength': 490.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B02'],
+        'name': 'Blue',
+    },
+    'B03': {
+        'wavelength': 560.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B03'],
+        'name': 'Green',
+    },
+    'B04': {
+        'wavelength': 665.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B04'],
+        'name': 'Red',
+    },
+    'B08': {
+        'wavelength': 842.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B08'],
+        'name': 'NIR',
+    },
+    'B11': {
+        'wavelength': 1610.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B11'],
+        'name': 'SWIR1',
+    },
+    'B12': {
+        'wavelength': 2190.0,
+        'stack_idx': S2_L2A_OUTPUT_BAND_INDEX['B12'],
+        'name': 'SWIR2',
+    },
 }
 
 # Curated 1-based PRISMA band indices for Sentinel-2 matching bands.
@@ -153,6 +224,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'max_cloud': DEFAULT_MAX_CLOUD_COVER,
     'max_input_cloud_cover': 70.0,
     'local_s2_stack_path': None,
+    's2_stack_cache': True,
+    's2_cache_dir': None,
+    'scl_exclude_classes': list(SCL_EXCLUDE_CLASSES.keys()),
+    's2_stack_mode': "materialized",
 
     # Coregistration parameters
     'residual_threshold': DEFAULT_RESIDUAL_THRESHOLD_M,
@@ -161,10 +236,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'residual_mad_factor': 3.0,
     's2_ref_band': DEFAULT_S2_BAND,
     'prefer_fixed_band_pairs': True,
+    'synthetic_s2_band_mode': "fixed_pair",
     'fixed_band_pairs_by_sensor': {
         'PRISMA': dict(PRISMA_FIXED_BAND_PAIRS),
     },
     'bandpair_wavelength_window_nm': 20.0,
+    's2_band_subset_by_branch': {
+        'VNIR': ['B03', 'B04', 'B08'],
+        'SWIR': ['B11', 'B12'],
+    },
+    'local_tiepoint_early_stop': True,
+    'local_tiepoint_early_stop_min_points': None,
+    'local_tiepoint_early_stop_min_cells': None,
+    'local_tiepoint_early_stop_reliability': MIN_RELIABILITY_THRESHOLD,
+    'cache_hs_narrowbands': True,
+    'hs_narrowband_cache_dir': None,
     'min_band_support': 2,
     'allow_single_band_fallback': True,
     'consensus_group_rounding_px': 1.0,
@@ -175,6 +261,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'auto_downgrade_polynomial_order': True,
     'min_gcps_order2': 12,
     'min_cells_order2': 6,
+    'transform_model_selection': "rule_based",
+    'transform_cv_folds': 5,
+    'transform_cv_repeats': 3,
+    'transform_cv_holdout_fraction': 0.25,
+    'transform_cv_seed': 1337,
+    'transform_cv_min_tps_gcps': 20,
+    'transform_cv_min_tps_cells': 8,
+    'transform_cv_tps_min_p90_improvement_m': 1.0,
+    'transform_cv_edge_instability_factor': 2.5,
     'local_coreg_grid_res': LOCAL_GRID_RES_M,
     'local_coreg_window_size': (256, 256),
     'local_coreg_tieP_filter_level': 1,
@@ -208,6 +303,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'arosics_cpus': 0,
     'gdalwarp_multi': True,
     'gdalwarp_num_threads': 'ALL_CPUS',
+    'batch_workers': 1,
     'allow_gui_prompt': False,
     'remove_detector_overlap_bands': False,
     'normalization_mode': "none",
@@ -252,12 +348,132 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'pan_residual_max_dim': 1024,
     'defer_temp_cleanup_gui': False,
     'timing_logs': True,
-    # Migration controls (legacy -> pipeline-native runtime switch).
-    # Keep conservative defaults for safety-first rollout.
-    'use_pipeline_native': False,
-    'enable_legacy_fallback': True,
-    'assert_legacy_parity': False,
 }
+
+FAST_CONFIG: Dict[str, Any] = {
+    'max_s2_candidates': 2,
+    'synthetic_s2_band_mode': "fixed_pair",
+    's2_band_subset_by_branch': {
+        'VNIR': ['B04', 'B08'],
+        'SWIR': ['B11', 'B12'],
+    },
+    'local_tiepoint_early_stop': True,
+    'local_tiepoint_early_stop_min_points': 10,
+    'local_tiepoint_early_stop_min_cells': 3,
+    'metadata_extension_level': "none",
+    'metadata_stats_mode': "none",
+    'enmap_metadata_stats_mode': "none",
+    'validation_max_windows': 16,
+    'quicklook_max_dim': 900,
+    'quicklook_scalebar': False,
+    'save_pre': False,
+    'gen_tiepoint_pngs': False,
+    'save_displacement_vectors': False,
+    'save_pan': False,
+    'save_quality_mask': False,
+    'build_overviews': False,
+    'postwarp_phasecorr_check': False,
+    'pan_residual_check': False,
+    'timing_logs': False,
+}
+
+ACCURACY_CONFIG: Dict[str, Any] = {
+    'max_s2_candidates': 5,
+    'max_cloud': 5,
+    'days_window': 15,
+    'min_overlap': 0.7,
+    'synthetic_s2_band_mode': "srf_weighted",
+    'min_band_support': 2,
+    'allow_single_band_fallback': False,
+    'min_tie_points': 25,
+    'spatial_stratification_grid_rows': 6,
+    'spatial_stratification_grid_cols': 6,
+    'max_points_per_cell': 2,
+    'local_tiepoint_early_stop': False,
+    'preferred_polynomial_order': 2,
+    'auto_downgrade_polynomial_order': True,
+    'min_gcps_order2': 24,
+    'min_cells_order2': 10,
+    'transform_model_selection': "cv",
+    'transform_cv_folds': 5,
+    'transform_cv_repeats': 5,
+    'transform_cv_holdout_fraction': 0.25,
+    'transform_cv_seed': 1337,
+    'transform_cv_min_tps_gcps': 20,
+    'transform_cv_min_tps_cells': 8,
+    'transform_cv_tps_min_p90_improvement_m': 1.0,
+    'transform_cv_edge_instability_factor': 2.5,
+    'postwarp_phasecorr_check': True,
+    'postwarp_phasecorr_warn_threshold_px': 0.5,
+    'postwarp_phasecorr_reject_threshold_px': 1.5,
+    'postwarp_phasecorr_reject_bad': True,
+    'use_geolocation_mesh_affine': True,
+    'pan_gcp_mode': "scaled_image",
+    'pan_target_aligned_pixels': True,
+    'pan_residual_check': True,
+    'pan_residual_threshold_px': 0.5,
+    'metadata_stats_mode': "approx",
+    'validation_max_windows': 0,
+}
+
+PRESET_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "default": {},
+    "fast": FAST_CONFIG,
+    "accuracy": ACCURACY_CONFIG,
+}
+
+
+def apply_cpu_oversubscription_guard(
+    config: Dict[str, Any],
+    explicit_keys: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Cap nested worker thread settings when batch processing uses processes.
+
+    The guard is intentionally conservative: if callers explicitly provide
+    ``arosics_cpus`` or ``gdalwarp_num_threads`` those values are preserved.
+    """
+    guarded = dict(config or {})
+    explicit = {str(k) for k in (explicit_keys or [])}
+    warnings_out: List[str] = []
+    try:
+        workers = int(guarded.get("batch_workers", DEFAULT_CONFIG.get("batch_workers", 1)) or 1)
+    except Exception:
+        workers = 1
+    if workers <= 1:
+        guarded["_cpu_guard_applied"] = False
+        return guarded, warnings_out
+
+    if "arosics_cpus" not in explicit:
+        raw_arosics = guarded.get("arosics_cpus", DEFAULT_CONFIG.get("arosics_cpus", 0))
+        try:
+            arosics_cpus = int(raw_arosics)
+        except Exception:
+            arosics_cpus = 0
+        if arosics_cpus != 1:
+            guarded["arosics_cpus"] = 1
+            warnings_out.append(
+                "batch_workers > 1: auto-capped arosics_cpus to 1 to avoid CPU oversubscription."
+            )
+
+    if "gdalwarp_num_threads" not in explicit:
+        raw_threads = guarded.get("gdalwarp_num_threads", DEFAULT_CONFIG.get("gdalwarp_num_threads", "ALL_CPUS"))
+        token = str(raw_threads if raw_threads is not None else "").strip().upper()
+        should_cap = token in {"", "0", "ALL_CPUS"}
+        if not should_cap:
+            try:
+                should_cap = int(token) > 1
+            except Exception:
+                should_cap = True
+        if should_cap:
+            guarded["gdalwarp_num_threads"] = "1"
+            warnings_out.append(
+                "batch_workers > 1: auto-capped gdalwarp_num_threads to 1 to avoid CPU oversubscription."
+            )
+
+    guarded["_cpu_guard_applied"] = bool(warnings_out)
+    if warnings_out:
+        guarded["_cpu_guard_warnings"] = list(warnings_out)
+    return guarded, warnings_out
 
 
 @dataclass
@@ -270,6 +486,12 @@ class CoregConfig:
     max_cloud: float = DEFAULT_MAX_CLOUD_COVER
     max_input_cloud_cover: float = 70.0
     local_s2_stack_path: Optional[str] = None
+    s2_stack_cache: bool = True
+    s2_cache_dir: Optional[str] = None
+    scl_exclude_classes: List[int] = field(
+        default_factory=lambda: list(SCL_EXCLUDE_CLASSES.keys())
+    )
+    s2_stack_mode: str = "materialized"
 
     # Coregistration
     residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD_M
@@ -278,10 +500,23 @@ class CoregConfig:
     residual_mad_factor: float = 3.0
     s2_ref_band: int = DEFAULT_S2_BAND
     prefer_fixed_band_pairs: bool = True
+    synthetic_s2_band_mode: str = "fixed_pair"
     fixed_band_pairs_by_sensor: Dict[str, Dict[str, int]] = field(
         default_factory=lambda: {'PRISMA': dict(PRISMA_FIXED_BAND_PAIRS)}
     )
     bandpair_wavelength_window_nm: float = 20.0
+    s2_band_subset_by_branch: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            'VNIR': ['B03', 'B04', 'B08'],
+            'SWIR': ['B11', 'B12'],
+        }
+    )
+    local_tiepoint_early_stop: bool = True
+    local_tiepoint_early_stop_min_points: Optional[int] = None
+    local_tiepoint_early_stop_min_cells: Optional[int] = None
+    local_tiepoint_early_stop_reliability: float = MIN_RELIABILITY_THRESHOLD
+    cache_hs_narrowbands: bool = True
+    hs_narrowband_cache_dir: Optional[str] = None
     min_band_support: int = 2
     allow_single_band_fallback: bool = True
     consensus_group_rounding_px: float = 1.0
@@ -292,6 +527,15 @@ class CoregConfig:
     auto_downgrade_polynomial_order: bool = True
     min_gcps_order2: int = 12
     min_cells_order2: int = 6
+    transform_model_selection: str = "rule_based"
+    transform_cv_folds: int = 5
+    transform_cv_repeats: int = 3
+    transform_cv_holdout_fraction: float = 0.25
+    transform_cv_seed: int = 1337
+    transform_cv_min_tps_gcps: int = 20
+    transform_cv_min_tps_cells: int = 8
+    transform_cv_tps_min_p90_improvement_m: float = 1.0
+    transform_cv_edge_instability_factor: float = 2.5
     local_coreg_grid_res: int = LOCAL_GRID_RES_M
     local_coreg_window_size: Tuple[int, int] = (256, 256)
     local_coreg_tieP_filter_level: int = 1
@@ -329,6 +573,7 @@ class CoregConfig:
     arosics_cpus: int = 0
     gdalwarp_multi: bool = True
     gdalwarp_num_threads: str = 'ALL_CPUS'
+    batch_workers: int = 1
     allow_gui_prompt: bool = False
     remove_detector_overlap_bands: bool = False
     normalization_mode: str = "none"
@@ -373,10 +618,6 @@ class CoregConfig:
     pan_residual_max_dim: int = 1024
     defer_temp_cleanup_gui: bool = False
     timing_logs: bool = True
-    use_pipeline_native: bool = False
-    enable_legacy_fallback: bool = True
-    assert_legacy_parity: bool = False
-
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -385,17 +626,32 @@ class CoregConfig:
             'max_cloud': self.max_cloud,
             'max_input_cloud_cover': self.max_input_cloud_cover,
             'local_s2_stack_path': self.local_s2_stack_path,
+            's2_stack_cache': self.s2_stack_cache,
+            's2_cache_dir': self.s2_cache_dir,
+            'scl_exclude_classes': [int(v) for v in self.scl_exclude_classes],
+            's2_stack_mode': self.s2_stack_mode,
             'residual_threshold': self.residual_threshold,
             'min_tie_points': self.min_tie_points,
             'max_s2_candidates': self.max_s2_candidates,
             'residual_mad_factor': self.residual_mad_factor,
             's2_ref_band': self.s2_ref_band,
             'prefer_fixed_band_pairs': self.prefer_fixed_band_pairs,
+            'synthetic_s2_band_mode': self.synthetic_s2_band_mode,
             'fixed_band_pairs_by_sensor': {
                 str(sensor): {str(k): int(v) for k, v in pairs.items()}
                 for sensor, pairs in self.fixed_band_pairs_by_sensor.items()
             },
             'bandpair_wavelength_window_nm': self.bandpair_wavelength_window_nm,
+            's2_band_subset_by_branch': {
+                str(branch): [str(band) for band in bands]
+                for branch, bands in self.s2_band_subset_by_branch.items()
+            },
+            'local_tiepoint_early_stop': self.local_tiepoint_early_stop,
+            'local_tiepoint_early_stop_min_points': self.local_tiepoint_early_stop_min_points,
+            'local_tiepoint_early_stop_min_cells': self.local_tiepoint_early_stop_min_cells,
+            'local_tiepoint_early_stop_reliability': self.local_tiepoint_early_stop_reliability,
+            'cache_hs_narrowbands': self.cache_hs_narrowbands,
+            'hs_narrowband_cache_dir': self.hs_narrowband_cache_dir,
             'min_band_support': self.min_band_support,
             'allow_single_band_fallback': self.allow_single_band_fallback,
             'consensus_group_rounding_px': self.consensus_group_rounding_px,
@@ -406,6 +662,15 @@ class CoregConfig:
             'auto_downgrade_polynomial_order': self.auto_downgrade_polynomial_order,
             'min_gcps_order2': self.min_gcps_order2,
             'min_cells_order2': self.min_cells_order2,
+            'transform_model_selection': self.transform_model_selection,
+            'transform_cv_folds': self.transform_cv_folds,
+            'transform_cv_repeats': self.transform_cv_repeats,
+            'transform_cv_holdout_fraction': self.transform_cv_holdout_fraction,
+            'transform_cv_seed': self.transform_cv_seed,
+            'transform_cv_min_tps_gcps': self.transform_cv_min_tps_gcps,
+            'transform_cv_min_tps_cells': self.transform_cv_min_tps_cells,
+            'transform_cv_tps_min_p90_improvement_m': self.transform_cv_tps_min_p90_improvement_m,
+            'transform_cv_edge_instability_factor': self.transform_cv_edge_instability_factor,
             'local_coreg_grid_res': self.local_coreg_grid_res,
             'local_coreg_window_size': self.local_coreg_window_size,
             'local_coreg_tieP_filter_level': self.local_coreg_tieP_filter_level,
@@ -441,6 +706,7 @@ class CoregConfig:
             'arosics_cpus': self.arosics_cpus,
             'gdalwarp_multi': self.gdalwarp_multi,
             'gdalwarp_num_threads': self.gdalwarp_num_threads,
+            'batch_workers': self.batch_workers,
             'allow_gui_prompt': self.allow_gui_prompt,
             'remove_detector_overlap_bands': self.remove_detector_overlap_bands,
             'normalization_mode': self.normalization_mode,
@@ -485,9 +751,6 @@ class CoregConfig:
             'pan_residual_max_dim': self.pan_residual_max_dim,
             'defer_temp_cleanup_gui': self.defer_temp_cleanup_gui,
             'timing_logs': self.timing_logs,
-            'use_pipeline_native': self.use_pipeline_native,
-            'enable_legacy_fallback': self.enable_legacy_fallback,
-            'assert_legacy_parity': self.assert_legacy_parity,
         }
 
     @classmethod

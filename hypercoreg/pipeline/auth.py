@@ -1,22 +1,26 @@
 """CDSE authentication and credential helpers.
 
 This module is the migration target for auth/session logic previously hosted
-in ``_legacy_coreg.py``.
+in the monolithic runtime.
 """
 
 from __future__ import annotations
 
+import base64
 import getpass
 import json
 import logging
 import os
 import sys
 import threading
+import time
 from time import sleep
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import requests
 from requests.auth import AuthBase
+
+from hypercoreg.utils import CDSEAuthenticationError
 
 logger = logging.getLogger("COREG_PROCESSING")
 
@@ -26,8 +30,10 @@ HTTP_AUTH_RETRY_ATTEMPTS = 2
 HTTP_RETRY_BACKOFF_BASE_S = 1.0
 HTTP_RETRY_BACKOFF_FACTOR = 2.0
 HTTP_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+TOKEN_REFRESH_MARGIN_S = 300.0
 
 PromptUserpassFn = Callable[[], Tuple[str, str, Optional[str]]]
+TokenFactoryFn = Callable[[], str]
 _CDSE_CREDENTIAL_CACHE_LOCK = threading.Lock()
 _CDSE_CREDENTIAL_CACHE: Dict[str, Optional[str]] = {
     "username": None,
@@ -120,6 +126,54 @@ def _extract_cdse_credential_value(source: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _resolve_configured_public_credentials(
+    *,
+    include_env: bool = True,
+    include_file: bool = True,
+    file_creds: Optional[Dict[str, Any]] = None,
+    creds_path: Optional[str] = None,
+) -> Optional[Tuple[str, str, Optional[str], str]]:
+    if include_env:
+        username = (os.environ.get("CDSE_USERNAME") or "").strip()
+        password = os.environ.get("CDSE_PASSWORD") or ""
+        if username and password:
+            totp = (os.environ.get("CDSE_TOTP") or "").strip() or None
+            return username, password, totp, "environment"
+        if username or password:
+            logger.warning(
+                _fmt_issue(
+                    "AUTH",
+                    "Incomplete CDSE username/password in environment; set both "
+                    "CDSE_USERNAME and CDSE_PASSWORD.",
+                )
+            )
+
+    if not include_file:
+        return None
+
+    if file_creds is None:
+        file_creds = _read_cdse_credentials_file()
+    if not isinstance(file_creds, dict):
+        return None
+    if creds_path is None:
+        creds_path = _resolve_cdse_credentials_file_path()
+
+    file_username = _extract_cdse_credential_value(file_creds, "username", "CDSE_USERNAME")
+    file_password = _extract_cdse_credential_value(file_creds, "password", "CDSE_PASSWORD")
+    if file_username and file_password:
+        file_totp = _extract_cdse_credential_value(file_creds, "totp", "CDSE_TOTP") or None
+        return file_username, file_password, file_totp, f"credentials file: {creds_path}"
+    if file_username or file_password:
+        logger.warning(
+            _fmt_issue(
+                "AUTH",
+                "Incomplete CDSE username/password in credentials file; expected "
+                "both username and password.",
+            )
+        )
+    return None
+
+
 class _BearerAuth(AuthBase):
     def __init__(self, token: str):
         self.token = token
@@ -127,6 +181,85 @@ class _BearerAuth(AuthBase):
     def __call__(self, request):
         request.headers["Authorization"] = f"Bearer {self.token}"
         return request
+
+
+def _decode_jwt_exp(access_token: str) -> Optional[float]:
+    parts = str(access_token or "").split(".")
+    if len(parts) < 2:
+        return None
+    payload_b64 = parts[1]
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")))
+    except Exception:
+        return None
+    exp = payload.get("exp")
+    try:
+        return float(exp)
+    except (TypeError, ValueError):
+        return None
+
+
+class _RefreshableBearerAuth(AuthBase):
+    def __init__(
+        self,
+        token_factory: TokenFactoryFn,
+        *,
+        source_name: str,
+        refresh_margin_s: float = TOKEN_REFRESH_MARGIN_S,
+    ):
+        self._token_factory = token_factory
+        self._source_name = str(source_name or "CDSE")
+        self._refresh_margin_s = max(0.0, float(refresh_margin_s))
+        self._lock = threading.Lock()
+        self.token: Optional[str] = None
+        self.expires_at: Optional[float] = None
+
+    def _refresh_locked(self) -> str:
+        token = str(self._token_factory() or "").strip()
+        if not token:
+            raise CDSEAuthenticationError(
+                _fmt_issue("AUTH", f"{self._source_name} token refresh returned no token.")
+            )
+        self.token = token
+        self.expires_at = _decode_jwt_exp(token)
+        if self.expires_at is not None:
+            logger.debug(
+                "Refreshed CDSE token from %s; expires at %s UTC.",
+                self._source_name,
+                datetime_from_timestamp_utc(self.expires_at),
+            )
+        else:
+            logger.debug(
+                "Refreshed CDSE token from %s; token expiry is not available.",
+                self._source_name,
+            )
+        return token
+
+    def _needs_refresh_locked(self) -> bool:
+        if not self.token:
+            return True
+        if self.expires_at is None:
+            return False
+        return (self.expires_at - time.time()) <= self._refresh_margin_s
+
+    def force_refresh(self) -> str:
+        with self._lock:
+            return self._refresh_locked()
+
+    def get_token(self) -> str:
+        with self._lock:
+            if self._needs_refresh_locked():
+                return self._refresh_locked()
+            return str(self.token)
+
+    def __call__(self, request):
+        request.headers["Authorization"] = f"Bearer {self.get_token()}"
+        return request
+
+
+def datetime_from_timestamp_utc(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
 
 
 def _create_cdse_bearer_session(access_token: str) -> requests.Session:
@@ -137,6 +270,28 @@ def _create_cdse_bearer_session(access_token: str) -> requests.Session:
     session.auth = _BearerAuth(token)
     session.headers.update({"Accept": "application/json"})
     return session
+
+
+def _create_cdse_refreshable_bearer_session(
+    token_factory: TokenFactoryFn,
+    *,
+    source_name: str,
+) -> requests.Session:
+    session = requests.Session()
+    refreshable_auth = _RefreshableBearerAuth(token_factory, source_name=source_name)
+    session.auth = refreshable_auth
+    session.headers.update({"Accept": "application/json"})
+    refreshable_auth.force_refresh()
+    return session
+
+
+def _force_refresh_cdse_session(session: Any) -> bool:
+    auth_obj = getattr(session, "auth", None)
+    refresh = getattr(auth_obj, "force_refresh", None)
+    if not callable(refresh):
+        return False
+    refresh()
+    return True
 
 
 def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
@@ -158,13 +313,18 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                     sleep(delay_s)
                     continue
                 msg = response.text[:500]
-                raise RuntimeError(
-                    _fmt_issue("AUTH", f"{flow_name} token generation failed ({response.status_code}): {msg}")
+                raise CDSEAuthenticationError(
+                    _fmt_issue(
+                        "AUTH",
+                        f"{flow_name} token generation failed ({response.status_code}): {msg}",
+                    )
                 )
 
             token = response.json().get("access_token")
             if not token:
-                raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token response missing access_token."))
+                raise CDSEAuthenticationError(
+                    _fmt_issue("AUTH", f"{flow_name} token response missing access_token.")
+                )
             return token
         except requests.RequestException as exc:
             last_error = exc
@@ -179,7 +339,9 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                 )
                 sleep(delay_s)
                 continue
-            raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token request failed: {exc}")) from exc
+            raise CDSEAuthenticationError(
+                _fmt_issue("AUTH", f"{flow_name} token request failed: {exc}")
+            ) from exc
         except Exception as exc:
             last_error = exc
             if attempt < attempts:
@@ -193,14 +355,26 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                 )
                 sleep(delay_s)
                 continue
-            raise
+            if isinstance(exc, CDSEAuthenticationError):
+                raise
+            raise CDSEAuthenticationError(
+                _fmt_issue("AUTH", f"{flow_name} token generation failed: {exc}")
+            ) from exc
 
     if last_error is not None:
-        raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token generation failed: {last_error}"))
-    raise RuntimeError(_fmt_issue("AUTH", f"{flow_name} token generation failed unexpectedly."))
+        raise CDSEAuthenticationError(
+            _fmt_issue("AUTH", f"{flow_name} token generation failed: {last_error}")
+        )
+    raise CDSEAuthenticationError(
+        _fmt_issue("AUTH", f"{flow_name} token generation failed unexpectedly.")
+    )
 
 
-def _generate_cdse_public_access_token(username: str, password: str, totp: Optional[str] = None) -> str:
+def _generate_cdse_public_access_token(
+    username: str,
+    password: str,
+    totp: Optional[str] = None,
+) -> str:
     payload = {
         "client_id": "cdse-public",
         "grant_type": "password",
@@ -221,23 +395,45 @@ def _generate_cdse_client_access_token(client_id: str, client_secret: str) -> st
     return _request_cdse_access_token(payload, flow_name="client-credentials")
 
 
-def _create_cdse_public_session(username: str, password: str, totp: Optional[str] = None) -> requests.Session:
-    token = _generate_cdse_public_access_token(username=username, password=password, totp=totp)
-    return _create_cdse_bearer_session(token)
+def _create_cdse_public_session(
+    username: str,
+    password: str,
+    totp: Optional[str] = None,
+) -> requests.Session:
+    return _create_cdse_refreshable_bearer_session(
+        lambda: _generate_cdse_public_access_token(
+            username=username,
+            password=password,
+            totp=totp,
+        ),
+        source_name="cdse-public",
+    )
+
+
+def _create_cdse_client_session(client_id: str, client_secret: str) -> requests.Session:
+    return _create_cdse_refreshable_bearer_session(
+        lambda: _generate_cdse_client_access_token(
+            client_id=client_id,
+            client_secret=client_secret,
+        ),
+        source_name="client-credentials",
+    )
 
 
 def _create_cdse_session_from_environment() -> Optional[requests.Session]:
-    access_token = (os.environ.get("CDSE_ACCESS_TOKEN") or "").strip()
-    if access_token:
-        logger.info("Using CDSE bearer token from environment (CDSE_ACCESS_TOKEN).")
-        return _create_cdse_bearer_session(access_token)
+    public_creds = _resolve_configured_public_credentials(include_env=True, include_file=False)
+    if public_creds is not None:
+        username, password, totp, source = public_creds
+        logger.info("Using CDSE username/password from %s.", source)
+        sess = _create_cdse_public_session(username=username, password=password, totp=totp)
+        _cache_cdse_public_credentials(username=username, password=password, totp=totp)
+        return sess
 
     client_id = (os.environ.get("CDSE_CLIENT_ID") or "").strip()
     client_secret = (os.environ.get("CDSE_CLIENT_SECRET") or "").strip()
     if client_id and client_secret:
         logger.info("Using CDSE client credentials from environment.")
-        token = _generate_cdse_client_access_token(client_id=client_id, client_secret=client_secret)
-        return _create_cdse_bearer_session(token)
+        return _create_cdse_client_session(client_id=client_id, client_secret=client_secret)
     if client_id or client_secret:
         logger.warning(
             _fmt_issue(
@@ -247,47 +443,52 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
             )
         )
 
-    username = (os.environ.get("CDSE_USERNAME") or "").strip()
-    password = os.environ.get("CDSE_PASSWORD") or ""
-    if username and password:
-        logger.info("Using CDSE username/password from environment.")
-        totp = (os.environ.get("CDSE_TOTP") or "").strip() or None
-        sess = _create_cdse_public_session(username=username, password=password, totp=totp)
-        _cache_cdse_public_credentials(username=username, password=password, totp=totp)
-        return sess
-    if username or password:
-        logger.warning(
-            _fmt_issue(
-                "AUTH",
-                "Incomplete CDSE username/password in environment; set both "
-                "CDSE_USERNAME and CDSE_PASSWORD.",
-            )
-        )
+    access_token = (os.environ.get("CDSE_ACCESS_TOKEN") or "").strip()
+    if access_token:
+        logger.info("Using non-renewable CDSE bearer token from environment (CDSE_ACCESS_TOKEN).")
+        return _create_cdse_bearer_session(access_token)
 
     file_creds = _read_cdse_credentials_file()
     if isinstance(file_creds, dict):
         creds_path = _resolve_cdse_credentials_file_path()
 
-        file_access_token = _extract_cdse_credential_value(
-            file_creds,
-            "access_token",
-            "CDSE_ACCESS_TOKEN",
-            "cdse_access_token",
-            "token",
+        public_file_creds = _resolve_configured_public_credentials(
+            include_env=False,
+            include_file=True,
+            file_creds=file_creds,
+            creds_path=creds_path,
         )
-        if file_access_token:
-            logger.info("Using CDSE bearer token from credentials file: %s", creds_path)
-            return _create_cdse_bearer_session(file_access_token)
+        if public_file_creds is not None:
+            file_username, file_password, file_totp, source = public_file_creds
+            logger.info("Using CDSE username/password from %s.", source)
+            sess = _create_cdse_public_session(
+                username=file_username,
+                password=file_password,
+                totp=file_totp,
+            )
+            _cache_cdse_public_credentials(
+                username=file_username,
+                password=file_password,
+                totp=file_totp,
+            )
+            return sess
 
-        file_client_id = _extract_cdse_credential_value(file_creds, "client_id", "CDSE_CLIENT_ID")
-        file_client_secret = _extract_cdse_credential_value(file_creds, "client_secret", "CDSE_CLIENT_SECRET")
+        file_client_id = _extract_cdse_credential_value(
+            file_creds,
+            "client_id",
+            "CDSE_CLIENT_ID",
+        )
+        file_client_secret = _extract_cdse_credential_value(
+            file_creds,
+            "client_secret",
+            "CDSE_CLIENT_SECRET",
+        )
         if file_client_id and file_client_secret:
             logger.info("Using CDSE client credentials from credentials file: %s", creds_path)
-            token = _generate_cdse_client_access_token(
+            return _create_cdse_client_session(
                 client_id=file_client_id,
                 client_secret=file_client_secret,
             )
-            return _create_cdse_bearer_session(token)
         if file_client_id or file_client_secret:
             logger.warning(
                 _fmt_issue(
@@ -297,22 +498,19 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
                 )
             )
 
-        file_username = _extract_cdse_credential_value(file_creds, "username", "CDSE_USERNAME")
-        file_password = _extract_cdse_credential_value(file_creds, "password", "CDSE_PASSWORD")
-        if file_username and file_password:
-            file_totp = _extract_cdse_credential_value(file_creds, "totp", "CDSE_TOTP") or None
-            logger.info("Using CDSE username/password from credentials file: %s", creds_path)
-            sess = _create_cdse_public_session(username=file_username, password=file_password, totp=file_totp)
-            _cache_cdse_public_credentials(username=file_username, password=file_password, totp=file_totp)
-            return sess
-        if file_username or file_password:
-            logger.warning(
-                _fmt_issue(
-                    "AUTH",
-                    "Incomplete CDSE username/password in credentials file; expected "
-                    "both username and password.",
-                )
+        file_access_token = _extract_cdse_credential_value(
+            file_creds,
+            "access_token",
+            "CDSE_ACCESS_TOKEN",
+            "cdse_access_token",
+            "token",
+        )
+        if file_access_token:
+            logger.info(
+                "Using non-renewable CDSE bearer token from credentials file: %s",
+                creds_path,
             )
+            return _create_cdse_bearer_session(file_access_token)
 
     return None
 
@@ -320,7 +518,7 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
 def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, Optional[str]]:
     stdin = getattr(sys, "stdin", None)
     if stdin is None or not callable(getattr(stdin, "isatty", None)) or not bool(stdin.isatty()):
-        raise RuntimeError(
+        raise CDSEAuthenticationError(
             _fmt_issue(
                 "AUTH",
                 "No interactive terminal available for CDSE username/password prompt. "
@@ -336,7 +534,7 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
             pwd = getpass.getpass("CDSE password: ")
             totp = input("CDSE TOTP (optional): ").strip() or None
         except EOFError as exc:
-            raise RuntimeError(
+            raise CDSEAuthenticationError(
                 _fmt_issue(
                     "AUTH",
                     "CDSE credential prompt reached EOF (non-interactive input stream). "
@@ -345,14 +543,21 @@ def _prompt_cdse_userpass_cli(max_prompt_attempts: int = 2) -> Tuple[str, str, O
                 )
             ) from exc
         except KeyboardInterrupt as exc:
-            raise RuntimeError(_fmt_issue("AUTH", "CDSE login cancelled by user.")) from exc
+            raise CDSEAuthenticationError(
+                _fmt_issue("AUTH", "CDSE login cancelled by user.")
+            ) from exc
 
         if user and pwd:
             return user, pwd, totp
 
-        logger.warning(_fmt_issue("AUTH", f"Username and password are required (attempt {attempt}/{attempts})."))
+        logger.warning(
+            _fmt_issue(
+                "AUTH",
+                f"Username and password are required (attempt {attempt}/{attempts}).",
+            )
+        )
 
-    raise RuntimeError(_fmt_issue("AUTH", "CDSE username/password were not provided."))
+    raise CDSEAuthenticationError(_fmt_issue("AUTH", "CDSE username/password were not provided."))
 
 
 def _prompt_cdse_userpass_gui() -> Tuple[str, str, Optional[str]]:
@@ -430,7 +635,7 @@ def _prompt_cdse_userpass_gui() -> Tuple[str, str, Optional[str]]:
             pass
 
     if not result["ok"]:
-        raise RuntimeError(_fmt_issue("AUTH", "CDSE login cancelled by user."))
+        raise CDSEAuthenticationError(_fmt_issue("AUTH", "CDSE login cancelled by user."))
 
     return result["username"], result["password"], (result["totp"] or None)
 
@@ -443,7 +648,7 @@ def _request_cdse_userpass(
         if prompt_userpass_fn is not None:
             return prompt_userpass_fn()
         if threading.current_thread() is not threading.main_thread():
-            raise RuntimeError(
+            raise CDSEAuthenticationError(
                 _fmt_issue(
                     "AUTH",
                     "GUI credential prompt requested from a worker thread. "
@@ -460,6 +665,7 @@ def _create_public_session_with_retry(
     max_prompt_attempts: int = 2,
     prompt_userpass_fn: Optional[PromptUserpassFn] = None,
 ) -> requests.Session:
+    last_error: Optional[Exception] = None
     cached_userpass = _get_cached_cdse_public_credentials()
     if cached_userpass is not None:
         user, pwd, totp = cached_userpass
@@ -474,8 +680,37 @@ def _create_public_session_with_retry(
                 )
             )
             _clear_cached_cdse_public_credentials()
+            last_error = exc
 
-    last_error: Optional[Exception] = None
+    configured_userpass = _resolve_configured_public_credentials(
+        include_env=True,
+        include_file=True,
+    )
+    if configured_userpass is not None:
+        user, pwd, totp, source = configured_userpass
+        try:
+            logger.info(
+                "Using configured CDSE username/password from %s for session refresh.",
+                source,
+            )
+            sess = _create_cdse_public_session(user, pwd, totp=totp)
+            _cache_cdse_public_credentials(
+                username=user,
+                password=pwd,
+                totp=totp,
+            )
+            return sess
+        except Exception as exc:
+            logger.warning(
+                _fmt_issue(
+                    "AUTH",
+                    f"Configured CDSE username/password from {source} failed ({exc}); "
+                    "requesting credentials again.",
+                )
+            )
+            _clear_cached_cdse_public_credentials()
+            last_error = exc
+
     attempts = max(1, int(max_prompt_attempts))
     for attempt in range(1, attempts + 1):
         try:
@@ -486,19 +721,29 @@ def _create_public_session_with_retry(
             sess = _create_cdse_public_session(user, pwd, totp=totp)
             _cache_cdse_public_credentials(username=user, password=pwd, totp=totp)
             return sess
+        except CDSEAuthenticationError as exc:
+            lower_msg = str(exc).lower()
+            if "cancelled" in lower_msg or "no interactive terminal" in lower_msg:
+                raise
+            last_error = exc
         except RuntimeError as exc:
             if "cancelled" in str(exc).lower():
-                raise
+                raise CDSEAuthenticationError(str(exc)) from exc
             last_error = exc
         except Exception as exc:
             last_error = exc
 
         if attempt < attempts:
             logger.warning(
-                _fmt_issue("AUTH", f"CDSE login failed (attempt {attempt}/{attempts}): {last_error}")
+                _fmt_issue(
+                    "AUTH",
+                    f"CDSE login failed (attempt {attempt}/{attempts}): {last_error}",
+                )
             )
 
-    raise RuntimeError(_fmt_issue("AUTH", f"CDSE username/password authentication failed: {last_error}"))
+    raise CDSEAuthenticationError(
+        _fmt_issue("AUTH", f"CDSE username/password authentication failed: {last_error}")
+    )
 
 
 def _create_cdse_session_with_retry(
@@ -517,15 +762,21 @@ def _create_cdse_session_with_retry(
 
 
 __all__ = [
+    "CDSEAuthenticationError",
     "_BearerAuth",
+    "_RefreshableBearerAuth",
     "_cache_cdse_public_credentials",
     "_clear_cached_cdse_public_credentials",
     "_create_cdse_bearer_session",
+    "_create_cdse_client_session",
     "_create_cdse_public_session",
+    "_create_cdse_refreshable_bearer_session",
     "_create_cdse_session_from_environment",
     "_create_cdse_session_with_retry",
     "_create_public_session_with_retry",
+    "_decode_jwt_exp",
     "_extract_cdse_credential_value",
+    "_force_refresh_cdse_session",
     "_generate_cdse_client_access_token",
     "_generate_cdse_public_access_token",
     "_get_cached_cdse_public_credentials",
