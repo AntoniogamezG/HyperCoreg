@@ -1,204 +1,473 @@
 # HyperCoreg
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/version-0.5.0-green.svg)](https://github.com/AntoniogamezG/HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 **Automated hyperspectral PRISMA and EnMAP to Sentinel-2 coregistration pipeline.**
 
-HyperCoreg is a Python tool that automatically aligns hyperspectral satellite imagery (PRISMA, EnMAP) to geometrically accurate Sentinel-2 reference data. It addresses significant geolocation errors in hyperspectral products (80-250m for PRISMA, 14-17m for EnMAP) to enable sub-pixel alignment for data fusion and multitemporal analysis.
+HyperCoreg aligns hyperspectral satellite imagery from PRISMA and EnMAP to geometrically accurate Sentinel-2 reference data. It is designed for scenes where hyperspectral products have meaningful geolocation errors and need sub-pixel alignment before data fusion, comparison, or multitemporal analysis.
 
-## Features
+## What HyperCoreg Does
 
-- **Multi-sensor support**: PRISMA (.he5) and EnMAP (SPECTRAL_IMAGE GeoTIFF)
-- **Automated Sentinel-2 reference selection**: Queries Copernicus Data Space Ecosystem (CDSE) for optimal reference scenes
-- **Robust tie point detection**: Multi-band feature matching using AROSICS
-- **Quality-driven processing**: MAD-based outlier filtering, spatial distribution analysis
-- **2nd-order polynomial warping**: Handles non-linear geometric distortions
-- **Auxiliary data processing**: Coregisters panchromatic bands and quality masks
-- **Comprehensive outputs**: GeoTIFF with spectral metadata, ENVI headers, quality reports
-- **Dual interface**: GUI for interactive use, CLI for automation/scripting
+- Supports PRISMA L2D `.he5` products.
+- Supports EnMAP `*-SPECTRAL_IMAGE.TIF`, `.TIFF`, and `.BSQ` products when the matching `*-METADATA.XML` file is available.
+- Searches Copernicus Data Space Ecosystem (CDSE) for Sentinel-2 L2A reference scenes, or uses a local Sentinel-2 stack when provided.
+- Detects tie points with AROSICS, filters outliers, and applies polynomial warping.
+- Writes coregistered GeoTIFF outputs, spectral metadata, ENVI headers, quicklooks, and processing reports.
+- Provides both a graphical interface and a command-line interface.
+
+## Before You Start
+
+You need:
+
+- A working Conda or Mamba installation. This is strongly recommended because GDAL is difficult to install reliably with plain pip.
+- Python 3.9, 3.10, or 3.11.
+- PRISMA or EnMAP input data.
+- CDSE credentials if you want HyperCoreg to download Sentinel-2 references automatically.
+- Enough disk space for temporary Sentinel-2 downloads, intermediate rasters, and output products.
+
+If you already have a local Sentinel-2 L2A reference stack, you can skip CDSE credentials by using `--local-s2-stack`.
 
 ## Installation
 
-### Recommended: Conda (handles GDAL dependencies)
+### 1. Clone And Enter The Repository
 
 ```bash
-# Open this folder
-cd Hypercoreg_StandardUser
+git clone https://github.com/AntoniogamezG/HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery.git
+cd HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery
+```
 
-# Create conda environment
+If you downloaded the repository as a ZIP file, extract it and open a terminal in the extracted folder.
+
+### 2. Create The Conda Environment
+
+```bash
 conda env create -f environment.yml
 conda activate hypercoreg
-
-# Install package
-pip install .
 ```
 
-### Alternative: pip (requires GDAL pre-installed)
+If the environment already exists and you want to refresh it:
 
 ```bash
-# Ensure GDAL is installed system-wide or via conda first
-pip install -r requirements.txt
-pip install .
+conda env update -f environment.yml --prune
+conda activate hypercoreg
 ```
 
-## Quick Start
+### 3. Install HyperCoreg
 
-### GUI Mode
+For normal use from this source checkout, install it in editable mode:
+
+```bash
+python -m pip install -e .
+```
+
+Editable mode keeps the installed command linked to this folder. If the code changes later, you do not need to reinstall after every edit.
+
+### 4. Verify The Installation
+
+Run these commands from the activated `hypercoreg` environment:
+
+```bash
+hypercoreg --help
+gdalwarp --version
+python -c "import hypercoreg; print(hypercoreg.__version__)"
+```
+
+You should see the HyperCoreg command help, a GDAL version, and the installed package version.
+
+### Pip-Only Installation
+
+Use this only if GDAL is already installed and available in your environment:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+If `rasterio`, `geopandas`, `arosics`, or `gdalwarp` fail to install or import, use the Conda installation above.
+
+## CDSE Credentials
+
+HyperCoreg can automatically search and download Sentinel-2 L2A reference scenes from the Copernicus Data Space Ecosystem. Create an account at [https://dataspace.copernicus.eu/](https://dataspace.copernicus.eu/) before running remote Sentinel-2 processing.
+
+The easiest option for most users is to set credentials as environment variables before running HyperCoreg.
+
+PowerShell:
+
+```powershell
+$env:CDSE_USERNAME="your-cdse-username"
+$env:CDSE_PASSWORD="your-cdse-password"
+```
+
+Bash or macOS/Linux terminal:
+
+```bash
+export CDSE_USERNAME="your-cdse-username"
+export CDSE_PASSWORD="your-cdse-password"
+```
+
+If your account uses a time-based one-time password, also set:
+
+```bash
+export CDSE_TOTP="123456"
+```
+
+HyperCoreg also supports CDSE OAuth client credentials:
+
+```bash
+export CDSE_CLIENT_ID="your-client-id"
+export CDSE_CLIENT_SECRET="your-client-secret"
+```
+
+For a persistent local setup, create `~/.hypercoreg/credentials.json`:
+
+```json
+{
+  "cdse": {
+    "username": "your-cdse-username",
+    "password": "your-cdse-password"
+  }
+}
+```
+
+or:
+
+```json
+{
+  "cdse": {
+    "client_id": "your-client-id",
+    "client_secret": "your-client-secret"
+  }
+}
+```
+
+You can store the file somewhere else by setting `HYPERCOREG_CREDENTIALS_FILE` to the full path.
+
+## Input Data
+
+### PRISMA
+
+Use the PRISMA L2D `.he5` file directly:
+
+```text
+PRS_L2D_STD_20230615_....he5
+```
+
+### EnMAP
+
+Use the EnMAP spectral image file. The matching metadata XML must be in the same product folder so HyperCoreg can detect and read the scene:
+
+```text
+ENMAP01-....-SPECTRAL_IMAGE.TIF
+ENMAP01-....-METADATA.XML
+```
+
+Supported spectral image extensions are `.TIF`, `.TIFF`, and `.BSQ`.
+
+### Batch Folders
+
+Batch mode searches recursively for:
+
+```text
+*.he5
+*.HE5
+*-SPECTRAL_IMAGE.tif
+*-SPECTRAL_IMAGE.TIF
+*-SPECTRAL_IMAGE.tiff
+*-SPECTRAL_IMAGE.TIFF
+*-SPECTRAL_IMAGE.bsq
+*-SPECTRAL_IMAGE.BSQ
+```
+
+## Running HyperCoreg
+
+### Option A: Graphical Interface
+
+Start the GUI:
+
+```bash
+hypercoreg-gui
+```
+
+If you are running directly from the source folder without using the installed command:
 
 ```bash
 python runGUI.py
 ```
 
-The GUI will guide you through:
-1. Selecting single file or batch mode
-2. Choosing input file/folder and output directory
-3. Configuring processing parameters
-4. Running the coregistration
+The GUI workflow is:
 
-### CLI Mode
+1. Select single-file mode or batch mode.
+2. Choose the PRISMA/EnMAP input file or input folder.
+3. Choose the output directory.
+4. Adjust processing options if needed.
+5. Run the coregistration and inspect the output folder.
+
+### Option B: Command Line
+
+Single PRISMA scene:
 
 ```bash
-# Single file processing
-python runCLI.py single -i /path/to/image.he5 -o /path/to/output
-
-# Batch processing
-python runCLI.py batch -i /path/to/input_folder -o /path/to/output
-
-# Accuracy-first processing
-python runCLI.py single -i image.he5 -o ./output --preset accuracy
-
-# Faster production processing
-python runCLI.py batch -i /path/to/input_folder -o ./output --preset fast
-
-# With custom parameters
-python runCLI.py single -i image.he5 -o ./output \
-    --days-window 60 \
-    --max-cloud 30 \
-    --min-tie-points 15
+hypercoreg single -i /path/to/PRS_L2D_STD_20230615.he5 -o /path/to/output
 ```
 
-### As a Python Library
+Single EnMAP scene:
+
+```bash
+hypercoreg single -i /path/to/ENMAP01-SPECTRAL_IMAGE.TIF -o /path/to/output
+```
+
+Batch processing:
+
+```bash
+hypercoreg batch -i /path/to/input_folder -o /path/to/output
+```
+
+Use `python runCLI.py` instead of `hypercoreg` if you prefer running from the repository folder:
+
+```bash
+python runCLI.py single -i /path/to/image.he5 -o /path/to/output
+```
+
+## Recommended Execution Recipes
+
+### Default Run
+
+Use this first when you are processing a normal scene and want balanced defaults:
+
+```bash
+hypercoreg single -i image.he5 -o ./output
+```
+
+### Faster Run
+
+Use this for quicker batch checks or production runs where you want fewer diagnostics:
+
+```bash
+hypercoreg batch -i ./input_scenes -o ./output --preset fast
+```
+
+### Accuracy-First Run
+
+Use this when quality is more important than runtime:
+
+```bash
+hypercoreg single -i image.he5 -o ./output --preset accuracy
+```
+
+### Run With A Local Sentinel-2 Stack
+
+Use this when you already have a Sentinel-2 L2A reference stack and do not want HyperCoreg to search or download from CDSE:
+
+```bash
+hypercoreg single -i image.he5 -o ./output --local-s2-stack /path/to/s2_l2a_stack.tif
+```
+
+The expected Sentinel-2 reflectance band order is:
+
+```text
+B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12
+```
+
+Optional trailing ancillary bands are accepted in this order:
+
+```text
+SCL, AOT, WVP
+```
+
+### Batch Run With Multiple Workers
+
+```bash
+hypercoreg batch -i ./input_scenes -o ./output --batch-workers 4
+```
+
+For multi-worker batch runs, set CDSE credentials with environment variables or `~/.hypercoreg/credentials.json` before starting. Interactive credential prompts are not suitable for parallel batch processing.
+
+### Useful Output Options
+
+```bash
+hypercoreg single -i image.he5 -o ./output \
+  --save-pre \
+  --save-pan \
+  --save-quality-mask \
+  --gen-tiepoint-pngs \
+  --build-overviews
+```
+
+Notes:
+
+- `--save-pan` applies to PRISMA panchromatic output.
+- `--save-quality-mask` saves PRISMA masks and EnMAP quicklook auxiliaries when available.
+- `--build-overviews` can make large GeoTIFFs easier to open in GIS software.
+- `--gen-tiepoint-pngs` is useful for quality control but adds runtime.
+
+## Common Parameters
+
+| Option | Default | What It Controls |
+|--------|---------|------------------|
+| `--preset` | `default` | Runtime preset: `default`, `fast`, or `accuracy`. |
+| `--days-window` | `30` | Sentinel-2 temporal search window in days. |
+| `--max-cloud` | `20` | Maximum Sentinel-2 cloud cover percentage. |
+| `--max-input-cloud` | `70` | Skip hyperspectral input scenes above this cloud percentage. |
+| `--min-overlap` | `0.5` | Minimum required spatial overlap with Sentinel-2. |
+| `--local-s2-stack` | none | Use a local Sentinel-2 stack instead of CDSE download. |
+| `--s2-cache-dir` | none | Directory for persistent Sentinel-2 reference stack cache. |
+| `--min-tie-points` | `10` | Minimum tie points required for processing. |
+| `--residual-threshold` | `25` | Maximum accepted tie point residual in meters. |
+| `--max-s2-candidates` | `3` | Number of Sentinel-2 candidates to evaluate. |
+| `--s2-band` | `8` | Sentinel-2 reference band: `2`, `3`, `4`, or `8`. |
+| `--normalization-mode` | `none` | Output normalization: `none`, `minmax`, or `percentile`. |
+| `--metadata-stats-mode` | `approx` | Metadata statistics mode: `exact`, `approx`, or `none`. |
+| `--validation-max-windows` | `64` | Final validation scan cap. Use `0` for full scan. |
+| `--batch-workers` | `1` | Number of worker processes in batch mode. |
+
+See all available options with:
+
+```bash
+hypercoreg single --help
+hypercoreg batch --help
+```
+
+## Python API
 
 ```python
 from hypercoreg import run_coregistration
 from hypercoreg.utils import detect_hyp_type
 
-# Detect sensor type
-hyp_type = detect_hyp_type("/path/to/image.he5")
+input_path = "/path/to/image.he5"
+output_dir = "/path/to/output"
 
-# Run coregistration
+hyp_type = detect_hyp_type(input_path)
+
 config = {
-    'days_window': 30,
-    'max_cloud': 20,
-    'min_overlap': 0.5,
-    'max_input_cloud_cover': 70.0,
+    "days_window": 30,
+    "max_cloud": 20,
+    "min_overlap": 0.5,
+    "max_input_cloud_cover": 70.0,
 }
-metrics = run_coregistration("/path/to/image.he5", hyp_type, "/path/to/output", config)
+
+metrics = run_coregistration(input_path, hyp_type, output_dir, config)
+print(metrics)
 ```
 
-## Configuration Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `days_window` | 30 | Temporal window for Sentinel-2 search (days) |
-| `min_overlap` | 0.5 | Minimum spatial overlap with S2 (0-1) |
-| `max_cloud` | 20 | Maximum cloud cover for S2 reference (%) |
-| `max_input_cloud_cover` | 70 | Skip input if cloud cover exceeds (%) |
-| `local_s2_stack_path` | `None` | Optional local Sentinel-2 L2A stack in canonical output order |
-| `residual_threshold` | 25 | Maximum acceptable tie point residual (m) |
-| `min_tie_points` | 10 | Minimum required tie points |
-| `max_s2_candidates` | 3 | Maximum S2 candidates to evaluate |
-| `residual_mad_factor` | 3.0 | MAD factor for outlier removal |
-| `s2_ref_band` | 8 | Sentinel-2 reference band (B08 NIR) |
-| `min_accuracy` | 70 | Minimum coregistration accuracy (%) |
-| `max_displacement` | 350 | Maximum allowed displacement (m) |
-| `normalization_mode` | `none` | Output normalization mode: `none`, `minmax`, `percentile` |
-| `metadata_stats_mode` | `approx` | PAM stats strategy: `exact`, `approx`, or `none` |
-| `enmap_metadata_stats_mode` | `none` | EnMAP-only PAM stats strategy override (`none` by default for faster EnMAP output) |
-| `validation_max_windows` | `64` | Final validation scan cap (`0` = full scan) |
-| `preset` | `default` | Named runtime preset: `default`, `fast`, or `accuracy`; explicit CLI flags override preset values |
-| `pan_gcp_mode` | `map_inverse` | PAN TPS GCP mode: `map_inverse` or `scaled_image` |
-| `pan_map_dxdy_source` | `auto` | Map-shift source for PAN scaled GCPs: `auto`, `xy_shift_m`, `zero` |
-| `pan_target_aligned_pixels` | `False` | Use GDAL `-tap` in PAN warp |
-| `pan_residual_check` | `False` | Optional post-warp PAN residual translation estimate |
-
-By default, ancillary outputs such as PRISMA PAN and quality auxiliaries are disabled. Enable them explicitly with `save_pan`, `save_quality_mask`, `--save-pan`, or `--save-quality-mask`.
-
-Sentinel-2 reference outputs are written as 12-band L2A spectral GeoTIFF stacks in this order: `B01, B02, B03, B04, B05, B06, B07, B08, B8A, B09, B11, B12`. `B10` is not included because Sentinel-2 Level-2A products do not provide it as surface reflectance. SCL is used internally for masking and valid-pixel scoring, but it is not persisted as a band in the reference stack.
-
-## CDSE Credentials
-
-HyperCoreg requires Copernicus Data Space Ecosystem (CDSE) credentials to download Sentinel-2 data.
-
-1. Register at [https://dataspace.copernicus.eu/](https://dataspace.copernicus.eu/)
-2. Create OAuth client credentials in your account settings
-
-Provide credentials via:
-- **Environment variables** (recommended):
-  ```bash
-  export CDSE_CLIENT_ID="your-client-id"
-  export CDSE_CLIENT_SECRET="your-client-secret"
-  ```
-- **Config file**: `~/.hypercoreg/credentials.json`
-- **GUI prompt**: Enter when prompted for the first time
-
 ## Output Structure
+
+HyperCoreg creates one scene folder per processed scene:
 
 ```text
 output_dir/
 |- PRISMA_YYMMDD_HASH/
-|  |- 00_inputs/       # Optional: pre-coreg raster when --save-pre is enabled
-|  |- 01_reference/
-|  |- 02_temp/
+|  |- 00_inputs/       # Optional pre-coreg raster when --save-pre is enabled
+|  |- 01_reference/    # Sentinel-2 reference products
+|  |- 02_temp/         # Temporary processing files
 |  |- 03_coreg/        # Coregistered outputs
-|  |  |- *_coreg.tif   # Coregistered hyperspectral data
-|  |  |- pan/          # Optional: coregistered PAN (PRISMA)
-|  |  `- quality/      # Optional: coregistered quality masks (PRISMA VNIR/SWIR)
-|  |- 04_reports/      # Metrics JSON, shift reports, per-scene *_DATASET.xlsx
-|  `- 05_quicklooks/   # PNG quicklooks (scene quicklook always, tiepoints optional)
-|- *_DATASET.xlsx      # Fallback per-scene dataset for early skip/fail before scene folder creation
-`- batch_summary.xlsx
+|  |  |- *_coreg.tif
+|  |  |- pan/          # Optional PRISMA PAN output
+|  |  `- quality/      # Optional quality auxiliaries
+|  |- 04_reports/      # Metrics JSON, reports, and per-scene *_DATASET.xlsx
+|  `- 05_quicklooks/   # PNG quicklooks and optional tie point plots
+|- *_DATASET.xlsx      # Fallback per-scene dataset for early skip/fail cases
+`- batch_summary.xlsx  # Batch summary when batch mode is used
 ```
 
-## PAN Alignment Notes
+The most important outputs for users are usually:
 
-If PRISMA PAN output still shows residual offset/distortion after HS coregistration, enable:
+- `03_coreg/*_coreg.tif`: the coregistered hyperspectral image.
+- `04_reports/`: processing metrics and quality reports.
+- `05_quicklooks/`: visual checks of the scene and optional tie points.
+- `batch_summary.xlsx`: batch-level status and metrics.
 
-- `pan_gcp_mode="scaled_image"`: builds PAN GCP pixel/line from tiepoint image coordinates (`X_IM`,`Y_IM`) scaled by HS/PAN resolution ratio instead of inverse map transform.
-- `pan_target_aligned_pixels=True`: enables GDAL `-tap` to stabilize grid alignment.
+## Troubleshooting
 
-Optional diagnostics:
+### `gdalwarp` Is Not Found
 
-- `pan_residual_check=True` (with `pan_residual_threshold_px`) runs a lightweight translation estimate and warns when residual shift is still high.
+Activate the Conda environment and check GDAL:
+
+```bash
+conda activate hypercoreg
+gdalwarp --version
+```
+
+If that fails, recreate or update the environment from `environment.yml`.
+
+### CDSE Authentication Fails
+
+Check that both parts of the credential pair are set:
+
+```bash
+echo $CDSE_USERNAME
+echo $CDSE_PASSWORD
+```
+
+In PowerShell:
+
+```powershell
+echo $env:CDSE_USERNAME
+echo $env:CDSE_PASSWORD
+```
+
+You can also avoid remote CDSE access by providing `--local-s2-stack`.
+
+### Batch Mode Finds No Files
+
+Confirm that the input folder contains supported files. For EnMAP, the spectral image filename must contain `SPECTRAL_IMAGE`, and the matching metadata XML must be available.
+
+### EnMAP Detection Fails
+
+Make sure the EnMAP spectral image and metadata file are from the same product and are kept together. HyperCoreg expects `SPECTRAL_IMAGE.TIF`, `.TIFF`, or `.BSQ` with a matching `-METADATA.XML`.
+
+### Processing Is Slow
+
+Try:
+
+```bash
+hypercoreg batch -i ./input_scenes -o ./output --preset fast
+```
+
+For batch processing, increase `--batch-workers` carefully. Large scenes and multiple workers can use substantial CPU, memory, and disk I/O.
+
+### Outputs Are Large Or Slow To Open
+
+Add internal overviews:
+
+```bash
+hypercoreg single -i image.he5 -o ./output --build-overviews
+```
 
 ## Requirements
 
-- Python 3.9+
+The primary dependency list is in `environment.yml`. Key dependencies include:
+
+- Python 3.9 to 3.11
 - GDAL 3.4+
-- See `environment.yml` for full dependency list
+- rasterio
+- geopandas
+- h5py
+- AROSICS
+- geoarray
+- numpy, scipy, pandas, matplotlib, openpyxl
 
 ## Citation
 
-If you use HyperCoreg in your research, please cite (TO CHECK):
+If you use HyperCoreg in your research, please cite:
 
 ```bibtex
 @software{hypercoreg,
   title = {HyperCoreg: Automated hyperspectral to Sentinel-2 coregistration},
   author = {HyperCoreg Contributors},
   year = {2024},
-  url = {https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP}
+  url = {https://github.com/AntoniogamezG/HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery}
 }
 ```
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- [AROSICS](https://github.com/GFZ/arosics) - Automated and Robust Open-Source Image Co-Registration Software
-- [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu/) - Sentinel-2 data access
-- ASI (Italian Space Agency) - PRISMA mission
-- DLR (German Aerospace Center) - EnMAP mission
-
+- [AROSICS](https://github.com/GFZ/arosics): Automated and Robust Open-Source Image Co-Registration Software.
+- [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu/): Sentinel-2 data access.
+- ASI, Italian Space Agency: PRISMA mission.
+- DLR, German Aerospace Center: EnMAP mission.
