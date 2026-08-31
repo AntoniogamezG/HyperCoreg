@@ -1,7 +1,7 @@
 # HyperCoreg
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-0.5.0-green.svg)](https://github.com/AntoniogamezG/HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery)
+[![Version](https://img.shields.io/badge/version-0.6.0-green.svg)](https://github.com/AntoniogamezG/HyperCoreg-An-Automated-Optimized-Pipeline-for-Co-Registering-PRISMA-and-EnMAP-Hyperspectral-Imagery)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#project-status)
 
@@ -18,6 +18,7 @@ is already available.
 
 - [Features](#features)
 - [Supported Inputs](#supported-inputs)
+- [PRISMA Radiometry](#prisma-radiometry)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
@@ -35,6 +36,8 @@ is already available.
 ## Features
 
 - PRISMA L2D `.he5` processing.
+- Product-specific PRISMA L2D decoding to unitless surface reflectance, with an
+  explicit native-DN compatibility mode.
 - EnMAP `*-SPECTRAL_IMAGE.TIF`, `.TIFF`, and `.BSQ` processing with matching
   `*-METADATA.XML`.
 - Automatic Sentinel-2 L2A search and download through CDSE.
@@ -54,6 +57,23 @@ is already available.
 
 Batch mode recursively searches for PRISMA `.he5` files and EnMAP
 `*-SPECTRAL_IMAGE.*` products.
+
+## PRISMA Radiometry
+
+PRISMA L2D samples are encoded `uint16` values. HyperCoreg now defaults to
+`reflectance` mode, which applies the VNIR, SWIR, and (when exported) PAN scale
+minimum and maximum stored in that exact source HE5 product. Outputs are
+`float32`, unitless surface reflectance when normalization is `none`.
+
+Use `--prisma-radiometric-mode native-dn` only when the previous encoded-value
+representation is required. This compatibility mode records the source gain
+and offset; it does not turn encoded samples into calibrated reflectance.
+
+PRISMA L2 decoding is independent of `--normalization-mode`. Min-max or
+percentile normalization is scene-dependent, so an output using either is
+labelled `normalized_unitless`, even when decoding occurred first. See
+[PRISMA L2D radiometry and migration](docs/PRISMA_RADIOMETRY.md) for the exact
+formula, output metadata contract, and guidance for legacy products.
 
 ## Installation
 
@@ -167,6 +187,7 @@ Common options:
 | `--residual-threshold` | `25` | Maximum accepted tie point residual in meters. |
 | `--max-s2-candidates` | `3` | Number of Sentinel-2 candidates to evaluate. |
 | `--s2-band` | `8` | Sentinel-2 reference band: `2`, `3`, `4`, or `8`. |
+| `--prisma-radiometric-mode` | `reflectance` | PRISMA L2D radiometry: product-decoded `reflectance` or legacy `native-dn`. |
 | `--normalization-mode` | `none` | Output normalization: `none`, `minmax`, or `percentile`. |
 | `--metadata-stats-mode` | `approx` | Metadata statistics mode: `exact`, `approx`, or `none`. |
 | `--validation-max-windows` | `64` | Final validation scan cap. Use `0` for a full scan. |
@@ -189,7 +210,8 @@ hypercoreg-gui
 
 The GUI supports single-scene and batch workflows, output directory selection,
 processing presets, CDSE access, optional local Sentinel-2 stacks, and quality
-control outputs.
+control outputs. For PRISMA input, choose `reflectance` or `native-dn` under
+**PRISMA radiometry**; normalization remains a separate control.
 
 ## CDSE Credentials
 
@@ -221,6 +243,13 @@ The main outputs are:
 - `04_reports/`: processing metrics and quality reports.
 - `05_quicklooks/`: visual quality checks.
 - `batch_summary.xlsx`: batch-level summary.
+
+PRISMA GeoTIFFs declare the radiometric quantity, units, decoding state, source
+coefficients, and detector-specific gain/offset in dataset and per-band
+metadata. The same radiometric contract is also recorded in each scene's
+metrics JSON and run manifest. Exported PAN quality is an aligned categorical
+mask: source flag `4` and pixels outside the warped footprint remain PAN
+NoData, while valid zero-DN pixels remain valid.
 
 ## Repository Layout
 
@@ -258,6 +287,8 @@ config = {
     "max_cloud": 20,
     "min_overlap": 0.5,
     "max_input_cloud_cover": 70.0,
+    "prisma_radiometric_mode": "reflectance",
+    "normalization_mode": "none",
 }
 
 metrics = run_coregistration(input_path, hyp_type, output_dir, config)

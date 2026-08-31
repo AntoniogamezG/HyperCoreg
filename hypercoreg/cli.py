@@ -734,6 +734,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         help="Keep all VNIR/SWIR bands (including overlap region)"
     )
     output_group.add_argument(
+        "--prisma-radiometric-mode",
+        type=str,
+        choices=["reflectance", "native-dn"],
+        default=None,
+        help=(
+            "PRISMA L2 radiometry: reflectance applies the per-product VNIR/SWIR/PAN "
+            "scale coefficients; native-dn retains legacy encoded values with scale/offset "
+            f"provenance (default: {DEFAULT_CONFIG['prisma_radiometric_mode']}). "
+            "This is independent of --normalization-mode."
+        ),
+    )
+    output_group.add_argument(
         "--normalization-mode",
         type=str,
         choices=["none", "minmax", "percentile"],
@@ -1006,6 +1018,7 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
             "remove_overlap_bands",
             "remove_detector_overlap_bands",
         ),
+        'prisma_radiometric_mode': _arg_value("prisma_radiometric_mode"),
         'normalization_mode': _arg_value("normalization_mode"),
         'norm_p_low': base_config['norm_p_low'],
         'norm_p_high': base_config['norm_p_high'],

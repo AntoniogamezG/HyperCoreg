@@ -18,6 +18,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional, Tuple
 
 from hypercoreg.path_utils import _portable_name, _portable_stem, _portable_suffix
+from hypercoreg.radiometry import prisma_radiometric_report_fields
 
 logger = logging.getLogger("COREG_PROCESSING")
 
@@ -29,6 +30,15 @@ DATASET_XLSX_COLUMNS: List[str] = [
     "prisma_date",
     "prisma_cloud_pct",
     "prisma_sea_pct",
+    "prisma_radiometric_mode",
+    "radiometric_quantity",
+    "prisma_l2_scaling_applied",
+    "prisma_l2_scale_vnir_min",
+    "prisma_l2_scale_vnir_max",
+    "prisma_l2_scale_swir_min",
+    "prisma_l2_scale_swir_max",
+    "prisma_l2_scale_pan_min",
+    "prisma_l2_scale_pan_max",
     "enmap_id",
     "enmap_date",
     "enmap_processing_version",
@@ -646,7 +656,12 @@ def _write_batch_summary_xlsx(
     wb.save(xlsx_path)
 
 
-def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_message: str) -> Dict[str, Any]:
+def _build_failed_scene_metrics(
+    hs_file: str,
+    hyp_type: Optional[str],
+    error_message: str,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     filename = _portable_name(hs_file)
     inferred_sensor = _infer_sensor_from_identifiers(hyp_type, None, filename)
     scene_name = _build_scene_output_name(hs_file, inferred_sensor)
@@ -658,6 +673,7 @@ def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_mes
         "status": "FAIL",
         "error": error_message,
         "notes": error_message,
+        **prisma_radiometric_report_fields(radiometric_contract),
     }
 
 
@@ -686,6 +702,7 @@ def _build_skip_result(
     validation_max_windows: int,
     extra_summary: Optional[Dict[str, Any]] = None,
     extra_metrics: Optional[Dict[str, Any]] = None,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     scene_name = _build_scene_output_name(hs_file, hyp_type, hs_time)
     filename = _portable_name(hs_file)
@@ -714,6 +731,7 @@ def _build_skip_result(
         "metadata_schema_version": METADATA_SCHEMA_VERSION,
         "metadata_status": "skipped",
         "metadata_warnings": [],
+        **prisma_radiometric_report_fields(radiometric_contract),
         "normalization_mode": str(normalization_mode),
         "normalization_params": dict(normalization_params),
         "build_overviews": bool(build_overviews),
@@ -768,6 +786,12 @@ def _build_skip_result(
             "bbox": list(bbox) if bbox is not None else None,
         },
         "config": _sanitize_config_for_manifest(config),
+        "processing": {
+            "prisma_radiometric_mode": (
+                radiometric_contract.get("mode") if radiometric_contract else None
+            ),
+            "radiometric": dict(radiometric_contract or {}),
+        },
         "summary": {"reason": reason},
     }
     if extra_summary:

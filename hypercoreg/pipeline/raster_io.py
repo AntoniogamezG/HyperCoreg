@@ -2094,6 +2094,7 @@ def _coregister_prisma_ancillary_outputs(
     arosics_cpus: int = 1,
     gdalwarp_multi: bool = True,
     gdalwarp_num_threads: str = "ALL_CPUS",
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate coregistered PRISMA ancillary outputs (PAN and quality masks)."""
     fmt_issue = _fmt_issue
@@ -2181,6 +2182,14 @@ def _coregister_prisma_ancillary_outputs(
                 dtype="float32",
                 nodata=processing_nodata,
             )
+            import rasterio
+
+            with rasterio.open(pan_src, "r+") as pan_src_dst:
+                _runtime._apply_prisma_radiometric_tags(
+                    pan_src_dst,
+                    radiometric_contract,
+                    ["PAN"],
+                )
             pan_xres, pan_yres = _infer_raster_native_resolution(
                 pan_src,
                 fallback=float(pan_geo_info.get("pixel_size_m", 5.0) or 5.0),
@@ -2368,6 +2377,13 @@ def _coregister_prisma_ancillary_outputs(
                 pan_order = 1
             if not pan_warp.get("success", False):
                 raise RuntimeError(pan_warp.get("error_message", "unknown PAN warp error"))
+
+            with rasterio.open(pan_out, "r+") as pan_out_dst:
+                _runtime._apply_prisma_radiometric_tags(
+                    pan_out_dst,
+                    radiometric_contract,
+                    ["PAN"],
+                )
 
             pan_check = _validate_ancillary_raster(pan_out, s2_crs)
             if not pan_check.get("ok", False):
@@ -2590,7 +2606,8 @@ _LOCAL_EXPORTS = {
     "_build_tps_gcps_for_source_raster",
     "_collect_pan_tiepoints_with_synthetic_reference",
     "_coregister_enmap_auxiliary_outputs",
-    "_coregister_prisma_ancillary_outputs",
+    # Keep the exported PRISMA ancillary path bound to runtime's canonical
+    # implementation, which owns radiometric tags and active scale/offsets.
     "_crs_equivalent",
     "_compute_band_statistics",
     "_create_synthetic_s2_pan",
@@ -2611,10 +2628,8 @@ _LOCAL_EXPORTS = {
     "_probe_raster_valid_pixels",
     "_remove_sidecar_if_exists",
     "_sanitize_raster_nonfinite_inplace",
-    "_stream_copy_raster_with_band_order",
     "_summarize_raster_grid",
     "_transforms_equivalent",
-    "_write_envi_header",
 }
 
 for _name in __all__:

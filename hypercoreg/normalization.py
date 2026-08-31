@@ -21,6 +21,19 @@ from hypercoreg.pipeline.raster_sanitize import _sanitize_raster_nonfinite_inpla
 
 ALLOWED_NORMALIZATION_MODES = {"none", "minmax", "percentile"}
 STALE_DERIVED_RASTER_BAND_METADATA_PREFIXES = ("STATISTICS_",)
+NORMALIZED_OUTPUT_STALE_DATASET_KEYS = {
+    "RADIOMETRIC_RESAMPLING_OVERSHOOT_POLICY",
+    "RADIOMETRIC_QUANTITY",
+    "RADIOMETRIC_UNITS",
+    "NORMALIZATION_MODE",
+}
+NORMALIZED_OUTPUT_STALE_BAND_KEYS = {
+    "INTERPOLATION_OVERSHOOTS_PRESERVED",
+    "SOURCE_VALID_RANGE_MIN",
+    "SOURCE_VALID_RANGE_MAX",
+    "RADIOMETRIC_QUANTITY",
+    "RADIOMETRIC_UNITS",
+}
 
 
 @dataclass
@@ -621,6 +634,10 @@ def _copy_dataset_metadata(
     src: rasterio.io.DatasetReader,
     dst: rasterio.io.DatasetWriter,
     source_band_indexes: Sequence[int],
+    *,
+    normalization_mode: Optional[str] = None,
+    normalization_clip: Optional[bool] = None,
+    normalization_params: Optional[NormalizationParams] = None,
 ) -> None:
     """Copy dataset-level tags and per-band descriptions/tags using a source-band mapping."""
     src_tags = filter_dataset_tags_for_raster_copy(
@@ -628,6 +645,56 @@ def _copy_dataset_metadata(
         output_band_count=int(dst.count),
         source_band_count=int(src.count),
     )
+    normalized_mode = normalize_mode(normalization_mode, default="none")
+    numeric_normalization_applied = normalized_mode != "none"
+    if numeric_normalization_applied:
+        dst.scales = tuple(1.0 for _ in source_band_indexes)
+        dst.offsets = tuple(0.0 for _ in source_band_indexes)
+    else:
+        dst.scales = tuple(float(src.scales[int(bidx) - 1]) for bidx in source_band_indexes)
+        dst.offsets = tuple(float(src.offsets[int(bidx) - 1]) for bidx in source_band_indexes)
+    rewrite_prisma_radiometric_contract = (
+        numeric_normalization_applied
+        and bool(str(src_tags.get("PRISMA_RADIOMETRIC_MODE", "")).strip())
+    )
+    if rewrite_prisma_radiometric_contract:
+        for key in list(src_tags):
+            normalized_key = str(key).strip().upper()
+            if (
+                normalized_key in NORMALIZED_OUTPUT_STALE_DATASET_KEYS
+                or normalized_key.startswith("RADIOMETRIC_RANGE_")
+                or normalized_key.startswith("NORM_")
+            ):
+                src_tags.pop(key, None)
+        clipping_state = (
+            "with_clipping" if normalization_clip is not False else "without_clipping"
+        )
+        src_tags.update(
+            {
+                "NORMALIZATION_MODE": normalized_mode,
+                "NORM_CLIP": str(normalization_clip is not False).lower(),
+                "RADIOMETRIC_QUANTITY": "normalized_unitless",
+                "RADIOMETRIC_UNITS": "1",
+                "RADIOMETRIC_RESAMPLING_OVERSHOOT_POLICY": (
+                    f"transformed_by_{normalized_mode}_normalization_{clipping_state}"
+                ),
+            }
+        )
+        if normalization_params is not None:
+            src_tags.update(
+                {
+                    "NORM_P_LOW": str(float(normalization_params.p_low)),
+                    "NORM_P_HIGH": str(float(normalization_params.p_high)),
+                    "NORM_EPS": str(float(normalization_params.eps)),
+                    "NORM_MIN_VALID_PIXELS": str(int(normalization_params.min_valid_pixels)),
+                    "NORM_RESERVOIR_SIZE": str(int(normalization_params.reservoir_size)),
+                    "NORM_SEED": str(int(normalization_params.seed)),
+                    "NORM_TILE_SIZE": str(int(normalization_params.tile_size)),
+                    "NORM_ESTIMATOR": (
+                        "reservoir" if normalized_mode == "percentile" else "none"
+                    ),
+                }
+            )
     src_tags["n_rows"] = str(int(dst.height))
     src_tags["n_cols"] = str(int(dst.width))
     src_tags["n_bands"] = str(int(dst.count))
@@ -644,6 +711,16 @@ def _copy_dataset_metadata(
         if desc:
             dst.set_band_description(out_bidx, desc)
         band_tags = filter_band_tags_for_raster_copy(src.tags(src_bidx))
+        if rewrite_prisma_radiometric_contract:
+            for key in list(band_tags):
+                if str(key).strip().upper() in NORMALIZED_OUTPUT_STALE_BAND_KEYS:
+                    band_tags.pop(key, None)
+            band_tags.update(
+                {
+                    "RADIOMETRIC_QUANTITY": "normalized_unitless",
+                    "RADIOMETRIC_UNITS": "1",
+                }
+            )
         if band_tags:
             dst.update_tags(out_bidx, **band_tags)
 
@@ -1064,7 +1141,14 @@ def normalize_raster_to_path(
 
             t0_apply = perf_counter()
             with rasterio.open(temp_output_path, "w", **out_profile) as dst:
-                _copy_dataset_metadata(src, dst, read_indexes)
+                _copy_dataset_metadata(
+                    src,
+                    dst,
+                    read_indexes,
+                    normalization_mode=params.mode,
+                    normalization_clip=params.clip,
+                    normalization_params=params,
+                )
 
                 apply_windows, apply_strategy = _iter_windows_for_dataset(src, params.tile_size)
                 if result.get("window_strategy") is None:

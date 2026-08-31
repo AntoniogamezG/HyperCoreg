@@ -132,6 +132,7 @@ def _build_gui_runtime_config(
         'save_pan': config_vars['save_pan'].get(),
         'save_quality_mask': config_vars['save_quality_mask'].get(),
         'remove_detector_overlap_bands': config_vars['remove_detector_overlap_bands'].get(),
+        'prisma_radiometric_mode': str(config_vars['prisma_radiometric_mode'].get()).strip().lower(),
         'normalization_mode': str(config_vars['normalization_mode'].get()).strip().lower(),
         'norm_p_low': DEFAULT_CONFIG['norm_p_low'],
         'norm_p_high': DEFAULT_CONFIG['norm_p_high'],
@@ -486,6 +487,7 @@ def _show_parameter_dialog(
         'save_pan': tk.BooleanVar(value=DEFAULT_CONFIG['save_pan']),
         'save_quality_mask': tk.BooleanVar(value=DEFAULT_CONFIG['save_quality_mask']),
         'remove_detector_overlap_bands': tk.BooleanVar(value=DEFAULT_CONFIG['remove_detector_overlap_bands']),
+        'prisma_radiometric_mode': tk.StringVar(value=DEFAULT_CONFIG['prisma_radiometric_mode']),
         'normalization_mode': tk.StringVar(value=DEFAULT_CONFIG['normalization_mode']),
         'build_overviews': tk.BooleanVar(value=DEFAULT_CONFIG['build_overviews']),
         'strict_metadata': tk.BooleanVar(value=DEFAULT_CONFIG['strict_metadata']),
@@ -640,7 +642,24 @@ def _show_parameter_dialog(
         cb = tk.Checkbutton(out_frame, text=label, variable=var, anchor='w')
         cb.grid(row=i, column=0, sticky='w', pady=2)
 
-    norm_row = len(checkboxes)
+    next_output_row = len(checkboxes)
+    if has_prisma_input:
+        tk.Label(out_frame, text="PRISMA radiometry:", anchor='w').grid(
+            row=next_output_row, column=0, sticky='w', pady=(10, 2)
+        )
+        prisma_radiometry_combo = ttk.Combobox(
+            out_frame,
+            state="readonly",
+            values=["reflectance", "native-dn"],
+            textvariable=config_vars['prisma_radiometric_mode'],
+            width=12,
+        )
+        prisma_radiometry_combo.grid(
+            row=next_output_row, column=1, sticky='w', padx=5, pady=(10, 2)
+        )
+        next_output_row += 1
+
+    norm_row = next_output_row
     tk.Label(out_frame, text="Normalization mode:", anchor='w').grid(
         row=norm_row, column=0, sticky='w', pady=(10, 2)
     )

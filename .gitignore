@@ -1,0 +1,90 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+
+# Test and coverage artifacts (keep the tests/ sources tracked)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+*.cover
+*.py,cover
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Virtual environments and local Python tooling
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.ipynb_checkpoints/
+
+# IDE and editor state
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs, temporary files, and local run output
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.pid
+*.pid.lock
+logs/
+tmp/
+temp/
+output/
+outputs/
+results/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local
+credentials.json
+secrets.json
+
+# Local satellite products and generated geospatial rasters
+*.he5
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.jp2
+*.vrt
+*.aux.xml
+*.ovr
+*.msk
+*.nc

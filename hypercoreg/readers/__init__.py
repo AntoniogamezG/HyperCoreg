@@ -7,6 +7,7 @@ This package provides readers for PRISMA and EnMAP hyperspectral data.
 from hypercoreg.readers.prisma import (
     read_prisma_cube_and_meta,
     read_prisma_pan_and_geo,
+    read_prisma_pan_quality_mask,
     read_prisma_quality_mask,
     extract_prisma_extended_metadata,
     estimate_prisma_geotransform,
@@ -27,6 +28,7 @@ __all__ = [
     # PRISMA
     "read_prisma_cube_and_meta",
     "read_prisma_pan_and_geo",
+    "read_prisma_pan_quality_mask",
     "read_prisma_quality_mask",
     "extract_prisma_extended_metadata",
     "estimate_prisma_geotransform",

@@ -306,6 +306,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'batch_workers': 1,
     'allow_gui_prompt': False,
     'remove_detector_overlap_bands': False,
+    # Product-defined PRISMA L2 decoding. This is independent of optional
+    # scene-dependent normalization below.
+    'prisma_radiometric_mode': "reflectance",
     'normalization_mode': "none",
     'norm_p_low': 2.0,
     'norm_p_high': 98.0,
@@ -576,6 +579,7 @@ class CoregConfig:
     batch_workers: int = 1
     allow_gui_prompt: bool = False
     remove_detector_overlap_bands: bool = False
+    prisma_radiometric_mode: str = "reflectance"
     normalization_mode: str = "none"
     norm_p_low: float = 2.0
     norm_p_high: float = 98.0
@@ -709,6 +713,7 @@ class CoregConfig:
             'batch_workers': self.batch_workers,
             'allow_gui_prompt': self.allow_gui_prompt,
             'remove_detector_overlap_bands': self.remove_detector_overlap_bands,
+            'prisma_radiometric_mode': self.prisma_radiometric_mode,
             'normalization_mode': self.normalization_mode,
             'norm_p_low': self.norm_p_low,
             'norm_p_high': self.norm_p_high,

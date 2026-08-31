@@ -39,6 +39,7 @@ import rasterio
 from rasterio.errors import RasterioIOError
 from rasterio import warp
 from rasterio.enums import Resampling
+from rasterio.fill import fillnodata
 from rasterio.transform import Affine, array_bounds, from_bounds as transform_from_bounds
 from rasterio.windows import Window, from_bounds
 from rasterio.plot import plotting_extent
@@ -82,8 +83,16 @@ from hypercoreg.normalization import (
 )
 from hypercoreg.readers.prisma import (
     estimate_prisma_geotransform, read_prisma_cube_and_meta,
-    read_prisma_pan_and_geo, read_prisma_quality_mask,
+    read_prisma_pan_and_geo, read_prisma_pan_quality_mask, read_prisma_quality_mask,
     extract_prisma_extended_metadata, check_cloud_threshold
+)
+from hypercoreg.radiometry import (
+    build_prisma_radiometric_contract,
+    normalize_prisma_radiometric_mode,
+    prisma_active_scale_offset,
+    prisma_radiometric_band_tags,
+    prisma_radiometric_dataset_tags,
+    prisma_radiometric_report_fields,
 )
 from hypercoreg.readers.enmap import (
     find_enmap_metadata_for_spectral_image, read_enmap_metadata,
@@ -151,6 +160,15 @@ DATASET_XLSX_COLUMNS: List[str] = [
     "prisma_date",
     "prisma_cloud_pct",
     "prisma_sea_pct",
+    "prisma_radiometric_mode",
+    "radiometric_quantity",
+    "prisma_l2_scaling_applied",
+    "prisma_l2_scale_vnir_min",
+    "prisma_l2_scale_vnir_max",
+    "prisma_l2_scale_swir_min",
+    "prisma_l2_scale_swir_max",
+    "prisma_l2_scale_pan_min",
+    "prisma_l2_scale_pan_max",
     "enmap_id",
     "enmap_date",
     "enmap_processing_version",
@@ -4903,6 +4921,38 @@ def _write_georeferenced_raster(
         dst.write(data)
 
 
+def _align_pan_quality_to_reference_grid(
+    quality_source_path: str,
+    reference_path: str,
+    output_path: str,
+) -> None:
+    """Nearest-neighbour align a categorical PAN matrix to a PAN work grid."""
+    with rasterio.open(quality_source_path) as src, rasterio.open(reference_path) as reference:
+        profile = reference.profile.copy()
+        profile.update(
+            driver="GTiff",
+            count=1,
+            dtype="uint8",
+            nodata=255,
+            compress="lzw",
+            tiled=True,
+            BIGTIFF="YES",
+        )
+        with rasterio.open(output_path, "w", **profile) as dst:
+            warp.reproject(
+                source=rasterio.band(src, 1),
+                destination=rasterio.band(dst, 1),
+                src_transform=src.transform,
+                src_crs=src.crs,
+                src_nodata=255,
+                dst_transform=reference.transform,
+                dst_crs=reference.crs,
+                dst_nodata=255,
+                resampling=Resampling.nearest,
+            )
+            dst.set_band_description(1, "PAN_PIXEL_L2_ERR_MATRIX")
+
+
 def _infer_raster_native_resolution(raster_path: str, fallback: float = 30.0) -> Tuple[float, float]:
     """Estimate raster native resolution from affine transform."""
     with rasterio.open(raster_path) as src:
@@ -6170,6 +6220,17 @@ def _stream_copy_raster_with_band_order(
                     if band_tags:
                         dst.update_tags(out_bidx, **band_tags)
 
+                # Preserve active scale/offset state whenever pixels are copied
+                # without a radiometric transform.  If gains/offsets are baked
+                # into the pixels, the resulting raster must advertise identity
+                # state to prevent downstream double application.
+                if apply_radiometry:
+                    dst.scales = tuple(1.0 for _ in src_bands)
+                    dst.offsets = tuple(0.0 for _ in src_bands)
+                else:
+                    dst.scales = tuple(float(src.scales[index - 1]) for index in src_bands)
+                    dst.offsets = tuple(float(src.offsets[index - 1]) for index in src_bands)
+
                 window_count = 0
                 for window in windows_iter:
                     window_count += 1
@@ -6706,6 +6767,11 @@ def _resample_raster_to_shared_grid(
                 )
                 if src_tags:
                     dst.update_tags(**src_tags)
+                # Reprojection changes the spatial grid, not the radiometric
+                # encoding.  Preserve active affine state so native PRISMA DN
+                # remains self-describing through detector harmonization.
+                dst.scales = tuple(float(value) for value in src.scales)
+                dst.offsets = tuple(float(value) for value in src.offsets)
 
                 for bidx in range(1, int(src.count) + 1):
                     for _block_idx, dst_window in dst.block_windows(bidx):
@@ -6973,6 +7039,24 @@ def _recombine_detector_branches_windowed(
                 )
                 if src_tags:
                     dst.update_tags(**src_tags)
+
+                combined_sources = (
+                    [(vsrc, index) for index in range(1, int(vsrc.count) + 1)]
+                    + [(ssrc, index) for index in range(1, int(ssrc.count) + 1)]
+                )
+                combined_scales: List[float] = []
+                combined_offsets: List[float] = []
+                for out_bidx, (branch_src, branch_bidx) in enumerate(combined_sources, start=1):
+                    description = branch_src.descriptions[branch_bidx - 1]
+                    if description:
+                        dst.set_band_description(out_bidx, description)
+                    band_tags = filter_band_tags_for_raster_copy(branch_src.tags(branch_bidx))
+                    if band_tags:
+                        dst.update_tags(out_bidx, **band_tags)
+                    combined_scales.append(float(branch_src.scales[branch_bidx - 1]))
+                    combined_offsets.append(float(branch_src.offsets[branch_bidx - 1]))
+                dst.scales = tuple(combined_scales)
+                dst.offsets = tuple(combined_offsets)
 
                 v_nodata = vsrc.nodata
                 s_nodata = ssrc.nodata
@@ -10715,6 +10799,9 @@ def _coregister_prisma_ancillary_outputs(
     arosics_cpus: int = CPUS_FOR_AROSICS,
     gdalwarp_multi: bool = True,
     gdalwarp_num_threads: str = "ALL_CPUS",
+    radiometric_contract: Optional[Dict[str, Any]] = None,
+    radiometric_validation_max_windows: int = 64,
+    pan_quality_data: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Generate coregistered ancillary outputs (PAN and quality masks)."""
     result: Dict[str, Any] = {
@@ -10722,6 +10809,7 @@ def _coregister_prisma_ancillary_outputs(
         "warnings": [],
         "outputs": {
             "pan": None,
+            "quality_pan": None,
             "quality_vnir": None,
             "quality_swir": None,
             "enmap_ql": {},
@@ -10732,6 +10820,8 @@ def _coregister_prisma_ancillary_outputs(
         "pan_gcp_mode": _normalize_pan_gcp_mode(pan_gcp_mode),
         "pan_target_aligned_pixels": bool(pan_target_aligned_pixels),
         "pan_residual_check": {"enabled": bool(pan_residual_check), "ok": None},
+        "pan_radiometric_range_validation": {"status": "not_applicable"},
+        "pan_quality_evidence": {"status": "not_requested"},
     }
     if not (save_pan or save_quality_mask):
         return result
@@ -10767,11 +10857,28 @@ def _coregister_prisma_ancillary_outputs(
 
     if save_pan:
         pan_out = os.path.join(pan_dir, f"{scene_name}_pan_coreg.tif")
+        pan_quality_out = os.path.join(quality_dir, f"{scene_name}_quality_pan_coreg.tif")
         pan_src = os.path.join(folder_struct["temp"], f"{scene_name}_PAN_src.tif")
+        pan_quality_src = os.path.join(folder_struct["temp"], f"{scene_name}_PAN_quality_src.tif")
+        pan_quality_aligned = os.path.join(
+            folder_struct["temp"], f"{scene_name}_PAN_quality_aligned.tif"
+        )
         synthetic_s2_pan_path = os.path.join(folder_struct["temp"], f"{scene_name}_S2_SYN_PAN.tif")
         pan_global_path = os.path.join(folder_struct["temp"], f"{scene_name}_PAN_GLOBAL_SYN.tif")
         pan_local_path = os.path.join(folder_struct["temp"], f"{scene_name}_PAN_LOCAL_SYN.tif")
-        pan_temp_paths = [synthetic_s2_pan_path, pan_global_path, pan_local_path, pan_src]
+        pan_temp_paths = [
+            synthetic_s2_pan_path,
+            pan_global_path,
+            pan_local_path,
+            pan_quality_aligned,
+            pan_quality_src,
+            pan_src,
+        ]
+        # Do not leave an earlier categorical result visible when the current
+        # product lacks a usable PCO error matrix.
+        _cleanup_raster_temp_outputs(pan_quality_out)
+        _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".hdr")))
+        _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".aux.xml")))
         try:
             if pan_data is None or pan_geo_info is None:
                 raise RuntimeError("PAN source data unavailable.")
@@ -10779,6 +10886,78 @@ def _coregister_prisma_ancillary_outputs(
             if pan_arr.ndim != 2:
                 raise RuntimeError(f"PAN array must be 2D; got shape {tuple(pan_arr.shape)}.")
             rows, cols = pan_arr.shape
+            pan_quality_arr: Optional[np.ndarray] = None
+            if pan_quality_data is None:
+                result["status"] = "degraded"
+                result["pan_quality_evidence"] = {
+                    "status": "unavailable",
+                    "expected_shape": [int(rows), int(cols)],
+                    "numeric_mask_applied": False,
+                }
+                result["warnings"].append(
+                    _fmt_issue(
+                        "ANCILLARY",
+                        "PRISMA PAN PIXEL_L2_ERR_MATRIX is unavailable; PAN values were not "
+                        "quality-masked and no categorical PAN quality output was produced.",
+                    )
+                )
+            else:
+                quality_candidate = np.asarray(pan_quality_data)
+                if quality_candidate.ndim != 2 or quality_candidate.shape != (rows, cols):
+                    result["status"] = "degraded"
+                    result["pan_quality_evidence"] = {
+                        "status": "shape_mismatch",
+                        "expected_shape": [int(rows), int(cols)],
+                        "observed_shape": [int(value) for value in quality_candidate.shape],
+                        "numeric_mask_applied": False,
+                    }
+                    result["warnings"].append(
+                        _fmt_issue(
+                            "ANCILLARY",
+                            "PRISMA PAN PIXEL_L2_ERR_MATRIX shape mismatch: expected "
+                            f"{(rows, cols)}, got {tuple(quality_candidate.shape)}; PAN values "
+                            "were not quality-masked and no categorical PAN quality output was produced.",
+                        )
+                    )
+                else:
+                    pan_quality_arr = quality_candidate.astype(np.uint8, copy=False)
+                    flag_counts = {
+                        str(flag): int(np.count_nonzero(pan_quality_arr == flag))
+                        for flag in range(5)
+                    }
+                    source_nodata_count = int(np.count_nonzero(pan_quality_arr == 255))
+                    unexpected_mask = ~np.isin(
+                        pan_quality_arr,
+                        np.asarray([0, 1, 2, 3, 4, 255], dtype=np.uint8),
+                    )
+                    unexpected_count = int(np.count_nonzero(unexpected_mask))
+                    if unexpected_count:
+                        unexpected_values = [
+                            int(value) for value in np.unique(pan_quality_arr[unexpected_mask])
+                        ]
+                        result["pan_quality_evidence"] = {
+                            "status": "invalid_categories",
+                            "shape": [int(rows), int(cols)],
+                            "unexpected_categories": unexpected_values,
+                            "unexpected_pixels": unexpected_count,
+                            "numeric_mask_applied": False,
+                        }
+                        raise RuntimeError(
+                            "PRISMA PAN PIXEL_L2_ERR_MATRIX contains unsupported categories "
+                            f"{unexpected_values}; expected 0, 1, 2, 3, 4, or 255."
+                        )
+                    del unexpected_mask
+                    flag_counts["255"] = source_nodata_count
+                    flag4_count = int(flag_counts["4"])
+                    result["pan_quality_evidence"] = {
+                        "status": "available",
+                        "shape": [int(rows), int(cols)],
+                        "flag_counts": flag_counts,
+                        "numeric_mask_applied": True,
+                        "numeric_mask_flag": 4,
+                        "numeric_pixels_masked": flag4_count + source_nodata_count,
+                        "source_nodata_pixels": source_nodata_count,
+                    }
             transform_pan = _estimate_transform_from_corner_coords(
                 {
                     **dict(pan_geo_info),
@@ -10787,7 +10966,59 @@ def _coregister_prisma_ancillary_outputs(
                 },
                 s2_crs,
             )
-            pan_clean = np.where(np.isfinite(pan_arr), pan_arr, PROCESSING_NODATA).astype(np.float32)
+            pan_for_warp = np.asarray(pan_arr, dtype=np.float32)
+            if pan_quality_arr is not None:
+                # PRISMA's current PCO legend identifies flag 4 as NaN/Inf.
+                # Flags 1-3 are retained as valid numeric observations and,
+                # in particular, native DN value zero remains valid.  Fill the
+                # sparse flag-4 holes from neighbouring valid samples before
+                # cubic warping; inserting the numeric nodata sentinel here
+                # contaminates cubic kernels.  The categorical warp below
+                # restores flag 4 (and the outside footprint) to numeric
+                # nodata on the exact final grid.
+                interpolation_mask = (
+                    np.isfinite(pan_for_warp)
+                    & np.isin(
+                        pan_quality_arr,
+                        np.asarray([0, 1, 2, 3], dtype=np.uint8),
+                    )
+                ).astype(np.uint8)
+                invalid_source_mask = interpolation_mask == 0
+                pan_fill_source = pan_for_warp.copy()
+                # Make an unfilled hole detectable. GDAL FillNodata otherwise
+                # leaves the original finite encoded value in a hole that has
+                # no valid neighbour within the configured search radius.
+                pan_fill_source[invalid_source_mask] = np.nan
+                pan_for_warp = fillnodata(
+                    pan_fill_source,
+                    mask=interpolation_mask,
+                    max_search_distance=100.0,
+                    smoothing_iterations=0,
+                ).astype(np.float32, copy=False)
+                unfilled_source_pixels = int(
+                    np.count_nonzero(invalid_source_mask & ~np.isfinite(pan_for_warp))
+                )
+                result["pan_quality_evidence"].update(
+                    {
+                        "prewarp_hole_fill": "inverse_distance_from_valid_pan_pixels",
+                        "prewarp_hole_fill_max_search_distance_pixels": 100,
+                        "prewarp_hole_fill_unfilled_pixels": unfilled_source_pixels,
+                    }
+                )
+                if unfilled_source_pixels:
+                    result["pan_quality_evidence"]["status"] = "prefill_failed"
+                    raise RuntimeError(
+                        "PAN quality masking left "
+                        f"{unfilled_source_pixels} source pixels without a valid interpolation "
+                        "neighbour inside the 100-pixel search radius; refusing to warp "
+                        "source-invalid numeric values."
+                    )
+            pan_valid = np.isfinite(pan_for_warp)
+            pan_clean = np.where(
+                pan_valid,
+                pan_for_warp,
+                PROCESSING_NODATA,
+            ).astype(np.float32, copy=False)
             _write_georeferenced_raster(
                 pan_src,
                 pan_clean[np.newaxis, :, :],
@@ -10796,6 +11027,23 @@ def _coregister_prisma_ancillary_outputs(
                 dtype="float32",
                 nodata=PROCESSING_NODATA,
             )
+            if pan_quality_arr is not None:
+                _write_georeferenced_raster(
+                    pan_quality_src,
+                    pan_quality_arr[np.newaxis, :, :],
+                    s2_crs,
+                    transform_pan,
+                    dtype="uint8",
+                    nodata=255,
+                )
+                with rasterio.open(pan_quality_src, "r+") as pan_quality_src_dst:
+                    pan_quality_src_dst.set_band_description(1, "PAN_PIXEL_L2_ERR_MATRIX")
+            with rasterio.open(pan_src, "r+") as pan_src_dst:
+                _apply_prisma_radiometric_tags(
+                    pan_src_dst,
+                    radiometric_contract,
+                    ["PAN"],
+                )
             pan_xres, pan_yres = _infer_raster_native_resolution(
                 pan_src,
                 fallback=float(pan_geo_info.get("pixel_size_m", 5.0) or 5.0),
@@ -10977,6 +11225,250 @@ def _coregister_prisma_ancillary_outputs(
             if not pan_warp.get("success", False):
                 raise RuntimeError(pan_warp.get("error_message", "unknown PAN warp error"))
 
+            if pan_quality_arr is not None:
+                try:
+                    pan_quality_warp_source = pan_quality_src
+                    if os.path.abspath(pan_warp_source) != os.path.abspath(pan_src):
+                        _align_pan_quality_to_reference_grid(
+                            pan_quality_src,
+                            pan_warp_source,
+                            pan_quality_aligned,
+                        )
+                        pan_quality_warp_source = pan_quality_aligned
+
+                    with rasterio.open(pan_out) as accepted_pan:
+                        accepted_pan_bounds = tuple(float(value) for value in accepted_pan.bounds)
+
+                    pan_quality_warp = _apply_polynomial_warp(
+                        input_raster=pan_quality_warp_source,
+                        output_raster=pan_quality_out,
+                        gcps=pan_gcps,
+                        target_crs=s2_crs,
+                        polynomial_order=pan_order,
+                        output_resolution=pan_res,
+                        nodata=255,
+                        resampling="near",
+                        s2_bounds=accepted_pan_bounds,
+                        gdalwarp_multi=bool(gdalwarp_multi),
+                        gdalwarp_num_threads=gdal_threads,
+                    )
+                    if not pan_quality_warp.get("success", False):
+                        raise RuntimeError(
+                            pan_quality_warp.get(
+                                "error_message", "unknown PAN quality warp error"
+                            )
+                        )
+
+                    observed_categories = set()
+                    with rasterio.open(pan_out) as accepted_pan, rasterio.open(
+                        pan_quality_out, "r+"
+                    ) as quality_dst:
+                        same_grid = (
+                            int(quality_dst.width) == int(accepted_pan.width)
+                            and int(quality_dst.height) == int(accepted_pan.height)
+                            and quality_dst.crs == accepted_pan.crs
+                            and quality_dst.transform.almost_equals(accepted_pan.transform)
+                        )
+                        if not same_grid:
+                            raise RuntimeError(
+                                "PAN quality warp grid differs from the accepted PAN output grid."
+                            )
+                        if quality_dst.dtypes[0] != "uint8" or quality_dst.nodata != 255:
+                            raise RuntimeError(
+                                "PAN quality output must be uint8 with NoData=255; got "
+                                f"dtype={quality_dst.dtypes[0]}, nodata={quality_dst.nodata}."
+                            )
+                        quality_dst.set_band_description(1, "PAN_PIXEL_L2_ERR_MATRIX")
+                        quality_dst.update_tags(
+                            SENSOR="PRISMA",
+                            QUALITY_MATRIX="PIXEL_L2_ERR_MATRIX",
+                            QUALITY_SOURCE_DATASET=(
+                                "HDFEOS/SWATHS/PRS_L2D_PCO/Data Fields/"
+                                "PIXEL_L2_ERR_MATRIX"
+                            ),
+                            QUALITY_FLAG_LEGEND=(
+                                "0=OK;1=KDP;2=Saturation;3=Low confidence;"
+                                "4=NaN/Inf;255=NoData"
+                            ),
+                            QUALITY_RESAMPLING="nearest",
+                            PAN_NUMERIC_NODATA_FLAG="4",
+                            PAN_NUMERIC_OUTSIDE_FOOTPRINT_NODATA_FLAG="255",
+                        )
+                        quality_dst.update_tags(
+                            1,
+                            SOURCE_BAND_NAME="PAN_PIXEL_L2_ERR_MATRIX",
+                            QUALITY_FLAG_LEGEND=(
+                                "0=OK;1=KDP;2=Saturation;3=Low confidence;"
+                                "4=NaN/Inf;255=NoData"
+                            ),
+                        )
+                        for _block_index, block_window in quality_dst.block_windows(1):
+                            observed_categories.update(
+                                int(value)
+                                for value in np.unique(
+                                    quality_dst.read(1, window=block_window, masked=False)
+                                )
+                            )
+
+                    postwarp_flag4_pixels = 0
+                    postwarp_outside_pixels = 0
+                    postwarp_pixels_set_nodata = 0
+                    with rasterio.open(pan_quality_out) as quality_src, rasterio.open(
+                        pan_out, "r+"
+                    ) as numeric_pan_dst:
+                        numeric_nodata = numeric_pan_dst.nodata
+                        if numeric_nodata is None or not np.isfinite(float(numeric_nodata)):
+                            raise RuntimeError(
+                                "PAN numeric output must have a finite NoData value before quality masking."
+                            )
+                        numeric_nodata = float(numeric_nodata)
+                        for _block_index, block_window in quality_src.block_windows(1):
+                            quality_block = quality_src.read(
+                                1,
+                                window=block_window,
+                                masked=False,
+                            )
+                            numeric_block = numeric_pan_dst.read(
+                                1,
+                                window=block_window,
+                                masked=False,
+                            )
+                            flag4_mask = quality_block == 4
+                            outside_mask = quality_block == 255
+                            invalid_mask = flag4_mask | outside_mask
+                            postwarp_flag4_pixels += int(np.count_nonzero(flag4_mask))
+                            postwarp_outside_pixels += int(np.count_nonzero(outside_mask))
+                            postwarp_pixels_set_nodata += int(
+                                np.count_nonzero(
+                                    invalid_mask & (numeric_block != numeric_nodata)
+                                )
+                            )
+                            if np.any(invalid_mask):
+                                numeric_block[invalid_mask] = numeric_nodata
+                                numeric_pan_dst.write(
+                                    numeric_block,
+                                    1,
+                                    window=block_window,
+                                )
+
+                    quality_check = _validate_ancillary_raster(pan_quality_out, s2_crs)
+                    if not quality_check.get("ok", False):
+                        raise RuntimeError(
+                            quality_check.get(
+                                "error", "PAN quality output validation failed"
+                            )
+                        )
+                    quality_sidecar = _finalize_pipeline_sidecars(
+                        tif_path=pan_quality_out,
+                        sensor_type="PRISMA",
+                        artifact_role=ARTIFACT_ROLE_QUALITY_MASK,
+                        wl=None,
+                        fwhm=None,
+                        band_names=None,
+                        band_detectors=None,
+                        strict_metadata=True,
+                    )
+                    if not quality_sidecar.get("ok", False):
+                        err = "; ".join(
+                            list(
+                                quality_sidecar.get("errors", [])
+                                or ["unknown PAN quality metadata error"]
+                            )
+                        )
+                        raise RuntimeError(err)
+                    result["outputs"]["quality_pan"] = pan_quality_out
+                    result["pan_quality_evidence"].update(
+                        {
+                            "status": "exported",
+                            "output": pan_quality_out,
+                            "resampling": "nearest",
+                            "nodata": 255,
+                            "polynomial_order": int(pan_order),
+                            "output_resolution": float(pan_res),
+                            "grid_matches_pan": True,
+                            "observed_output_categories": sorted(observed_categories),
+                            "postwarp_numeric_mask_applied": True,
+                            "postwarp_flag4_pixels": int(postwarp_flag4_pixels),
+                            "postwarp_outside_footprint_pixels": int(postwarp_outside_pixels),
+                            "postwarp_pixels_set_nodata": int(postwarp_pixels_set_nodata),
+                        }
+                    )
+                except Exception as quality_exc:
+                    result["status"] = "degraded"
+                    result["pan_quality_evidence"].update(
+                        {
+                            "status": "export_failed",
+                            "error": str(quality_exc),
+                            "postwarp_numeric_mask_applied": False,
+                            "numeric_output_withheld": True,
+                        }
+                    )
+                    result["warnings"].append(
+                        _fmt_issue(
+                            "ANCILLARY",
+                            f"PAN categorical quality ancillary output failed: {quality_exc}",
+                        )
+                    )
+                    _cleanup_raster_temp_outputs(pan_quality_out)
+                    _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".hdr")))
+                    _remove_sidecar_if_exists(
+                        str(Path(pan_quality_out).with_suffix(".aux.xml"))
+                    )
+                    raise RuntimeError(
+                        "PAN categorical quality could not be aligned/applied; "
+                        "numeric PAN output was withheld to avoid publishing unmasked "
+                        "source-invalid pixels."
+                    ) from quality_exc
+
+            with rasterio.open(pan_out, "r+") as pan_out_dst:
+                _apply_prisma_radiometric_tags(
+                    pan_out_dst,
+                    radiometric_contract,
+                    ["PAN"],
+                )
+
+            pan_range_validation = _assess_prisma_radiometric_range(
+                pan_out,
+                radiometric_contract,
+                ["PAN"],
+                max_windows=radiometric_validation_max_windows,
+            )
+            result["pan_radiometric_range_validation"] = pan_range_validation
+            if radiometric_contract is not None:
+                radiometric_contract["range_validation"] = pan_range_validation
+                with rasterio.open(pan_out, "r+") as pan_out_dst:
+                    _apply_prisma_radiometric_tags(
+                        pan_out_dst,
+                        radiometric_contract,
+                        ["PAN"],
+                    )
+            if pan_range_validation.get("status") == "error":
+                result["warnings"].append(
+                    _fmt_issue(
+                        "ANCILLARY",
+                        "PAN radiometric range validation failed: "
+                        f"{pan_range_validation.get('error', 'unknown error')}",
+                    )
+                )
+            elif (
+                int(pan_range_validation.get("sampled_below_range_band_pixels", 0)) > 0
+                or int(pan_range_validation.get("sampled_above_range_band_pixels", 0)) > 0
+            ):
+                result["warnings"].append(
+                    _fmt_issue(
+                        "ANCILLARY",
+                        "PAN cubic-resampling overshoots were preserved and observed in checked "
+                        "blocks "
+                        f"(sampled_below_band_pixels="
+                        f"{int(pan_range_validation.get('sampled_below_range_band_pixels', 0))}, "
+                        f"sampled_above_band_pixels="
+                        f"{int(pan_range_validation.get('sampled_above_range_band_pixels', 0))}, "
+                        f"blocks={int(pan_range_validation.get('blocks_scanned', 0))}/"
+                        f"{int(pan_range_validation.get('blocks_total', 0))}, "
+                        f"basis={pan_range_validation.get('sampling_basis', 'unknown')}).",
+                    )
+                )
+
             pan_check = _validate_ancillary_raster(pan_out, s2_crs)
             if not pan_check.get("ok", False):
                 raise RuntimeError(pan_check.get("error", "PAN output validation failed"))
@@ -11037,6 +11529,10 @@ def _coregister_prisma_ancillary_outputs(
                     )
         except Exception as e:
             result["status"] = "degraded"
+            result["outputs"]["pan"] = None
+            _cleanup_raster_temp_outputs(pan_out)
+            _remove_sidecar_if_exists(str(Path(pan_out).with_suffix(".hdr")))
+            _remove_sidecar_if_exists(str(Path(pan_out).with_suffix(".aux.xml")))
             result["warnings"].append(_fmt_issue("ANCILLARY", f"PAN ancillary output failed: {e}"))
         finally:
             for tmp_path in pan_temp_paths:
@@ -11790,6 +12286,172 @@ def _assess_final_tiff_compatibility(path: str) -> Dict[str, Any]:
         return result
 
 
+def _assess_prisma_radiometric_range(
+    tif_path: str,
+    radiometric_contract: Optional[Dict[str, Any]],
+    band_detectors: Sequence[str],
+    max_windows: int = 64,
+) -> Dict[str, Any]:
+    """Inspect preserved interpolation overshoots without clipping pixels.
+
+    A bounded scan samples blocks deterministically across the complete block
+    sequence, including both spatial ends when at least two blocks are read.
+    Counts are explicitly reported as sampled band-pixel observations; block
+    and spatial-pixel coverage make it clear that they are not raster totals.
+    ``max_windows <= 0`` requests a full block scan.
+    """
+    result: Dict[str, Any] = {
+        "status": "not_applicable",
+        "sampling_basis": None,
+        "sampled_below_range_band_pixels": 0,
+        "sampled_above_range_band_pixels": 0,
+        "sampled_nonfinite_band_pixels": 0,
+        "sampled_valid_band_pixels": 0,
+        "sampled_band_pixels_read": 0,
+        "blocks_scanned": 0,
+        "blocks_total": 0,
+        "block_coverage_fraction": 0.0,
+        "spatial_pixels_scanned": 0,
+        "spatial_pixels_total": 0,
+        "spatial_coverage_fraction": 0.0,
+        "selected_block_indices": [],
+        "truncated": False,
+        "by_detector": {},
+    }
+    if not radiometric_contract:
+        return result
+    quantity = str(radiometric_contract.get("quantity", ""))
+    if quantity not in {"surface_reflectance", "native_encoded_dn"}:
+        return result
+
+    try:
+        with rasterio.open(tif_path) as src:
+            detectors = [str(value).upper() for value in band_detectors]
+            if len(detectors) != int(src.count):
+                raise ValueError(
+                    f"Radiometric range detector count mismatch: raster={src.count}, metadata={len(detectors)}"
+                )
+            all_blocks = list(src.block_windows(1))
+            total_blocks = len(all_blocks)
+            if total_blocks <= 0:
+                raise ValueError("Radiometric range validation found no raster blocks")
+            limit = int(max_windows)
+            if limit <= 0 or limit >= total_blocks:
+                selected_indices = list(range(total_blocks))
+                sampling_basis = "full_raster_block_scan"
+            elif limit == 1:
+                selected_indices = [total_blocks // 2]
+                sampling_basis = "deterministic_spatially_distributed_block_sample"
+            else:
+                selected_indices = [
+                    int(value)
+                    for value in np.rint(
+                        np.linspace(0, total_blocks - 1, num=limit, endpoint=True)
+                    ).astype(np.int64)
+                ]
+                sampling_basis = "deterministic_spatially_distributed_block_sample"
+
+            selected_windows = [all_blocks[index][1] for index in selected_indices]
+            spatial_pixels_scanned = int(
+                sum(int(window.width) * int(window.height) for window in selected_windows)
+            )
+            spatial_pixels_total = int(src.width) * int(src.height)
+            result.update(
+                {
+                    "sampling_basis": sampling_basis,
+                    "blocks_scanned": len(selected_windows),
+                    "blocks_total": total_blocks,
+                    "block_coverage_fraction": float(len(selected_windows) / total_blocks),
+                    "spatial_pixels_scanned": spatial_pixels_scanned,
+                    "spatial_pixels_total": spatial_pixels_total,
+                    "spatial_coverage_fraction": float(
+                        spatial_pixels_scanned / spatial_pixels_total
+                    ),
+                    "selected_block_indices": selected_indices,
+                    "truncated": len(selected_windows) < total_blocks,
+                    "sampled_band_pixels_read": spatial_pixels_scanned * int(src.count),
+                }
+            )
+            nodata = src.nodata
+            scales = radiometric_contract.get("scales", {}) or {}
+
+            for bidx, detector in enumerate(detectors, start=1):
+                scale = scales.get(detector)
+                if not scale:
+                    raise ValueError(f"Missing radiometric scale for output detector {detector}")
+                if quantity == "native_encoded_dn":
+                    lower, upper = 0.0, 65535.0
+                else:
+                    lower = float(scale["minimum"])
+                    upper = float(scale["maximum"])
+                tolerance = max(
+                    np.finfo(np.float32).eps * max(1.0, abs(lower), abs(upper)) * 8.0,
+                    abs(upper - lower) * 1e-7,
+                )
+                detector_result = result["by_detector"].setdefault(
+                    detector,
+                    {
+                        "sampled_below_range_band_pixels": 0,
+                        "sampled_above_range_band_pixels": 0,
+                        "sampled_nonfinite_band_pixels": 0,
+                        "sampled_valid_band_pixels": 0,
+                        "tolerance": float(tolerance),
+                    },
+                )
+                for window in selected_windows:
+                    values = src.read(bidx, window=window, masked=False)
+                    finite = np.isfinite(values)
+                    nonfinite_count = int(np.count_nonzero(~finite))
+                    valid = finite
+                    if nodata is not None and np.isfinite(float(nodata)):
+                        valid &= values != float(nodata)
+                    valid_values = values[valid]
+                    below = int(np.count_nonzero(valid_values < lower - tolerance))
+                    above = int(np.count_nonzero(valid_values > upper + tolerance))
+                    valid_count = int(valid_values.size)
+                    detector_result["sampled_below_range_band_pixels"] += below
+                    detector_result["sampled_above_range_band_pixels"] += above
+                    detector_result["sampled_nonfinite_band_pixels"] += nonfinite_count
+                    detector_result["sampled_valid_band_pixels"] += valid_count
+                    result["sampled_below_range_band_pixels"] += below
+                    result["sampled_above_range_band_pixels"] += above
+                    result["sampled_nonfinite_band_pixels"] += nonfinite_count
+                    result["sampled_valid_band_pixels"] += valid_count
+            result["status"] = "ok"
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+    return result
+
+
+def _apply_prisma_radiometric_tags(
+    dst: Any,
+    radiometric_contract: Optional[Dict[str, Any]],
+    band_detectors: Sequence[str],
+) -> None:
+    """Attach PRISMA radiometric tags and active GDAL scale/offset state."""
+    if not radiometric_contract:
+        return
+    detectors = [str(value).upper() for value in band_detectors]
+    if int(dst.count) != len(detectors):
+        raise ValueError(
+            f"Radiometric detector count mismatch: raster={int(dst.count)}, metadata={len(detectors)}"
+        )
+    dst.update_tags(**prisma_radiometric_dataset_tags(radiometric_contract))
+    active_scales: List[float] = []
+    active_offsets: List[float] = []
+    for bidx, detector in enumerate(detectors, start=1):
+        dst.update_tags(
+            bidx,
+            **prisma_radiometric_band_tags(radiometric_contract, detector),
+        )
+        scale, offset = prisma_active_scale_offset(radiometric_contract, detector)
+        active_scales.append(float(scale))
+        active_offsets.append(float(offset))
+    dst.scales = tuple(active_scales)
+    dst.offsets = tuple(active_offsets)
+
+
 def _write_geotiff_band_metadata(
     tif_path,
     sensor_type,
@@ -11804,6 +12466,7 @@ def _write_geotiff_band_metadata(
     label_precision=2,
     metadata_extension_level="stats",
     metadata_histogram_buckets=64,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ):
     """Write per-band descriptions and tags into GeoTIFF for QGIS/ENVI visibility."""
     result = {"ok": False, "warnings": [], "errors": []}
@@ -11847,6 +12510,8 @@ def _write_geotiff_band_metadata(
                 ),
                 wavelength_units="Nanometers",
             )
+            if str(sensor_type).upper() == "PRISMA":
+                _apply_prisma_radiometric_tags(dst, radiometric_contract, band_detectors)
 
             for i in range(n_bands):
                 bidx = i + 1
@@ -11951,6 +12616,14 @@ def _write_envi_header(
                 fwhm_str = ", ".join([f"{float(f):.2f}" for f in spectral_meta["fwhm"]])
                 lines.append(f"fwhm = {{{fwhm_str}}}")
             lines.append(f"sensor type = {str(sensor_type)}")
+            raster_tags = src.tags()
+            radiometric_quantity = raster_tags.get("RADIOMETRIC_QUANTITY")
+            if radiometric_quantity == "surface_reflectance":
+                lines.append("data units = Reflectance")
+            elif radiometric_quantity == "native_encoded_dn":
+                lines.append("data units = DN")
+            elif radiometric_quantity == "normalized_unitless":
+                lines.append("data units = Unitless")
             if band_name_result["band_names"] is not None:
                 bn_str = ", ".join(list(band_name_result["band_names"]))
                 lines.append(f"band names = {{{bn_str}}}")
@@ -12212,6 +12885,7 @@ def _write_pam_aux_xml(
     label_precision: int = 2,
     nodata_value: float = PROCESSING_NODATA,
     band_stats: Optional[List[Dict[str, Any]]] = None,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a GDAL PAM .aux.xml sidecar with per-band stats and optional histograms."""
     result = {"ok": False, "warnings": [], "errors": [], "raster_passes": 0}
@@ -12295,6 +12969,9 @@ def _write_pam_aux_xml(
                 "METADATA_LABEL_PRECISION",
                 int(_safe_parse_int(label_precision, 2, "metadata_label_precision")),
             )
+            if str(sensor_type).upper() == "PRISMA":
+                for tag_key, tag_value in prisma_radiometric_dataset_tags(radiometric_contract).items():
+                    _append_pam_mdi(dataset_metadata, tag_key, tag_value)
 
             nodata = src.nodata
             if nodata is None and nodata_value is not None:
@@ -12314,6 +12991,12 @@ def _write_pam_aux_xml(
                 if fwhm_arr is not None and np.isfinite(float(fwhm_arr[i])):
                     _append_pam_mdi(band_meta, "FWHM_NM", f"{float(fwhm_arr[i]):.2f}")
                 _append_pam_mdi(band_meta, "SOURCE_BAND_NAME", str(names_list[i]))
+                if str(sensor_type).upper() == "PRISMA":
+                    for tag_key, tag_value in prisma_radiometric_band_tags(
+                        radiometric_contract,
+                        detector,
+                    ).items():
+                        _append_pam_mdi(band_meta, tag_key, tag_value)
 
                 if include_stats:
                     sampled_values: Optional[np.ndarray] = None
@@ -12939,6 +13622,7 @@ def _write_failed_scene_artifacts(
     bbox: Any = None,
     candidate_errors: Optional[List[Dict[str, Any]]] = None,
     keep_temp_files: bool = False,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write scene-local failure reports and clean temp output when a scene aborts."""
     reports_dir = folder_struct.get("reports") or os.path.join(folder_struct.get("scene_root", ""), "04_reports")
@@ -12953,7 +13637,12 @@ def _write_failed_scene_artifacts(
         _build_dataset_xlsx_filename(scene_name=scene_name, filename=filename),
     )
 
-    metrics = _build_failed_scene_metrics(hs_file, hyp_type, reason)
+    metrics = _build_failed_scene_metrics(
+        hs_file,
+        hyp_type,
+        reason,
+        radiometric_contract=radiometric_contract,
+    )
     metrics.update(
         {
             "scene_name": scene_name,
@@ -12998,6 +13687,12 @@ def _write_failed_scene_artifacts(
             "bbox": list(bbox) if bbox is not None else None,
         },
         "config": _sanitize_config_for_manifest(config),
+        "processing": {
+            "prisma_radiometric_mode": (
+                radiometric_contract.get("mode") if radiometric_contract else None
+            ),
+            "radiometric": dict(radiometric_contract or {}),
+        },
         "summary": {
             "reason": reason,
             "candidate_errors": list(candidate_errors or []),
@@ -13029,7 +13724,12 @@ def _candidate_passes_final_quality(candidate: Dict[str, Any]) -> bool:
     return True
 
 
-def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_message: str) -> Dict[str, Any]:
+def _build_failed_scene_metrics(
+    hs_file: str,
+    hyp_type: Optional[str],
+    error_message: str,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Create a minimal metrics payload for fallback FAIL dataset workbook rows."""
     filename = _portable_name(hs_file)
     inferred_sensor = _infer_sensor_from_identifiers(hyp_type, None, filename)
@@ -13042,6 +13742,7 @@ def _build_failed_scene_metrics(hs_file: str, hyp_type: Optional[str], error_mes
         "status": "FAIL",
         "error": error_message,
         "notes": error_message,
+        **prisma_radiometric_report_fields(radiometric_contract),
     }
 
 
@@ -13070,6 +13771,7 @@ def _build_skip_result(
     validation_max_windows: int,
     extra_summary: Optional[Dict[str, Any]] = None,
     extra_metrics: Optional[Dict[str, Any]] = None,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create metrics + manifest for early scene skip conditions."""
     scene_name = _build_scene_output_name(hs_file, hyp_type, hs_time)
@@ -13110,6 +13812,7 @@ def _build_skip_result(
         'metadata_schema_version': METADATA_SCHEMA_VERSION,
         'metadata_status': 'skipped',
         'metadata_warnings': [],
+        **prisma_radiometric_report_fields(radiometric_contract),
         'normalization_mode': str(normalization_mode),
         'normalization_params': dict(normalization_params),
         'build_overviews': bool(build_overviews),
@@ -13166,6 +13869,12 @@ def _build_skip_result(
             "bbox": list(bbox) if bbox is not None else None,
         },
         "config": _sanitize_config_for_manifest(config),
+        "processing": {
+            "prisma_radiometric_mode": (
+                radiometric_contract.get("mode") if radiometric_contract else None
+            ),
+            "radiometric": dict(radiometric_contract or {}),
+        },
         "summary": {"reason": reason},
     }
     if extra_summary:
@@ -13492,6 +14201,13 @@ def _save_precoreg_output(
     wl: np.ndarray,
     source_bands_1based: Optional[Sequence[int]] = None,
     strict_metadata: bool = True,
+    fwhm: Optional[np.ndarray] = None,
+    band_names: Optional[Sequence[str]] = None,
+    band_detectors: Optional[Sequence[str]] = None,
+    normalization_mode: str = "none",
+    normalization_params: Optional[Dict[str, Any]] = None,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
+    remove_detector_overlap: bool = False,
 ) -> str:
     """Save pre-coreg raster output, applying optional EnMAP band selection/reorder."""
     if not source_path or not os.path.exists(source_path):
@@ -13517,14 +14233,30 @@ def _save_precoreg_output(
                 raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to save pre-coreg output: {err}"))
             if not os.path.exists(output_path):
                 raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to write pre-coreg output: {output_path}"))
+            geotiff_result = _write_geotiff_band_metadata(
+                output_path,
+                sensor_type,
+                wl,
+                fwhm,
+                band_names,
+                band_detectors,
+                normalization_mode=normalization_mode,
+                normalization_params=normalization_params,
+                remove_detector_overlap=remove_detector_overlap,
+                metadata_extension_level="none",
+                radiometric_contract=radiometric_contract,
+            )
+            if not geotiff_result.get("ok", False):
+                err = "; ".join(list(geotiff_result.get("errors", []) or ["unknown pre-coreg tag error"]))
+                raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to tag pre-coreg output: {err}"))
             sidecar_result = _finalize_pipeline_sidecars(
                 tif_path=output_path,
                 sensor_type=str(sensor_type),
                 artifact_role=ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
                 wl=wl,
-                fwhm=None,
-                band_names=None,
-                band_detectors=None,
+                fwhm=fwhm,
+                band_names=band_names,
+                band_detectors=band_detectors,
                 strict_metadata=bool(strict_metadata),
             )
             if not sidecar_result.get("ok", False):
@@ -13548,14 +14280,30 @@ def _save_precoreg_output(
             raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to save pre-coreg output: {err}"))
         if not os.path.exists(output_path):
             raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to write pre-coreg output: {output_path}"))
+        geotiff_result = _write_geotiff_band_metadata(
+            output_path,
+            sensor_type,
+            wl,
+            fwhm,
+            band_names,
+            band_detectors,
+            normalization_mode=normalization_mode,
+            normalization_params=normalization_params,
+            remove_detector_overlap=remove_detector_overlap,
+            metadata_extension_level="none",
+            radiometric_contract=radiometric_contract,
+        )
+        if not geotiff_result.get("ok", False):
+            err = "; ".join(list(geotiff_result.get("errors", []) or ["unknown pre-coreg tag error"]))
+            raise RuntimeError(_fmt_issue("PRE_COREG", f"Failed to tag pre-coreg output: {err}"))
         sidecar_result = _finalize_pipeline_sidecars(
             tif_path=output_path,
             sensor_type=str(sensor_type),
             artifact_role=ARTIFACT_ROLE_PRE_COREG_SPECTRAL,
             wl=wl,
-            fwhm=None,
-            band_names=None,
-            band_detectors=None,
+            fwhm=fwhm,
+            band_names=band_names,
+            band_detectors=band_detectors,
             strict_metadata=bool(strict_metadata),
         )
         if not sidecar_result.get("ok", False):
@@ -13591,6 +14339,8 @@ def _finalize_coreg_output(
     metadata_label_precision=2,
     build_overviews=False,
     timing_logs=True,
+    radiometric_contract: Optional[Dict[str, Any]] = None,
+    radiometric_validation_max_windows: int = 64,
 ):
     """Finalize coregistration output with metadata."""
     t0_total = perf_counter()
@@ -13795,6 +14545,40 @@ def _finalize_coreg_output(
         band_stats = list(rewrite_result.get("band_statistics", []))
         output_validation = dict(rewrite_result.get("output_validation", {}))
         raster_passes = int(rewrite_result.get("raster_passes", 0))
+        if str(hyp_type).upper() == "PRISMA" and radiometric_contract:
+            range_validation = _assess_prisma_radiometric_range(
+                output_path,
+                radiometric_contract,
+                band_detectors,
+                max_windows=radiometric_validation_max_windows,
+            )
+            radiometric_contract["range_validation"] = range_validation
+            if range_validation.get("status") != "not_applicable":
+                raster_passes += 1
+            if range_validation.get("status") == "error":
+                warning = _fmt_issue(
+                    "RADIOMETRY",
+                    f"Radiometric range validation failed: {range_validation.get('error', 'unknown error')}",
+                )
+                all_warnings.append(warning)
+            elif (
+                int(range_validation.get("sampled_below_range_band_pixels", 0)) > 0
+                or int(range_validation.get("sampled_above_range_band_pixels", 0)) > 0
+            ):
+                logger.warning(
+                    _fmt_issue(
+                        "RADIOMETRY",
+                        "Preserved cubic-resampling overshoots were observed outside the source "
+                        "detector range in checked blocks "
+                        f"(sampled_below_band_pixels="
+                        f"{int(range_validation.get('sampled_below_range_band_pixels', 0))}, "
+                        f"sampled_above_band_pixels="
+                        f"{int(range_validation.get('sampled_above_range_band_pixels', 0))}, "
+                        f"blocks={int(range_validation.get('blocks_scanned', 0))}/"
+                        f"{int(range_validation.get('blocks_total', 0))}, "
+                        f"basis={range_validation.get('sampling_basis', 'unknown')}).",
+                    )
+                )
 
         if build_overviews:
             logger.info("Building internal GeoTIFF overviews (levels: 2,4,8,16,32).")
@@ -13833,6 +14617,7 @@ def _finalize_coreg_output(
             label_precision=metadata_label_precision,
             metadata_extension_level=metadata_extension_level,
             metadata_histogram_buckets=metadata_histogram_buckets,
+            radiometric_contract=radiometric_contract,
         )
         all_warnings.extend(list(geotiff_result.get("warnings", [])))
         if not geotiff_result.get("ok", False):
@@ -13911,6 +14696,7 @@ def _finalize_coreg_output(
                 label_precision=metadata_label_precision,
                 nodata_value=PROCESSING_NODATA,
                 band_stats=band_stats if band_stats else None,
+                radiometric_contract=radiometric_contract,
             )
             all_warnings.extend(list(pam_result.get("warnings", [])))
             if not pam_result.get("ok", False):
@@ -14417,6 +15203,17 @@ def run_coregistration(
     allow_gui_prompt = config.get('allow_gui_prompt', False)
     prompt_userpass_fn = config.get('prompt_userpass_fn')
     remove_detector_overlap_bands = config.get('remove_detector_overlap_bands', False)
+    prisma_radiometric_mode: Optional[str] = None
+    if str(hyp_type).upper() == "PRISMA":
+        prisma_radiometric_mode = normalize_prisma_radiometric_mode(
+            config.get(
+                'prisma_radiometric_mode',
+                DEFAULT_CONFIG.get('prisma_radiometric_mode', 'reflectance'),
+            )
+        )
+        # Persist the resolved default in scene/batch manifests even when callers
+        # supplied a sparse direct-API configuration.
+        config['prisma_radiometric_mode'] = prisma_radiometric_mode
     normalization_params = _build_normalization_params_from_config(config)
     normalization_mode = str(normalization_params.mode)
     build_overviews = config.get('build_overviews', False)
@@ -14607,6 +15404,7 @@ def run_coregistration(
 
     logger.info(f"Parameters: days_window={days_window}, max_cloud={max_cloud}, "
                 f"residual_threshold={residual_threshold}, "
+                f"prisma_radiometric_mode={prisma_radiometric_mode}, "
                 f"normalization_mode={normalization_mode}, "
                 f"build_overviews={build_overviews}, "
                 f"metadata_extension_level={metadata_extension_level}, "
@@ -14672,21 +15470,52 @@ def run_coregistration(
     _emit_progress(progress_callback, "Reading hyperspectral data", scene_idx=scene_idx, scene_total=scene_total)
     log_section_header("READING HYPERSPECTRAL DATA")
 
-    pan_data, pan_geo_info = None, None
+    pan_data, pan_geo_info, pan_quality_data = None, None, None
     vnir_quality_data, swir_quality_data, lat_qm, lon_qm = None, None, None, None
     enmap_sort_idx = None
     enmap_meta_merged: Dict[str, Any] = {}
     enmap_processing_source_path = hs_file
+    prisma_radiometric_contract: Optional[Dict[str, Any]] = None
+    prisma_source_radiometric_contract: Optional[Dict[str, Any]] = None
+    prisma_pan_radiometric_contract: Optional[Dict[str, Any]] = None
 
     if hyp_type == "PRISMA":
         cube, wl, hs_time, bbox, lat, lon, fwhm, band_names, band_detectors = read_prisma_cube_and_meta(
             hs_file,
-            remove_detector_overlap=remove_detector_overlap_bands
+            remove_detector_overlap=remove_detector_overlap_bands,
+            radiometric_mode=prisma_radiometric_mode,
         )
         extended_meta = extract_prisma_extended_metadata(hs_file)
+        prisma_radiometric_contract = build_prisma_radiometric_contract(
+            extended_meta,
+            prisma_radiometric_mode,
+            normalization_mode=normalization_mode,
+            normalization_clip=bool(normalization_params.clip),
+            spatial_resampling_kernel="cubic;bilinear_if_detector_grid_harmonization",
+            require_pan=bool(save_pan),
+        )
+        prisma_source_radiometric_contract = build_prisma_radiometric_contract(
+            extended_meta,
+            prisma_radiometric_mode,
+            normalization_mode="none",
+            spatial_resampling_kernel="none",
+            require_pan=False,
+        )
+        if save_pan:
+            prisma_pan_radiometric_contract = build_prisma_radiometric_contract(
+                extended_meta,
+                prisma_radiometric_mode,
+                normalization_mode="none",
+                spatial_resampling_kernel="cubic",
+                require_pan=True,
+            )
 
         if save_pan:
-            pan_data, pan_geo_info = read_prisma_pan_and_geo(hs_file)
+            pan_data, pan_geo_info = read_prisma_pan_and_geo(
+                hs_file,
+                radiometric_mode=prisma_radiometric_mode,
+            )
+            pan_quality_data = read_prisma_pan_quality_mask(hs_file)
         if save_quality_mask:
             vnir_quality_data, swir_quality_data, lat_qm, lon_qm = read_prisma_quality_mask(hs_file)
     else:
@@ -14908,6 +15737,7 @@ def run_coregistration(
             metadata_histogram_buckets=metadata_histogram_buckets,
             metadata_label_precision=metadata_label_precision,
             validation_max_windows=validation_max_windows,
+            radiometric_contract=prisma_radiometric_contract,
             extra_summary={
                 "cloud_pct": cloud_pct,
                 "cloud_threshold_pct": max_input_cloud,
@@ -14962,6 +15792,7 @@ def run_coregistration(
             bbox=bbox,
             candidate_errors=candidate_errors,
             keep_temp_files=bool(keep_temp_files),
+            radiometric_contract=prisma_radiometric_contract,
         )
         if exc_cls is SceneProcessingError:
             raise SceneProcessingError(str(reason), metrics=metrics)
@@ -15325,6 +16156,11 @@ def run_coregistration(
                 with rasterio.open(temp_hs_path, 'w', **profile) as dst:
                     cube_bip = np.transpose(cube, (2, 0, 1)).astype(PROCESSING_DTYPE)
                     dst.write(cube_bip, indexes=list(range(1, cube.shape[2] + 1)))
+                    _apply_prisma_radiometric_tags(
+                        dst,
+                        prisma_source_radiometric_contract,
+                        band_detectors,
+                    )
                 candidate_band_limit = int(n_bands_total)
             else:
                 # EnMAP
@@ -15730,6 +16566,16 @@ def run_coregistration(
     _emit_progress(progress_callback, "Finalizing output", scene_idx=scene_idx, scene_total=scene_total)
     status_code = "SUCCESS" if final_success else "FAIL"
     final_source_path = accepted_source_path if accepted_source_path and os.path.exists(accepted_source_path) else None
+    if hyp_type == "PRISMA" and final_source_path:
+        # GDAL/AROSICS branch warps do not reliably carry band-level scale and
+        # offset metadata.  Restore the unnormalized source contract before
+        # any downstream copy or optional normalization step.
+        with rasterio.open(final_source_path, "r+") as accepted_prisma_dst:
+            _apply_prisma_radiometric_tags(
+                accepted_prisma_dst,
+                prisma_source_radiometric_contract,
+                band_detectors,
+            )
     metadata_status = "failed"
     metadata_warnings = []
     metadata_schema_version = METADATA_SCHEMA_VERSION
@@ -15741,6 +16587,7 @@ def run_coregistration(
         "warnings": [],
         "outputs": {
             "pan": None,
+            "quality_pan": None,
             "quality_vnir": None,
             "quality_swir": None,
             "enmap_ql": {},
@@ -15748,6 +16595,8 @@ def run_coregistration(
         },
         "warp_method": None,
         "tiepoints_used": 0,
+        "pan_radiometric_range_validation": {"status": "not_applicable"},
+        "pan_quality_evidence": {"status": "not_requested"},
     }
 
     if final_source_path and os.path.exists(final_source_path):
@@ -15784,6 +16633,8 @@ def run_coregistration(
                     metadata_histogram_buckets=metadata_histogram_buckets,
                     metadata_label_precision=metadata_label_precision,
                     timing_logs=timing_logs,
+                    radiometric_contract=prisma_radiometric_contract,
+                    radiometric_validation_max_windows=validation_max_windows,
                 )
             except Exception as exc:
                 _raise_scene_failure(str(exc))
@@ -15878,6 +16729,23 @@ def run_coregistration(
                     else None
                 ),
                 strict_metadata=bool(strict_metadata),
+                fwhm=fwhm,
+                band_names=band_names,
+                band_detectors=band_detectors,
+                normalization_mode="none",
+                normalization_params={
+                    "mode": "none",
+                    "p_low": float(normalization_params.p_low),
+                    "p_high": float(normalization_params.p_high),
+                    "clip": bool(normalization_params.clip),
+                    "eps": float(normalization_params.eps),
+                    "min_valid_pixels": int(normalization_params.min_valid_pixels),
+                    "reservoir_size": int(normalization_params.reservoir_size),
+                    "seed": int(normalization_params.seed),
+                    "tile_size": int(normalization_params.tile_size),
+                },
+                radiometric_contract=prisma_source_radiometric_contract,
+                remove_detector_overlap=remove_detector_overlap_bands,
             )
 
         if (
@@ -15991,6 +16859,7 @@ def run_coregistration(
                 save_quality_mask=bool(save_quality_mask),
                 pan_data=pan_data,
                 pan_geo_info=pan_geo_info,
+                pan_quality_data=pan_quality_data,
                 vnir_quality_data=vnir_quality_data,
                 swir_quality_data=swir_quality_data,
                 lat_qm=lat_qm,
@@ -16017,6 +16886,8 @@ def run_coregistration(
                 arosics_cpus=int(arosics_cpus),
                 gdalwarp_multi=bool(gdalwarp_multi),
                 gdalwarp_num_threads=gdalwarp_num_threads,
+                radiometric_contract=prisma_pan_radiometric_contract,
+                radiometric_validation_max_windows=validation_max_windows,
             )
             for anc_warning in ancillary_result.get("warnings", []):
                 logger.warning(anc_warning)
@@ -16089,6 +16960,19 @@ def run_coregistration(
         'prisma_date': extended_meta.get('prisma_date'),
         'prisma_cloud_pct': extended_meta.get('prisma_cloud_pct'),
         'prisma_sea_pct': extended_meta.get('prisma_sea_pct'),
+        'prisma_radiometric_mode': prisma_radiometric_mode,
+        'radiometric_quantity': (
+            prisma_radiometric_contract.get("quantity") if prisma_radiometric_contract else None
+        ),
+        'prisma_l2_scaling_applied': (
+            prisma_radiometric_contract.get("l2_scaling_applied") if prisma_radiometric_contract else None
+        ),
+        'prisma_l2_scale_vnir_min': extended_meta.get('prisma_l2_scale_vnir_min'),
+        'prisma_l2_scale_vnir_max': extended_meta.get('prisma_l2_scale_vnir_max'),
+        'prisma_l2_scale_swir_min': extended_meta.get('prisma_l2_scale_swir_min'),
+        'prisma_l2_scale_swir_max': extended_meta.get('prisma_l2_scale_swir_max'),
+        'prisma_l2_scale_pan_min': extended_meta.get('prisma_l2_scale_pan_min'),
+        'prisma_l2_scale_pan_max': extended_meta.get('prisma_l2_scale_pan_max'),
         'enmap_id': extended_meta.get('enmap_id'),
         'enmap_date': extended_meta.get('enmap_date'),
         'enmap_processing_version': extended_meta.get('enmap_processing_version'),
@@ -16168,6 +17052,7 @@ def run_coregistration(
         'metadata_schema_version': metadata_schema_version,
         'metadata_status': metadata_status,
         'metadata_warnings': metadata_warnings,
+        'radiometric': dict(prisma_radiometric_contract or {}),
         'normalization_mode': normalization_mode,
         'normalization_params': {
             "mode": str(normalization_mode),
@@ -16207,6 +17092,10 @@ def run_coregistration(
         'pan_residual_check_enabled': bool(pan_residual_check),
         'pan_residual_threshold_px': float(pan_residual_threshold_px),
         'pan_residual_estimate': dict(ancillary_result.get("pan_residual_check", {})),
+        'pan_radiometric_range_validation': dict(
+            ancillary_result.get("pan_radiometric_range_validation", {})
+        ),
+        'pan_quality_evidence': dict(ancillary_result.get("pan_quality_evidence", {})),
         'ancillary_status': ancillary_result.get("status", "not_requested"),
         'ancillary_warp_method': ancillary_result.get("warp_method"),
         'ancillary_tiepoints_used': ancillary_result.get("tiepoints_used", 0),
@@ -16291,6 +17180,8 @@ def run_coregistration(
         "processing": {
             "metadata_status": metadata_status,
             "metadata_warnings": metadata_warnings,
+            "prisma_radiometric_mode": prisma_radiometric_mode,
+            "radiometric": dict(prisma_radiometric_contract or {}),
             "normalization_mode": normalization_mode,
             "normalization_params": {
                 "mode": str(normalization_mode),
@@ -16330,6 +17221,10 @@ def run_coregistration(
             "pan_residual_check_enabled": bool(pan_residual_check),
             "pan_residual_threshold_px": float(pan_residual_threshold_px),
             "pan_residual_estimate": dict(ancillary_result.get("pan_residual_check", {})),
+            "pan_radiometric_range_validation": dict(
+                ancillary_result.get("pan_radiometric_range_validation", {})
+            ),
+            "pan_quality_evidence": dict(ancillary_result.get("pan_quality_evidence", {})),
             "prefer_fixed_band_pairs": bool(prefer_fixed_band_pairs),
             "fixed_band_pairs_by_sensor": fixed_band_pairs_by_sensor,
             "bandpair_wavelength_window_nm": float(bandpair_wavelength_window_nm),
