@@ -33,7 +33,11 @@ def _sanitize_raster_nonfinite_inplace(
                 return result
 
             src_nodata = dst.nodata
-            write_nodata = float(src_nodata) if src_nodata is not None else float(nodata)
+            write_nodata = (
+                float(src_nodata)
+                if src_nodata is not None and np.isfinite(float(src_nodata))
+                else float(nodata)
+            )
             if src_nodata is None or not np.isfinite(float(src_nodata)):
                 dst.nodata = float(write_nodata)
 

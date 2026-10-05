@@ -17,6 +17,12 @@ EXE_EXT = ".exe" if IS_WINDOWS else ""
 
 # Get conda/Python environment base path
 ENV_PREFIX = os.environ.get("CONDA_PREFIX", sys.prefix)
+# Only a conda environment ships GDAL/PROJ data under its prefix. For a plain
+# system Python, sys.prefix is e.g. /usr, whose PROJ data belongs to the system
+# PROJ, not the one bundled with rasterio/pyproj wheels.
+IS_CONDA_ENV = bool(os.environ.get("CONDA_PREFIX")) or os.path.isdir(
+    os.path.join(sys.prefix, "conda-meta")
+)
 
 
 def _get_gdal_candidates() -> list:
@@ -82,45 +88,42 @@ def _resolve_gdal_data() -> str:
     return None
 
 
+def _setdefault_env_dir(name: str, path: str) -> bool:
+    """Set ``name`` to ``path`` only when the user has not set it and the directory exists."""
+    if os.environ.get(name):
+        return True
+    if path and os.path.isdir(path):
+        os.environ[name] = path
+        return True
+    return False
+
+
 def _setup_gdal_windows():
     """Configure GDAL paths for Windows."""
-    os.environ["GDAL_DRIVER_PATH"] = os.path.join(
-        ENV_PREFIX, "Library", "lib", "gdalplugins"
+    if not IS_CONDA_ENV:
+        return
+    _setdefault_env_dir(
+        "GDAL_DRIVER_PATH", os.path.join(ENV_PREFIX, "Library", "lib", "gdalplugins")
     )
-    os.environ["PROJ_LIB"] = os.path.join(
-        ENV_PREFIX, "Library", "share", "proj"
-    )
-    os.environ["GDAL_WARP_EXE"] = os.path.join(
-        ENV_PREFIX, "Library", "bin", f"gdalwarp{EXE_EXT}"
-    )
+    _setdefault_env_dir("PROJ_LIB", os.path.join(ENV_PREFIX, "Library", "share", "proj"))
+    warp_exe = os.path.join(ENV_PREFIX, "Library", "bin", f"gdalwarp{EXE_EXT}")
+    if not os.environ.get("GDAL_WARP_EXE") and os.path.isfile(warp_exe):
+        os.environ["GDAL_WARP_EXE"] = warp_exe
 
 
 def _setup_gdal_unix():
     """Configure GDAL paths for Linux/macOS."""
-    # GDAL plugins
-    plugin_candidates = [
-        os.path.join(ENV_PREFIX, "lib", "gdalplugins"),
-        "/usr/lib/gdalplugins",
-        "/usr/local/lib/gdalplugins",
-    ]
-    for path in plugin_candidates:
-        if os.path.isdir(path):
-            os.environ["GDAL_DRIVER_PATH"] = path
-            break
+    # Only point at an active conda environment. System-wide fallbacks such as
+    # /usr/share/proj belong to a different PROJ build than the one bundled with
+    # rasterio/pyproj wheels and break every CRS lookup; a system GDAL already knows
+    # its own default paths.
+    if not IS_CONDA_ENV:
+        return
+    _setdefault_env_dir("GDAL_DRIVER_PATH", os.path.join(ENV_PREFIX, "lib", "gdalplugins"))
+    _setdefault_env_dir("PROJ_LIB", os.path.join(ENV_PREFIX, "share", "proj"))
 
-    # PROJ library data
-    proj_candidates = [
-        os.path.join(ENV_PREFIX, "share", "proj"),
-        "/usr/share/proj",
-        "/usr/local/share/proj",
-    ]
-    for path in proj_candidates:
-        if os.path.isdir(path):
-            os.environ["PROJ_LIB"] = path
-            break
-
-    # gdalwarp executable
-    os.environ["GDAL_WARP_EXE"] = "gdalwarp"
+    # gdalwarp is resolved from GDAL_WARP_EXE (if the user set it) or PATH;
+    # see hypercoreg.utils.resolve_gdalwarp_exe.
 
 
 def setup_gdal_environment():
@@ -135,6 +138,10 @@ def setup_gdal_environment():
         _setup_gdal_windows()
     else:
         _setup_gdal_unix()
+
+    # Multithreaded JPEG2000 decoding (Sentinel-2 bands) and GeoTIFF compression.
+    # Batch runs with several worker processes scale this down per worker.
+    os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
 
     # Resolve GDAL_DATA
     gdal_data = _resolve_gdal_data()

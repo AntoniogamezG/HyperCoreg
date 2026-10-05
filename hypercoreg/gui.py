@@ -642,24 +642,7 @@ def _show_parameter_dialog(
         cb = tk.Checkbutton(out_frame, text=label, variable=var, anchor='w')
         cb.grid(row=i, column=0, sticky='w', pady=2)
 
-    next_output_row = len(checkboxes)
-    if has_prisma_input:
-        tk.Label(out_frame, text="PRISMA radiometry:", anchor='w').grid(
-            row=next_output_row, column=0, sticky='w', pady=(10, 2)
-        )
-        prisma_radiometry_combo = ttk.Combobox(
-            out_frame,
-            state="readonly",
-            values=["reflectance", "native-dn"],
-            textvariable=config_vars['prisma_radiometric_mode'],
-            width=12,
-        )
-        prisma_radiometry_combo.grid(
-            row=next_output_row, column=1, sticky='w', padx=5, pady=(10, 2)
-        )
-        next_output_row += 1
-
-    norm_row = next_output_row
+    norm_row = len(checkboxes)
     tk.Label(out_frame, text="Normalization mode:", anchor='w').grid(
         row=norm_row, column=0, sticky='w', pady=(10, 2)
     )
@@ -914,7 +897,12 @@ def main() -> int:
                 while True:
                     kind, payload = event_queue.get_nowait()
                     if kind == "progress":
-                        progress_window.update_from_event(payload)
+                        try:
+                            progress_window.update_from_event(payload)
+                        except Exception:
+                            # A malformed progress event must not stop polling; otherwise
+                            # the final "done"/"error" event is never handled.
+                            logger.debug("Ignoring progress event that failed to render.", exc_info=True)
                     elif kind == "done":
                         final_state["finished"] = True
                         final_state["status"] = "success"

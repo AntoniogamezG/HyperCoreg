@@ -228,6 +228,42 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     's2_cache_dir': None,
     'scl_exclude_classes': list(SCL_EXCLUDE_CLASSES.keys()),
     's2_stack_mode': "materialized",
+    # Sentinel-2 download / reuse
+    # Fetch only the band JP2 files the stack uses (OData Nodes) instead of the full
+    # SAFE ZIP; falls back to the full ZIP automatically.
+    's2_band_only_download': True,
+    # Keep downloaded S2 products in a persistent cache shared by scenes and reruns.
+    's2_product_cache': True,
+    's2_product_cache_dir': None,
+    's2_product_cache_max_gb': 20.0,
+    # Candidate ranking: score = cloud% * w_cloud + days * w_days - overlap(0-1) * w_overlap
+    's2_rank_cloud_weight': 1.0,
+    's2_rank_days_weight': 1.5,
+    's2_rank_overlap_weight': 20.0,
+    # Re-rank the best candidates by cloud over the HS footprint (SCL band only).
+    's2_footprint_cloud_screen': True,
+    's2_footprint_screen_candidates': 6,
+    's2_min_footprint_clear_fraction': 0.3,
+    # Matching reference (a blurred, masked copy used only for tie-point matching)
+    # Gaussian PSF of the HS sensor as a multiple of its GSD; 0 disables the blur.
+    's2_match_psf_fwhm_factor': 1.0,
+    # Extra SCL classes excluded from matching (6 = water); scl_exclude_classes always apply.
+    'matching_exclude_scl_classes': [6],
+    # Exclude water seen by the HS sensor (NDWI from the HS cube).
+    'matching_mask_hs_water': True,
+    'matching_hs_ndwi_threshold': 0.2,
+    # Optional AROSICS resamp_alg_calc override (e.g. "average"); None keeps AROSICS'
+    # recommended cubic. Aliasing is handled by the matching-reference PSF blur.
+    'arosics_resamp_alg_calc': None,
+    # Per-band tie-point weighting: drop S2 bands whose median reliability is below this,
+    # and add band_weight_score * (band median / best band median) to the quality score.
+    'band_min_median_reliability': 30.0,
+    'band_weight_score': 0.25,
+    # Run the per-band AROSICS local matches in parallel processes (CPUs are split between
+    # them). Disabled automatically inside batch worker processes. Disables the
+    # sequential early stop, so all bands contribute tie points.
+    'local_band_parallel': True,
+    'local_band_parallel_start_method': "spawn",
 
     # Coregistration parameters
     'residual_threshold': DEFAULT_RESIDUAL_THRESHOLD_M,
@@ -249,7 +285,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'local_tiepoint_early_stop_min_points': None,
     'local_tiepoint_early_stop_min_cells': None,
     'local_tiepoint_early_stop_reliability': MIN_RELIABILITY_THRESHOLD,
-    'cache_hs_narrowbands': True,
+    # Off by default: the key is the per-run temp raster, so it never hits and only grows
+    # ~/.cache/hypercoreg/hs_narrowband.
+    'cache_hs_narrowbands': False,
     'hs_narrowband_cache_dir': None,
     'min_band_support': 2,
     'allow_single_band_fallback': True,
@@ -261,7 +299,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'auto_downgrade_polynomial_order': True,
     'min_gcps_order2': 12,
     'min_cells_order2': 6,
-    'transform_model_selection': "rule_based",
+    # "cv" picks affine / order-2 / TPS by held-out tie-point error; "rule_based" uses
+    # point-count and geometry rules only.
+    'transform_model_selection': "cv",
+    # Share of merged tie points held out to report independent check-point accuracy.
+    'checkpoint_holdout_fraction': 0.2,
     'transform_cv_folds': 5,
     'transform_cv_repeats': 3,
     'transform_cv_holdout_fraction': 0.25,
@@ -340,6 +382,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'pan_map_dxdy_source': "auto",
     'pan_target_aligned_pixels': False,
     'pan_use_synthetic_reference': True,
+    # "hs": match PAN against a PAN-like band from the coregistered HS cube (PAN follows
+    # the HS geometry; matching at HS resolution). "s2": mean(B02,B03,B04,B08) at 10 m.
+    'pan_reference_source': "hs",
     'pan_min_points_for_poly2': 20,
     'pan_local_window_size': (512, 512),
     'pan_local_grid_res': LOCAL_GRID_RES_M,
@@ -518,7 +563,7 @@ class CoregConfig:
     local_tiepoint_early_stop_min_points: Optional[int] = None
     local_tiepoint_early_stop_min_cells: Optional[int] = None
     local_tiepoint_early_stop_reliability: float = MIN_RELIABILITY_THRESHOLD
-    cache_hs_narrowbands: bool = True
+    cache_hs_narrowbands: bool = False
     hs_narrowband_cache_dir: Optional[str] = None
     min_band_support: int = 2
     allow_single_band_fallback: bool = True

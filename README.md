@@ -200,6 +200,25 @@ hypercoreg single --help
 hypercoreg batch --help
 ```
 
+### Quality and speed options
+
+These are on by default. Each has a switch to restore the previous behaviour.
+
+| Behaviour | Default | Switch / config key |
+| --- | --- | --- |
+| Download only the Sentinel-2 band files the stack uses (OData Nodes), falling back to the full ZIP | on | `--no-band-only-download` / `s2_band_only_download` |
+| Keep downloaded S2 products in a shared, size-capped cache (`~/.cache/hypercoreg/s2_products`) | on, 20 GB | `--no-s2-product-cache`, `--s2-product-cache-dir`, `--s2-product-cache-max-gb` |
+| Re-rank the best S2 candidates by cloud cover over the scene footprint (SCL band) | on | `--no-footprint-cloud-screen` / `s2_footprint_cloud_screen` |
+| Candidate ranking weighs temporal distance in days (1.5 per day vs 1 per % cloud) | on | `s2_rank_days_weight`, `s2_rank_cloud_weight`, `s2_rank_overlap_weight` |
+| Blur the S2 matching reference to the HS sensor's PSF and mask clouds, shadows, water (SCL) and HS-detected water (NDWI) | on | `--psf-fwhm-factor 0`, `matching_exclude_scl_classes`, `matching_mask_hs_water` |
+| Override AROSICS' internal resampling (e.g. `average`); AROSICS' recommended cubic is kept by default | off | `arosics_resamp_alg_calc` |
+| Per-band tie-point weighting; drop S2 bands with median reliability below 30 % | on | `band_min_median_reliability`, `band_weight_score` |
+| Choose affine / order-2 / TPS by held-out tie-point error | `cv` | `--transform-model rule_based` |
+| Report independent check-point accuracy (`checkpoint_rmse_m`, `checkpoint_p90_m` in metrics and batch summary) | 20 % held out | `checkpoint_holdout_fraction` |
+| Run the per-band local matches in parallel processes | on | `--no-parallel-bands` / `local_band_parallel` |
+| Match PRISMA PAN against a synthetic PAN band from the coregistered HS cube | `hs` | `--pan-reference s2` |
+| ZSTD (or DEFLATE) + predictor compression for intermediate GeoTIFFs | on | `HYPERCOREG_GTIFF_COMPRESS=LZW` |
+
 ### Graphical Interface
 
 Start the GUI with:
@@ -340,6 +359,16 @@ Use the fast preset for initial checks:
 hypercoreg batch -i ./input_scenes -o ./output --preset fast
 ```
 
+## Development
+
+Install the package in editable mode and run the test suite from the repository
+root:
+
+```bash
+python -m pip install -e .
+python -m pip install pytest
+python -m pytest
+```
 
 ## Project Status
 

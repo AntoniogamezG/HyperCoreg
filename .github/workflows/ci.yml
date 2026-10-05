@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install ruff
+      # Syntax errors and real pyflakes errors only; F822 is expected on the dynamic facades.
+      - run: ruff check --select E9,F63,F7,F82 --ignore F822 hypercoreg scripts tests
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # AROSICS/geoarray are stubbed by the tests; rasterio wheels bundle GDAL.
+      - run: python -m pip install numpy h5py rasterio shapely pyproj requests matplotlib openpyxl scipy pandas pytest
+      - run: python -m pytest -q

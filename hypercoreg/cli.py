@@ -239,8 +239,82 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         ),
     )
 
+    s2_group.add_argument(
+        "--no-band-only-download",
+        action="store_false",
+        dest="s2_band_only_download",
+        default=None,
+        help="Download the full Sentinel-2 SAFE ZIP instead of only the band files the stack uses.",
+    )
+    s2_group.add_argument(
+        "--no-s2-product-cache",
+        action="store_false",
+        dest="s2_product_cache",
+        default=None,
+        help="Keep downloaded Sentinel-2 products in the scene temp folder instead of a shared cache.",
+    )
+    s2_group.add_argument(
+        "--s2-product-cache-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Directory for cached Sentinel-2 product downloads (default: ~/.cache/hypercoreg/s2_products).",
+    )
+    s2_group.add_argument(
+        "--s2-product-cache-max-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help=f"Size cap for the product cache (default: {DEFAULT_CONFIG['s2_product_cache_max_gb']}).",
+    )
+    s2_group.add_argument(
+        "--no-footprint-cloud-screen",
+        action="store_false",
+        dest="s2_footprint_cloud_screen",
+        default=None,
+        help="Rank Sentinel-2 candidates by tile cloud cover only (skip the SCL footprint screen).",
+    )
+
     # Coregistration options
     coreg_group = parser.add_argument_group("Coregistration Options")
+    coreg_group.add_argument(
+        "--transform-model",
+        choices=["cv", "rule_based"],
+        default=None,
+        dest="transform_model_selection",
+        help=(
+            "Warp model selection: cv picks affine/order-2/TPS by held-out tie-point error "
+            f"(default: {DEFAULT_CONFIG['transform_model_selection']})"
+        ),
+    )
+    coreg_group.add_argument(
+        "--psf-fwhm-factor",
+        type=float,
+        default=None,
+        dest="s2_match_psf_fwhm_factor",
+        metavar="F",
+        help=(
+            "Blur the S2 matching reference to an HS PSF of F x HS pixel size; 0 disables "
+            f"(default: {DEFAULT_CONFIG['s2_match_psf_fwhm_factor']})"
+        ),
+    )
+    coreg_group.add_argument(
+        "--no-parallel-bands",
+        action="store_false",
+        dest="local_band_parallel",
+        default=None,
+        help="Run the per-band local matches sequentially (keeps the early stop).",
+    )
+    coreg_group.add_argument(
+        "--pan-reference",
+        choices=["hs", "s2"],
+        default=None,
+        dest="pan_reference_source",
+        help=(
+            "PRISMA PAN matching reference: hs (synthetic PAN from the coregistered HS cube) "
+            f"or s2 (default: {DEFAULT_CONFIG['pan_reference_source']})"
+        ),
+    )
     coreg_group.add_argument(
         "--residual-threshold",
         type=float,
@@ -919,6 +993,14 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         's2_stack_cache': _arg_value("s2_stack_cache"),
         's2_cache_dir': _arg_value("s2_cache_dir"),
         's2_stack_mode': _arg_value("s2_stack_mode"),
+        's2_band_only_download': _arg_value("s2_band_only_download"),
+        's2_product_cache': _arg_value("s2_product_cache"),
+        's2_product_cache_dir': _arg_value("s2_product_cache_dir"),
+        's2_product_cache_max_gb': _arg_value("s2_product_cache_max_gb"),
+        's2_footprint_cloud_screen': _arg_value("s2_footprint_cloud_screen"),
+        's2_match_psf_fwhm_factor': _arg_value("s2_match_psf_fwhm_factor"),
+        'local_band_parallel': _arg_value("local_band_parallel"),
+        'pan_reference_source': _arg_value("pan_reference_source"),
 
         # Coregistration
         'residual_threshold': _arg_value("residual_threshold"),
@@ -980,7 +1062,7 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         'use_geolocation_mesh_affine': _arg_value("use_geolocation_mesh_affine"),
         'geolocation_mesh_stride': _arg_value("geolocation_mesh_stride"),
         'fixed_band_pairs_by_sensor': base_config.get('fixed_band_pairs_by_sensor', {}),
-        'transform_model_selection': base_config.get('transform_model_selection', 'rule_based'),
+        'transform_model_selection': _arg_value("transform_model_selection"),
         'transform_cv_folds': base_config.get('transform_cv_folds', 5),
         'transform_cv_repeats': base_config.get('transform_cv_repeats', 5),
         'transform_cv_holdout_fraction': base_config.get('transform_cv_holdout_fraction', 0.25),

@@ -120,6 +120,9 @@ except ImportError:
 
 logger = logging.getLogger("COREG_PROCESSING")
 
+# np.trapz was removed in NumPy 2.x in favour of np.trapezoid.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 # Processing constants
 PROCESSING_DTYPE = np.float32
 PROCESSING_NODATA = -9999.0
@@ -232,6 +235,9 @@ BATCH_SUMMARY_CONTEXT_COLUMNS: Tuple[str, ...] = (
     "dataset_xlsx_path",
     "run_manifest_path",
     "displacement_vectors_path",
+    "checkpoint_rmse_m",
+    "checkpoint_p90_m",
+    "checkpoint_max_m",
 )
 BATCH_SUMMARY_XLSX_COLUMNS: List[str] = list(DATASET_XLSX_COLUMNS) + list(BATCH_SUMMARY_CONTEXT_COLUMNS)
 
@@ -574,17 +580,20 @@ def _destination_window_source_read(
         if col1 <= col0 or row1 <= row0:
             return None, None
         source_window = Window(col0, row0, col1 - col0, row1 - row0)
-        fill = src.nodata if src.nodata is not None else dst_nodata
-        arr = src.read(
-            int(band_index),
-            window=source_window,
-            boundless=False,
-            fill_value=fill,
-            out_dtype=np.dtype(out_dtype).name,
-        )
-        return arr, src.window_transform(source_window)
     except Exception:
+        # Window geometry could not be resolved: treat as no overlap.
         return None, None
+    fill = src.nodata if src.nodata is not None else dst_nodata
+    # Read errors (e.g. a corrupt JP2 inside the S2 ZIP) must propagate instead of
+    # silently turning the block into nodata.
+    arr = src.read(
+        int(band_index),
+        window=source_window,
+        boundless=False,
+        fill_value=fill,
+        out_dtype=np.dtype(out_dtype).name,
+    )
+    return arr, src.window_transform(source_window)
 
 
 def _reproject_source_window_to_destination(
@@ -633,13 +642,146 @@ def _copy_s2_stack_with_mask(source_stack: str, target_stack: str) -> None:
         shutil.copy2(source_mask, _s2_valid_mask_path(target_stack))
 
 
+_GTIFF_CODEC_CACHE: Dict[str, str] = {}
+
+
+def _gtiff_codec(for_cli: bool = False) -> str:
+    """Best lossless GeoTIFF codec available: ZSTD when supported, else DEFLATE.
+
+    ``HYPERCOREG_GTIFF_COMPRESS`` (e.g. LZW, DEFLATE, ZSTD) overrides detection.
+    ``for_cli`` probes the GDAL command-line tools, which may be a different build.
+    """
+    override = str(os.environ.get("HYPERCOREG_GTIFF_COMPRESS", "") or "").strip().upper()
+    if override:
+        return override
+    key = "cli" if for_cli else "lib"
+    if key in _GTIFF_CODEC_CACHE:
+        return _GTIFF_CODEC_CACHE[key]
+    codec = "DEFLATE"
+    try:
+        if for_cli:
+            warp_exe = resolve_gdalwarp_exe()
+            gdalinfo_exe = os.path.join(
+                os.path.dirname(warp_exe), "gdalinfo" + (".exe" if warp_exe.lower().endswith(".exe") else "")
+            )
+            if not os.path.isfile(gdalinfo_exe):
+                gdalinfo_exe = shutil.which("gdalinfo") or ""
+            if gdalinfo_exe:
+                probe = subprocess.run(
+                    [gdalinfo_exe, "--format", "GTiff"], capture_output=True, text=True, timeout=60
+                )
+                if "ZSTD" in (probe.stdout or ""):
+                    codec = "ZSTD"
+        else:
+            from rasterio.io import MemoryFile
+
+            with MemoryFile() as mem:
+                with mem.open(
+                    driver="GTiff", width=4, height=4, count=1, dtype="float32", compress="zstd", predictor=3
+                ) as dst:
+                    dst.write(np.zeros((1, 4, 4), dtype=np.float32))
+                # GDAL only warns on an unknown codec, so check what was actually written.
+                with mem.open() as chk:
+                    written = str(getattr(chk.compression, "value", chk.compression) or "").upper()
+            if "ZSTD" in written:
+                codec = "ZSTD"
+    except Exception:
+        codec = "DEFLATE"
+    _GTIFF_CODEC_CACHE[key] = codec
+    return codec
+
+
+def _gtiff_predictor(dtype: Any = None) -> int:
+    """3 (floating-point) for float rasters, 2 (horizontal) otherwise; 2 is valid for any type."""
+    try:
+        if dtype is not None and np.issubdtype(np.dtype(dtype), np.floating):
+            return 3
+    except Exception:
+        pass
+    return 2
+
+
+def _gtiff_compression_options(dtype: Any = None, *, for_cli: bool = False) -> List[str]:
+    """GDAL creation options (``COMPRESS=..``, ``PREDICTOR=..``) for pipeline GeoTIFFs."""
+    codec = _gtiff_codec(for_cli=for_cli)
+    opts = [f"COMPRESS={codec}"]
+    if codec in {"ZSTD", "DEFLATE", "LZW", "LZMA"}:
+        opts.append(f"PREDICTOR={_gtiff_predictor(dtype)}")
+    return opts
+
+
+def _gtiff_compression_profile(dtype: Any = None) -> Dict[str, Any]:
+    """rasterio profile keys equivalent to :func:`_gtiff_compression_options`."""
+    codec = _gtiff_codec(for_cli=False)
+    out: Dict[str, Any] = {"compress": codec.lower()}
+    if codec in {"ZSTD", "DEFLATE", "LZW", "LZMA"}:
+        out["predictor"] = _gtiff_predictor(dtype)
+    return out
+
+
+def _raster_dtype_or_none(path: Any) -> Optional[str]:
+    try:
+        with rasterio.open(str(path)) as src:
+            return str(src.dtypes[0])
+    except Exception:
+        return None
+
+
+_ACTIVE_AROSICS_RESAMP_CALC: Optional[str] = None
+
+
+def _add_arosics_calc_resampling(target_cls: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Optionally override AROSICS' ``resamp_alg_calc`` (e.g. "average").
+
+    AROSICS defaults to cubic and its authors recommend it; aliasing when downsampling
+    10 m Sentinel-2 is handled by the PSF blur of the matching reference instead, so
+    no override is applied unless ``arosics_resamp_alg_calc`` is set.
+    """
+    alg = _ACTIVE_AROSICS_RESAMP_CALC or DEFAULT_CONFIG.get("arosics_resamp_alg_calc")
+    if alg and "resamp_alg_calc" not in kwargs and _supports_constructor_kwarg(target_cls, "resamp_alg_calc"):
+        kwargs["resamp_alg_calc"] = str(alg)
+    return kwargs
+
+
+def _cache_lock_owner_is_dead(lock_path: str) -> bool:
+    """Return True when the lock records a PID that no longer exists (POSIX only)."""
+    if os.name != "posix":
+        return False
+    try:
+        with open(lock_path, "r", encoding="ascii") as fh:
+            owner_pid = int(fh.read().strip() or "0")
+    except Exception:
+        return False
+    if owner_pid <= 0 or owner_pid == os.getpid():
+        return False
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
 def _acquire_cache_lock(lock_path: str, *, timeout_s: float = 900.0, poll_s: float = 0.25) -> Optional[int]:
     os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
     deadline = perf_counter() + max(1.0, float(timeout_s))
     while True:
         try:
-            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(lock_fd, str(os.getpid()).encode("ascii"))
+            except Exception:
+                pass
+            return lock_fd
         except FileExistsError:
+            if _cache_lock_owner_is_dead(lock_path):
+                logger.warning(_fmt_issue("CACHE", f"Removing stale cache lock from a dead process: {lock_path}"))
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+                continue
             if perf_counter() >= deadline:
                 logger.warning(_fmt_issue("CACHE", f"Timed out waiting for cache lock: {lock_path}"))
                 return None
@@ -650,9 +792,11 @@ def _acquire_cache_lock(lock_path: str, *, timeout_s: float = 900.0, poll_s: flo
 
 
 def _release_cache_lock(lock_fd: Optional[int], lock_path: str) -> None:
+    if lock_fd is None:
+        # The lock was never acquired by this process; never delete another holder's lock.
+        return
     try:
-        if lock_fd is not None:
-            os.close(lock_fd)
+        os.close(lock_fd)
     except Exception:
         pass
     try:
@@ -1345,7 +1489,7 @@ def _query_s2_with_retry(
         return _query_s2(session, center_time, bbox, days_window, max_cloud), session
     except requests.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) is not None else None
-        if status in (400, 401, 403):
+        if status in (401, 403):
             try:
                 if _force_refresh_cdse_session(session):
                     logger.warning(
@@ -1366,7 +1510,7 @@ def _query_s2_with_retry(
                             if getattr(refresh_retry_exc, "response", None) is not None
                             else None
                         )
-                        if refresh_retry_status not in (400, 401, 403):
+                        if refresh_retry_status not in (401, 403):
                             raise
                         logger.warning(
                             _fmt_issue(
@@ -1404,7 +1548,7 @@ def _query_s2_with_retry(
                     if getattr(retry_exc, "response", None) is not None
                     else None
                 )
-                if retry_status in (400, 401, 403):
+                if retry_status in (401, 403):
                     raise CDSEAuthenticationError(
                         _fmt_issue(
                             "CDSE_QUERY",
@@ -1434,7 +1578,8 @@ def _query_s2(session, center_time, bbox, days_window=30, max_cloud=20):
         f"OData.CSC.Intersects(area=geography'SRID=4326;{wkt}')"
     )
 
-    params = {"$filter": filter_expr, "$expand": "Attributes"}
+    # CDSE OData returns only 20 products unless $top is set (maximum 1000).
+    params = {"$filter": filter_expr, "$expand": "Attributes", "$top": 1000}
     attempts = max(1, int(HTTP_QUERY_RETRY_ATTEMPTS))
     resp = None
     last_error: Optional[Exception] = None
@@ -1477,12 +1622,34 @@ def _query_s2(session, center_time, bbox, days_window=30, max_cloud=20):
     if resp is None:
         raise RuntimeError(_fmt_issue("CDSE_QUERY", f"No response returned: {last_error}"))
 
-    items = resp.json().get("value", [])
+    payload = resp.json()
+    items = payload.get("value", [])
     logger.info(f"  Found {len(items)} Sentinel-2 products")
+    if payload.get("@odata.nextLink"):
+        logger.warning(
+            _fmt_issue(
+                "CDSE_QUERY",
+                f"More Sentinel-2 products match than one page returns; only the first {len(items)} are ranked.",
+            )
+        )
     return items
 
 
-def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
+def _s2_rank_score(
+    cloud_pct: float,
+    days_apart: float,
+    overlap_fraction: float,
+    weights: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Lower is better. Defaults weigh 1 % cloud like ~0.7 days of temporal distance."""
+    w = weights or {}
+    w_cloud = float(w.get("s2_rank_cloud_weight", DEFAULT_CONFIG.get("s2_rank_cloud_weight", 1.0)))
+    w_days = float(w.get("s2_rank_days_weight", DEFAULT_CONFIG.get("s2_rank_days_weight", 1.5)))
+    w_overlap = float(w.get("s2_rank_overlap_weight", DEFAULT_CONFIG.get("s2_rank_overlap_weight", 20.0)))
+    return float(w_cloud * float(cloud_pct) + w_days * float(days_apart) - w_overlap * float(overlap_fraction))
+
+
+def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5, weights: Optional[Dict[str, Any]] = None):
     """Rank Sentinel-2 candidates by quality score and filter by overlap."""
     center_time = _to_utc_datetime(center_time)
     logger.info(f"Ranking S2 candidates (min overlap: {min_overlap:.1%})...")
@@ -1506,7 +1673,9 @@ def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
 
         logger.info(f"  {it['Name']}: overlap={ov:.1%}, cloud={cloud:.1f}%")
         tdiff_h = abs((dt - center_time).total_seconds()) / 3600.0
-        score = cloud + 0.5 * tdiff_h - 20.0 * ov
+        # Temporal distance is weighed in days: the old 0.5/hour weight made a 10-day
+        # gap cost more than a fully clouded scene.
+        score = _s2_rank_score(cloud, tdiff_h / 24.0, ov, weights)
         ranked_item = dict(it)
         ranked_item["_metadata_rank_score"] = float(score)
         ranked_item["_metadata_overlap_fraction"] = float(ov)
@@ -1523,6 +1692,392 @@ def _rank_s2_candidates(items, center_time, bbox, min_overlap=0.5):
     return [x['item'] for x in scored_candidates]
 
 
+CDSE_ODATA_NODE_BASES: Tuple[str, ...] = (
+    "https://download.dataspace.copernicus.eu/odata/v1",
+    "https://zipper.dataspace.copernicus.eu/odata/v1",
+    "https://catalogue.dataspace.copernicus.eu/odata/v1",
+)
+
+
+def _touch_quiet(path: str) -> None:
+    """Mark a cached file as recently used (for LRU pruning)."""
+    try:
+        os.utime(path, None)
+    except Exception:
+        pass
+
+
+def _cdse_get(sess: requests.Session, url: str, *, max_redirects: int = 5, **kwargs: Any) -> requests.Response:
+    """GET that follows redirects manually so the session auth is re-applied on every hop.
+
+    requests strips the Authorization header on cross-host redirects (e.g. download.
+    -> zipper.dataspace.copernicus.eu), which turns valid downloads into HTTP 401.
+    """
+    kwargs.pop("allow_redirects", None)
+    current = url
+    for _ in range(max(1, int(max_redirects)) + 1):
+        resp = sess.get(current, allow_redirects=False, **kwargs)
+        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+            next_url = requests.compat.urljoin(current, resp.headers["Location"])
+            resp.close()
+            current = next_url
+            continue
+        return resp
+    raise requests.TooManyRedirects(f"Too many redirects for {url}")
+
+
+def _odata_node_path(pid: str, parts: Sequence[str]) -> str:
+    from urllib.parse import quote
+
+    path = f"/Products({pid})"
+    for part in parts:
+        path += f"/Nodes({quote(str(part), safe='')})"
+    return path
+
+
+def _list_cdse_product_nodes(sess: requests.Session, pid: str, parts: Sequence[str]) -> List[Dict[str, Any]]:
+    """List child nodes of a product path, trying each CDSE OData host."""
+    errors: List[str] = []
+    for base in CDSE_ODATA_NODE_BASES:
+        url = base + _odata_node_path(pid, parts) + "/Nodes"
+        try:
+            resp = _cdse_get(sess, url, timeout=HTTP_TIMEOUT_S)
+            if resp.status_code != 200:
+                errors.append(f"{url} -> HTTP {resp.status_code}")
+                continue
+            payload = resp.json()
+            nodes = payload.get("result", payload.get("value", [])) if isinstance(payload, dict) else payload
+            if isinstance(nodes, list):
+                return [n for n in nodes if isinstance(n, dict) and n.get("Name")]
+            errors.append(f"{url} -> unexpected payload")
+        except CDSEAuthenticationError:
+            raise
+        except Exception as exc:
+            errors.append(f"{url} -> {exc}")
+    raise RuntimeError(_fmt_issue("S2_DOWNLOAD", f"Could not list product nodes: {' | '.join(errors[:3])}"))
+
+
+def _download_cdse_product_node(
+    sess: requests.Session,
+    pid: str,
+    parts: Sequence[str],
+    dest_path: str,
+    expected_size: Optional[int] = None,
+) -> int:
+    """Download one file node of a product to ``dest_path``; returns bytes written."""
+    errors: List[str] = []
+    attempts = max(1, int(HTTP_DOWNLOAD_RETRY_ATTEMPTS))
+    for base in CDSE_ODATA_NODE_BASES[:2]:
+        url = base + _odata_node_path(pid, parts) + "/$value"
+        for attempt in range(1, attempts + 1):
+            tmp_path = f"{dest_path}.{uuid.uuid4().hex}.part"
+            try:
+                with _cdse_get(sess, url, stream=True, timeout=HTTP_TIMEOUT_CONNECT_READ) as resp:
+                    if resp.status_code in (401, 403):
+                        raise CDSEAuthenticationError(
+                            _fmt_issue("S2_DOWNLOAD", f"HTTP {resp.status_code} downloading {parts[-1]}")
+                        )
+                    if resp.status_code != 200:
+                        errors.append(f"{parts[-1]} -> HTTP {resp.status_code}")
+                        if _is_retryable_http_status(resp.status_code) and attempt < attempts:
+                            sleep(_retry_delay_seconds(attempt))
+                            continue
+                        break
+                    header_size = int(resp.headers.get("Content-Length", "0") or "0")
+                    written = 0
+                    with open(tmp_path, "wb") as fh:
+                        for chunk in resp.iter_content(1024 * 1024):
+                            if chunk:
+                                fh.write(chunk)
+                                written += len(chunk)
+                want = int(expected_size or 0) or header_size
+                if want > 0 and written != want:
+                    errors.append(f"{parts[-1]} -> truncated ({written}/{want} bytes)")
+                    if attempt < attempts:
+                        sleep(_retry_delay_seconds(attempt))
+                        continue
+                    break
+                os.replace(tmp_path, dest_path)
+                return int(written)
+            except CDSEAuthenticationError:
+                raise
+            except requests.RequestException as exc:
+                errors.append(f"{parts[-1]} -> {exc}")
+                if attempt < attempts:
+                    sleep(_retry_delay_seconds(attempt))
+                    continue
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+    raise RuntimeError(_fmt_issue("S2_DOWNLOAD", f"Node download failed: {' | '.join(errors[:3])}"))
+
+
+def _locate_s2_l2a_img_nodes(sess: requests.Session, pid: str) -> Dict[str, Any]:
+    """Return the SAFE / granule names and the IMG_DATA files per resolution folder."""
+    root_nodes = _list_cdse_product_nodes(sess, pid, [])
+    safe_names = [str(n["Name"]) for n in root_nodes if str(n["Name"]).upper().endswith(".SAFE")]
+    if not safe_names:
+        raise RuntimeError(_fmt_issue("S2_DOWNLOAD", "Product has no .SAFE node."))
+    safe = safe_names[0]
+    granules = _list_cdse_product_nodes(sess, pid, [safe, "GRANULE"])
+    if not granules:
+        raise RuntimeError(_fmt_issue("S2_DOWNLOAD", "Product has no GRANULE node."))
+    granule = str(granules[0]["Name"])
+    files: Dict[str, List[Dict[str, Any]]] = {}
+    for res_dir in ("R10m", "R20m", "R60m"):
+        try:
+            files[res_dir] = _list_cdse_product_nodes(sess, pid, [safe, "GRANULE", granule, "IMG_DATA", res_dir])
+        except CDSEAuthenticationError:
+            raise
+        except Exception:
+            files[res_dir] = []
+    return {"safe": safe, "granule": granule, "files": files}
+
+
+def _pick_s2_band_nodes(
+    located: Dict[str, Any], bands: Sequence[str]
+) -> Dict[str, Tuple[str, str, Optional[int]]]:
+    """Map band -> (resolution folder, file name, size) using the preferred suffix order."""
+    picked: Dict[str, Tuple[str, str, Optional[int]]] = {}
+    for band in bands:
+        for suffix in _S2_L2A_BAND_SUFFIXES.get(str(band).upper(), ()):
+            for res_dir, nodes in located["files"].items():
+                hit = next((n for n in nodes if str(n["Name"]).endswith(suffix)), None)
+                if hit is not None:
+                    size = hit.get("ContentLength")
+                    picked[str(band).upper()] = (res_dir, str(hit["Name"]), int(size) if size else None)
+                    break
+            if str(band).upper() in picked:
+                break
+    return picked
+
+
+def _download_s2_band_subset_zip(
+    sess: requests.Session,
+    product: Dict[str, Any],
+    dest_zip: str,
+    bands: Sequence[str],
+    *,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    scene_idx: int = 1,
+    scene_total: int = 1,
+) -> Dict[str, Any]:
+    """Download only the needed band JP2s and pack them in a SAFE-layout ZIP.
+
+    The ZIP mirrors the member paths of the full product, so the rest of the pipeline
+    (``_resolve_s2_zip_band_paths`` and /vsizip/ reads) works unchanged. JP2 files are
+    stored without recompression.
+    """
+    pid = str(product["Id"])
+    located = _locate_s2_l2a_img_nodes(sess, pid)
+    picked = _pick_s2_band_nodes(located, bands)
+    missing = [b for b in S2_L2A_OUTPUT_BANDS if b not in picked]
+    if missing:
+        raise RuntimeError(_fmt_issue("S2_DOWNLOAD", f"Band files not found via Nodes: {missing}"))
+    work_dir = tempfile.mkdtemp(prefix=f".{pid}.nodes.", dir=os.path.dirname(os.path.abspath(dest_zip)))
+    total = 0
+    try:
+        local_files: List[Tuple[str, str]] = []
+        for i, (band, (res_dir, fname, size)) in enumerate(sorted(picked.items()), 1):
+            _emit_progress(
+                progress_callback,
+                "Downloading Sentinel-2 reference",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                substage=f"Band {band} ({i}/{len(picked)})",
+                download_percent=round(100.0 * (i - 1) / max(1, len(picked)), 1),
+            )
+            local = os.path.join(work_dir, fname)
+            total += _download_cdse_product_node(
+                sess,
+                pid,
+                [located["safe"], "GRANULE", located["granule"], "IMG_DATA", res_dir, fname],
+                local,
+                expected_size=size,
+            )
+            member = f"{located['safe']}/GRANULE/{located['granule']}/IMG_DATA/{res_dir}/{fname}"
+            local_files.append((local, member))
+        tmp_zip = f"{dest_zip}.{uuid.uuid4().hex}.part"
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for local, member in local_files:
+                    zf.write(local, member)
+            os.replace(tmp_zip, dest_zip)
+        finally:
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    logger.info(
+        "  Band-only download completed: %d files, %.1f MB", len(picked), total / (1024 * 1024)
+    )
+    return {"bands": sorted(picked), "bytes": int(total)}
+
+
+def _s2_zip_has_bands(zip_path: str, bands: Sequence[str]) -> bool:
+    try:
+        resolved = _resolve_s2_zip_band_paths(zip_path, [b for b in bands if b != "SCL"])
+        return all(b in resolved["paths"] for b in bands if b != "SCL")
+    except Exception:
+        return False
+
+
+def _prune_s2_product_cache(cache_dir: str, max_gb: float, keep: Sequence[str] = ()) -> None:
+    """Delete least-recently-used product ZIPs until the cache fits in ``max_gb``."""
+    try:
+        limit = float(max_gb) * (1024 ** 3)
+    except Exception:
+        return
+    if limit <= 0 or not os.path.isdir(cache_dir):
+        return
+    keep_abs = {os.path.abspath(k) for k in keep}
+    entries = []
+    for name in os.listdir(cache_dir):
+        if not name.endswith(".zip"):
+            continue
+        path = os.path.join(cache_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append((max(st.st_atime, st.st_mtime), st.st_size, path))
+    total = sum(e[1] for e in entries)
+    import time as _time
+
+    recent_cutoff = _time.time() - 2 * 3600.0
+    for used_at, size, path in sorted(entries):
+        if total <= limit:
+            break
+        pid = Path(path).name.split(".")[0]
+        if (
+            os.path.abspath(path) in keep_abs
+            # Possibly still read by another scene/worker of the same batch.
+            or used_at >= recent_cutoff
+            or os.path.exists(os.path.join(cache_dir, f".{pid}.zip.lock"))
+        ):
+            continue
+        try:
+            os.remove(path)
+            total -= size
+            logger.info("Pruned cached Sentinel-2 product: %s", path)
+        except OSError:
+            pass
+
+
+def _resolve_s2_download_dir(config: Dict[str, Any], scene_temp_dir: str) -> str:
+    """Persistent product cache when enabled, else the scene temp folder."""
+    if bool(config.get("s2_product_cache", DEFAULT_CONFIG.get("s2_product_cache", True))):
+        try:
+            cache_dir = _resolve_cache_dir(config.get("s2_product_cache_dir"), "s2_products")
+            os.makedirs(cache_dir, exist_ok=True)
+            return cache_dir
+        except Exception as exc:
+            logger.warning(_fmt_issue("CACHE", f"S2 product cache unavailable ({exc}); using scene temp."))
+    return scene_temp_dir
+
+
+_SCL_CLEAR_CLASSES = (4, 5, 6, 7, 11)
+
+
+def _footprint_clear_fraction_from_scl(scl_path: str, bbox: Sequence[float], exclude: Sequence[int]) -> Optional[float]:
+    """Fraction of valid (non-nodata) SCL pixels inside the lon/lat bbox that are not excluded."""
+    with rasterio.open(scl_path) as src:
+        bounds = warp.transform_bounds("EPSG:4326", src.crs, *[float(v) for v in bbox], densify_pts=21)
+        win = from_bounds(*bounds, transform=src.transform).round_offsets().round_shape()
+        win = win.intersection(Window(0, 0, src.width, src.height))
+        scl = src.read(1, window=win)
+    data = scl != 0
+    n_data = int(np.count_nonzero(data))
+    if n_data == 0:
+        return None
+    bad = np.isin(scl, [int(v) for v in exclude if int(v) != 0])
+    return float(np.count_nonzero(data & ~bad)) / float(n_data)
+
+
+def _screen_s2_candidates_by_footprint_cloud(
+    session: requests.Session,
+    candidates: List[Dict[str, Any]],
+    *,
+    bbox: Sequence[float],
+    config: Dict[str, Any],
+    work_dir: str,
+) -> List[Dict[str, Any]]:
+    """Re-rank the best candidates by cloud cover over the HS footprint.
+
+    Only the SCL file (a few MB) of each screened candidate is downloaded. Candidates
+    whose footprint is mostly cloud are moved to the end. Any failure keeps the
+    metadata ranking for that candidate.
+    """
+    n_screen = max(0, int(config.get("s2_footprint_screen_candidates", DEFAULT_CONFIG.get("s2_footprint_screen_candidates", 6))))
+    min_clear = float(config.get("s2_min_footprint_clear_fraction", DEFAULT_CONFIG.get("s2_min_footprint_clear_fraction", 0.3)))
+    exclude = _coerce_scl_exclude_classes(config.get("scl_exclude_classes"))
+    if n_screen <= 0 or not candidates:
+        return candidates
+    screened: List[Tuple[float, int, Dict[str, Any]]] = []
+    rejected: List[Dict[str, Any]] = []
+    scl_dir = tempfile.mkdtemp(prefix=".scl_screen.", dir=work_dir)
+    try:
+        for order, cand in enumerate(candidates[:n_screen]):
+            cand = dict(cand)
+            clear = None
+            try:
+                located = _locate_s2_l2a_img_nodes(session, str(cand["Id"]))
+                picked = _pick_s2_band_nodes(located, ["SCL"])
+                if "SCL" in picked:
+                    res_dir, fname, size = picked["SCL"]
+                    local = os.path.join(scl_dir, fname)
+                    _download_cdse_product_node(
+                        session,
+                        str(cand["Id"]),
+                        [located["safe"], "GRANULE", located["granule"], "IMG_DATA", res_dir, fname],
+                        local,
+                        expected_size=size,
+                    )
+                    clear = _footprint_clear_fraction_from_scl(local, bbox, exclude)
+            except CDSEAuthenticationError as exc:
+                # The screen is optional; the download path owns re-authentication.
+                logger.info("  Footprint cloud screen stopped (authentication: %s); keeping metadata ranking.", exc)
+                screened.append((float(cand.get("_metadata_rank_score", 0.0)), order, cand))
+                for later_order, later in enumerate(candidates[order + 1 : n_screen], order + 1):
+                    screened.append((float(later.get("_metadata_rank_score", 0.0)), later_order, dict(later)))
+                break
+            except Exception as exc:
+                logger.info("  Footprint cloud screen unavailable for %s: %s", cand.get("Name"), exc)
+            base_score = float(cand.get("_metadata_rank_score", 0.0))
+            if clear is None:
+                screened.append((base_score, order, cand))
+                continue
+            footprint_cloud = 100.0 * (1.0 - clear)
+            cand["_footprint_clear_fraction"] = float(clear)
+            score = _s2_rank_score(
+                footprint_cloud,
+                float(cand.get("_metadata_temporal_distance_hours", 0.0)) / 24.0,
+                float(cand.get("_metadata_overlap_fraction", 0.0)),
+                config,
+            )
+            cand["_footprint_rank_score"] = float(score)
+            logger.info(
+                "  %s: footprint clear=%.1f%% (tile cloud %.1f%%)",
+                cand.get("Name"),
+                100.0 * clear,
+                float(cand.get("_metadata_cloud_pct", float("nan"))),
+            )
+            if clear < min_clear:
+                rejected.append(cand)
+            else:
+                screened.append((score, order, cand))
+    finally:
+        shutil.rmtree(scl_dir, ignore_errors=True)
+    screened.sort(key=lambda t: (t[0], t[1]))
+    ranked = [c for _, _, c in screened] + candidates[n_screen:] + rejected
+    if ranked and str(ranked[0].get("Id")) != str(candidates[0].get("Id")):
+        logger.info("Footprint cloud screen re-ranked candidates. Top: %s", ranked[0].get("Name"))
+    return ranked
+
+
 def _download_s2_product(
     session,
     product,
@@ -1532,9 +2087,16 @@ def _download_s2_product(
     scene_idx: int = 1,
     scene_total: int = 1,
     prompt_userpass_fn: Optional[PromptUserpassFn] = None,
+    band_only: bool = False,
 ):
-    """Download Sentinel-2 product from CDSE."""
+    """Download Sentinel-2 product from CDSE.
+
+    With ``band_only`` the band JP2 files the stack uses are fetched individually and
+    packed into ``<id>.bands.zip``; on any failure the full product ZIP is downloaded.
+    """
     pid = product["Id"]
+    stack_bands = list(S2_L2A_REFERENCE_STACK_BANDS)
+    subset_zip_path = os.path.join(out_dir, f"{pid}.bands.zip")
     download_urls = [
         f"https://download.dataspace.copernicus.eu/odata/v1/Products({pid})/$value",
         f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products({pid})/$value",
@@ -1558,11 +2120,16 @@ def _download_s2_product(
     if os.path.exists(zip_path):
         if _is_valid_zip_quick(zip_path):
             logger.info("S2 already downloaded (valid zip file).")
+            _touch_quiet(zip_path)
             return zip_path, session
         try:
             os.remove(zip_path)
         except Exception:
             pass
+    if band_only and _is_valid_zip_quick(subset_zip_path) and _s2_zip_has_bands(subset_zip_path, stack_bands):
+        logger.info("S2 band subset already downloaded: %s", subset_zip_path)
+        _touch_quiet(subset_zip_path)
+        return subset_zip_path, session
 
     logger.info("Downloading S2...")
     _emit_progress(
@@ -1590,7 +2157,7 @@ def _download_s2_product(
                         download_percent=0.0,
                         download_mb=0.0,
                     )
-                    with sess.get(url, stream=True, timeout=HTTP_TIMEOUT_CONNECT_READ) as r:
+                    with _cdse_get(sess, url, stream=True, timeout=HTTP_TIMEOUT_CONNECT_READ) as r:
                         if r.status_code >= 400:
                             msg = r.text[:500]
                             if r.status_code in (401, 403):
@@ -1705,6 +2272,11 @@ def _download_s2_product(
                         continue
                     attempt_errors.append(f"{url} -> request error: {e}")
                     break
+                except CDSEAuthenticationError as e:
+                    # Raised by the session's token refresh hook inside sess.get().
+                    auth_error = True
+                    attempt_errors.append(f"{url} -> authentication error: {e}")
+                    break
                 except Exception as e:
                     attempt_errors.append(f"{url} -> request error: {e}")
                     break
@@ -1716,6 +2288,33 @@ def _download_s2_product(
         if os.path.exists(zip_path) and _is_valid_zip_quick(zip_path):
             logger.info("S2 already downloaded after waiting for product lock.")
             return zip_path, session
+        if band_only:
+            if _is_valid_zip_quick(subset_zip_path) and _s2_zip_has_bands(subset_zip_path, stack_bands):
+                logger.info("S2 band subset already downloaded after waiting for product lock.")
+                return subset_zip_path, session
+            try:
+                _download_s2_band_subset_zip(
+                    session,
+                    product,
+                    subset_zip_path,
+                    stack_bands,
+                    progress_callback=progress_callback,
+                    scene_idx=scene_idx,
+                    scene_total=scene_total,
+                )
+                if _s2_zip_has_bands(subset_zip_path, stack_bands):
+                    return subset_zip_path, session
+                logger.warning(_fmt_issue("S2_DOWNLOAD", "Band subset incomplete; downloading the full product."))
+            except Exception as exc:
+                # Includes auth errors: the full-download path below owns the re-auth flow.
+                logger.warning(
+                    _fmt_issue("S2_DOWNLOAD", f"Band-only download failed ({exc}); downloading the full product.")
+                )
+            if os.path.exists(subset_zip_path):
+                try:
+                    os.remove(subset_zip_path)
+                except Exception:
+                    pass
 
         ok, errors, saw_auth_error = _attempt_download(session)
         if ok:
@@ -1929,9 +2528,11 @@ def _build_s2_stack(
     ref_band_for_grid = reference_band if reference_band in bands_paths else "B04"
     with rasterio.open(bands_paths[ref_band_for_grid]) as ref:
         s2_crs = ref.crs
-        tr = Transformer.from_crs("EPSG:4326", s2_crs, always_xy=True)
-        minx, miny = tr.transform(bbox[0], bbox[1])
-        maxx, maxy = tr.transform(bbox[2], bbox[3])
+        # Densify the bbox edges: projecting only two corners under-estimates the
+        # UTM extent away from the central meridian.
+        minx, miny, maxx, maxy = warp.transform_bounds(
+            "EPSG:4326", s2_crs, float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]), densify_pts=21
+        )
         buffer = 200
         window = from_bounds(minx - buffer, miny - buffer, maxx + buffer, maxy + buffer, ref.transform)
         window = window.round_offsets().round_shape()
@@ -2129,7 +2730,7 @@ def _build_s2_stack(
             "dtype": "uint16",
             "crs": s2_crs,
             "transform": ref_transform,
-            "compress": "lzw",
+            **_gtiff_compression_profile("uint16"),
             "tiled": True,
             "BIGTIFF": "YES",
         }
@@ -2307,7 +2908,7 @@ def _reproject_reference_stack_to_target_crs(
                     "width": int(dst_width),
                     "height": int(dst_height),
                     "nodata": dst_nodata,
-                    "compress": "LZW",
+                    **_gtiff_compression_profile(profile.get("dtype")),
                     "tiled": True,
                     "BIGTIFF": "YES",
                 }
@@ -2991,14 +3592,20 @@ def _compute_quality_score(df):
         hi = float(np.nanmax(valid_vals))
         if not np.isfinite(lo) or not np.isfinite(hi) or abs(hi - lo) < 1e-9:
             out[valid] = 0.5
-            return out if higher_is_better else (1.0 - out)
+            return out
         norm = (values - lo) / (hi - lo)
         norm = np.clip(norm, 0.0, 1.0)
         out[valid] = norm[valid]
-        return out if higher_is_better else (1.0 - out)
+        if not higher_is_better:
+            # Invert only valid entries; a missing metric must not score as the best.
+            valid_mask = np.asarray(valid, dtype=bool)
+            out[valid_mask] = 1.0 - out[valid_mask]
+        return out
 
     metric_specs = [
         ("RELIABILITY", 0.45, True),
+        # AROSICS names it SSIM_IMPROVED in memory; SSIM_IMPRO is the shapefile truncation.
+        ("SSIM_IMPROVED", 0.25, True),
         ("SSIM_IMPRO", 0.25, True),
         ("SSIM_AFTER", 0.20, True),
         ("LAST_ERR", 0.10, False),
@@ -3008,6 +3615,8 @@ def _compute_quality_score(df):
     score = np.zeros(len(work), dtype=float)
     weight_sum = 0.0
     for col, weight, higher_is_better in metric_specs:
+        if col == "SSIM_IMPRO" and "SSIM_IMPROVED" in work.columns:
+            continue
         if col in work.columns:
             comp = _normalize_series(work[col], higher_is_better=higher_is_better)
             score += weight * comp
@@ -3329,6 +3938,84 @@ def _select_transform_model_cv(
     }
 
 
+def _checkpoint_accuracy(
+    tiepoints_df: Any,
+    *,
+    kind: str,
+    holdout_fraction: float = 0.2,
+    repeats: int = 10,
+    seed: int = 4242,
+) -> Dict[str, Any]:
+    """Independent check-point accuracy of a transform model.
+
+    Repeatedly holds out ``holdout_fraction`` of the merged tie points, fits ``kind``
+    (affine / order2 / tps) on the rest and measures the error at the held-out points.
+    Unlike fit residuals, this does not reward over-fitting.
+    """
+    out: Dict[str, Any] = {"ok": False, "model": str(kind)}
+    arrays = _extract_tiepoint_model_arrays(tiepoints_df)
+    if not arrays.get("ok", False):
+        out["error"] = arrays.get("error")
+        return out
+    x, y = np.asarray(arrays["x"], float), np.asarray(arrays["y"], float)
+    dst_x, dst_y = np.asarray(arrays["dst_x"], float), np.asarray(arrays["dst_y"], float)
+    n = int(x.size)
+    holdout_n = int(max(1, round(float(np.clip(holdout_fraction, 0.05, 0.5)) * n)))
+    min_train = 4 if kind == "affine" else 8
+    if n - holdout_n < min_train:
+        out["error"] = f"too few tie points for check points ({n})"
+        return out
+    rng = np.random.default_rng(int(seed))
+    residuals: List[float] = []
+    for _ in range(max(1, int(repeats))):
+        perm = rng.permutation(n)
+        test_idx, train_idx = perm[:holdout_n], perm[holdout_n:]
+        fit = _fit_transform_model(kind, x[train_idx], y[train_idx], dst_x[train_idx], dst_y[train_idx])
+        if not fit.get("ok", False):
+            continue
+        try:
+            px, py = _predict_transform_model(fit, x[test_idx], y[test_idx])
+        except Exception:
+            continue
+        res = np.hypot(px - dst_x[test_idx], py - dst_y[test_idx])
+        residuals.extend(float(v) for v in res if np.isfinite(v))
+    if not residuals:
+        out["error"] = "no check-point residuals"
+        return out
+    arr = np.asarray(residuals, dtype=float)
+    out.update(
+        {
+            "ok": True,
+            "checkpoint_rmse_m": float(np.sqrt(np.mean(arr ** 2))),
+            "checkpoint_median_m": float(np.median(arr)),
+            "checkpoint_p90_m": float(np.percentile(arr, 90)),
+            "checkpoint_max_m": float(np.max(arr)),
+            "n_checkpoint_residuals": int(arr.size),
+            "n_tiepoints": n,
+            "holdout_fraction": float(holdout_fraction),
+        }
+    )
+    return out
+
+
+def _summarize_checkpoint_accuracy(per_branch: Any) -> Dict[str, Any]:
+    """Flatten per-branch check-point accuracy into scene metrics (worst branch wins)."""
+    out: Dict[str, Any] = {
+        "checkpoint_rmse_m": None,
+        "checkpoint_p90_m": None,
+        "checkpoint_max_m": None,
+        "checkpoint_accuracy_by_branch": {},
+    }
+    if not isinstance(per_branch, dict):
+        return out
+    ok = {k: v for k, v in per_branch.items() if isinstance(v, dict) and v.get("ok")}
+    out["checkpoint_accuracy_by_branch"] = {k: dict(v) for k, v in per_branch.items() if isinstance(v, dict)}
+    if ok:
+        for key in ("checkpoint_rmse_m", "checkpoint_p90_m", "checkpoint_max_m"):
+            out[key] = float(max(float(v[key]) for v in ok.values()))
+    return out
+
+
 def _build_hs_narrowband_cache_key(
     hs_path: str,
     sensor_tag: str,
@@ -3471,7 +4158,7 @@ def _compute_srf_weights(
             continue
         mask = (srf_wl >= lo) & (srf_wl <= hi)
         if np.count_nonzero(mask) >= 2:
-            raw_weights[idx] = float(np.trapz(srf_resp[mask], srf_wl[mask]))
+            raw_weights[idx] = float(_trapezoid(srf_resp[mask], srf_wl[mask]))
         else:
             interp = float(np.interp(float(center_wl), srf_wl, srf_resp, left=0.0, right=0.0))
             raw_weights[idx] = max(0.0, interp) * float(width)
@@ -3552,7 +4239,7 @@ def _write_hs_narrowband_windowed(
             nodata = float(nodata)
             out_dtype_name = np.dtype(out_dtype).name
             profile = src.profile.copy()
-            profile.update(count=1, dtype=out_dtype_name, nodata=nodata, compress="LZW", tiled=True, BIGTIFF="YES")
+            profile.update(count=1, dtype=out_dtype_name, nodata=nodata, **_gtiff_compression_profile(), tiled=True, BIGTIFF="YES")
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
                 src_tags = filter_dataset_tags_for_raster_copy(
@@ -4063,6 +4750,117 @@ def _apply_spatial_stratification(
     return result
 
 
+def _resolve_local_band_parallelism(cfg: Dict[str, Any], *, n_bands: int, arosics_cpus: int) -> Tuple[bool, int]:
+    """Decide whether per-band COREG_LOCAL jobs run in parallel processes.
+
+    Disabled inside child processes (batch workers) to avoid nested pools, for a single
+    band, or when ``local_band_parallel`` is False.
+    """
+    import multiprocessing
+
+    enabled = bool(cfg.get("local_band_parallel", DEFAULT_CONFIG.get("local_band_parallel", True)))
+    total_cpus = int(os.cpu_count() or 1)
+    if not enabled or n_bands < 2 or total_cpus < 2:
+        return False, total_cpus
+    if multiprocessing.parent_process() is not None:
+        return False, total_cpus
+    cap = int(arosics_cpus) if int(arosics_cpus) > 0 else total_cpus
+    return True, max(1, min(total_cpus, cap))
+
+
+def _run_local_band_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Run COREG_LOCAL for one synthetic S2 band and return its tie-point table."""
+    import multiprocessing
+
+    out: Dict[str, Any] = {"band_name": job["band_name"], "df": None, "error": None}
+    try:
+        kwargs = dict(job["local_kwargs"])
+        if multiprocessing.current_process().daemon and int(kwargs.get("CPUs", 1) or 1) > 1:
+            # Daemonic workers cannot start AROSICS' own multiprocessing pool.
+            kwargs["CPUs"] = 1
+        CRL = COREG_LOCAL(job["s2_path"], job["nb_path"], **kwargs)
+        try:
+            CRL.correct_shifts()
+        except Exception:
+            pass
+        tie_points_df = getattr(CRL, "CoRegPoints_table", None)
+        if tie_points_df is None or len(tie_points_df) == 0:
+            return out
+        tie_points_df = tie_points_df.copy()
+        tie_points_df["BAND_LABEL"] = job["band_name"]
+        tie_points_df["MATCH_MODE"] = job["match_mode"]
+        tie_points_df["MATCH_BAND_INDICES"] = ",".join(str(v) for v in job["band_indices_1based"])
+        if job.get("band_weights") is not None:
+            tie_points_df["MATCH_BAND_WEIGHTS"] = ",".join(f"{float(v):.8g}" for v in job["band_weights"])
+        if "RELIABILITY" in tie_points_df.columns:
+            tie_points_df["RELIABILITY"] = tie_points_df["RELIABILITY"].replace([-9999, -9998], np.nan)
+            tie_points_df = tie_points_df[tie_points_df["RELIABILITY"].notna()]
+            if len(tie_points_df) > 0 and float(tie_points_df["RELIABILITY"].max()) <= 1.0:
+                tie_points_df["RELIABILITY"] = tie_points_df["RELIABILITY"] * 100.0
+        out["df"] = tie_points_df
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def _absorb_local_band_job(result: Dict[str, Any], job_result: Dict[str, Any]) -> None:
+    band_name = job_result["band_name"]
+    df = job_result.get("df")
+    if job_result.get("error"):
+        logger.warning(f"  {band_name} error: {job_result['error']}")
+    if df is not None and len(df) > 0:
+        result["all_tiepoints"].append(df)
+        result["tiepoint_counts"][band_name] = int(len(df))
+    else:
+        result["tiepoint_counts"][band_name] = 0
+
+
+def _run_local_band_jobs_parallel(
+    jobs: List[Dict[str, Any]],
+    *,
+    total_cpus: int,
+    start_method: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Run COREG_LOCAL band jobs in worker processes, splitting CPUs between them.
+
+    Uses "spawn" by default: forking a process that runs threads (the GUI runs the
+    pipeline on a worker thread) can deadlock.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    workers = max(1, min(len(jobs), int(total_cpus)))
+    per_job_cpus = max(1, int(total_cpus) // workers)
+    prepared = []
+    for job in jobs:
+        job = dict(job)
+        job["local_kwargs"] = dict(job["local_kwargs"])
+        if "CPUs" in job["local_kwargs"]:
+            job["local_kwargs"]["CPUs"] = int(per_job_cpus)
+        prepared.append(job)
+    logger.info(
+        "Running %d local band matches in parallel (%d processes x %d AROSICS CPUs).",
+        len(prepared),
+        workers,
+        per_job_cpus,
+    )
+    try:
+        method = str(
+            start_method
+            or DEFAULT_CONFIG.get("local_band_parallel_start_method", "spawn")
+            or "spawn"
+        )
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context(method)) as pool:
+            results = list(pool.map(_run_local_band_job, prepared))
+    except Exception as exc:
+        logger.warning(
+            _fmt_issue("LOCAL", f"Parallel band matching unavailable ({exc}); running bands sequentially.")
+        )
+        results = [_run_local_band_job(job) for job in jobs]
+    order = {job["band_name"]: k for k, job in enumerate(jobs)}
+    return sorted(results, key=lambda r: order.get(r["band_name"], 0))
+
+
 def _collect_multiband_tiepoints(
     s2_path,
     hs_path,
@@ -4129,7 +4927,7 @@ def _collect_multiband_tiepoints(
         "reliability_threshold": float(early_stop_reliability),
     }
     cache_hs_narrowbands = bool(
-        cfg.get("cache_hs_narrowbands", DEFAULT_CONFIG.get("cache_hs_narrowbands", True))
+        cfg.get("cache_hs_narrowbands", DEFAULT_CONFIG.get("cache_hs_narrowbands", False))
     )
     hs_nb_cache_dir = _resolve_cache_dir(
         cfg.get("hs_narrowband_cache_dir", DEFAULT_CONFIG.get("hs_narrowband_cache_dir")),
@@ -4194,7 +4992,18 @@ def _collect_multiband_tiepoints(
     else:
         selected_band_names = list(MULTIBAND_S2_WAVELENGTHS.keys())
 
+    run_parallel, parallel_total_cpus = _resolve_local_band_parallelism(
+        cfg, n_bands=len(selected_band_names), arosics_cpus=int(arosics_cpus)
+    )
+    pending_jobs: List[Dict[str, Any]] = []
+    deferred_cleanup: List[str] = []
+    if run_parallel:
+        # All bands run concurrently, so the sequential early stop does not apply.
+        result["early_stop"]["enabled"] = False
+        early_stop_enabled = False
+
     for band_name in selected_band_names:
+        keep_temp_for_job = False
         band_info = MULTIBAND_S2_WAVELENGTHS[band_name]
         target_wl = float(band_info['wavelength'])
         s2_stack_idx = int(band_info['stack_idx'])
@@ -4280,7 +5089,7 @@ def _collect_multiband_tiepoints(
                 "window_size": _coerce_window_size(profile.get("local_window_size"), (256, 256)),
                 "path_out": temp_nb_coreg_path,
                 "fmt_out": "GTiff",
-                "out_crea_options": ["COMPRESS=LZW", "BIGTIFF=YES"],
+                "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES"],
                 "r_b4match": s2_stack_idx,
                 "s_b4match": 1,
                 "max_shift": float(profile.get("local_max_shift", 50.0)),
@@ -4301,38 +5110,23 @@ def _collect_multiband_tiepoints(
                     local_kwargs["max_iter"] = int(local_max_iter)
                 else:
                     logger.info("COREG_LOCAL max_iter override ignored (installed AROSICS signature has no max_iter)")
-
-            CRL = COREG_LOCAL(
-                s2_path,
-                temp_nb_path,
-                **local_kwargs,
-            )
-            try:
-                CRL.correct_shifts()
-            except Exception:
-                pass
-
-            tie_points_df = getattr(CRL, "CoRegPoints_table", None)
-            if tie_points_df is not None and len(tie_points_df) > 0:
-                tie_points_df = tie_points_df.copy()
-                tie_points_df['BAND_LABEL'] = band_name
-                tie_points_df['MATCH_MODE'] = resolution.get("mode", "window")
-                tie_points_df['MATCH_BAND_INDICES'] = ",".join(str(v) for v in band_indices_1based)
-                if band_weights is not None:
-                    tie_points_df['MATCH_BAND_WEIGHTS'] = ",".join(f"{float(v):.8g}" for v in band_weights)
-                if 'RELIABILITY' in tie_points_df.columns:
-                    tie_points_df['RELIABILITY'] = tie_points_df['RELIABILITY'].replace([-9999, -9998], np.nan)
-                    tie_points_df = tie_points_df[tie_points_df['RELIABILITY'].notna()]
-                    if len(tie_points_df) > 0 and float(tie_points_df['RELIABILITY'].max()) <= 1.0:
-                        tie_points_df['RELIABILITY'] = tie_points_df['RELIABILITY'] * 100.0
-                tp_count = len(tie_points_df)
-                if tp_count > 0:
-                    result['all_tiepoints'].append(tie_points_df)
-                    result['tiepoint_counts'][band_name] = tp_count
-                else:
-                    result['tiepoint_counts'][band_name] = 0
-            else:
-                result['tiepoint_counts'][band_name] = 0
+            _add_arosics_calc_resampling(COREG_LOCAL, local_kwargs)
+            job = {
+                "band_name": band_name,
+                "s2_path": s2_path,
+                "nb_path": temp_nb_path,
+                "local_kwargs": local_kwargs,
+                "match_mode": resolution.get("mode", "window"),
+                "band_indices_1based": list(band_indices_1based),
+                "band_weights": None if band_weights is None else [float(v) for v in band_weights],
+            }
+            if run_parallel:
+                pending_jobs.append(job)
+                deferred_cleanup.extend([temp_nb_path, temp_nb_coreg_path])
+                keep_temp_for_job = True
+                continue
+            job_result = _run_local_band_job(job)
+            _absorb_local_band_job(result, job_result)
 
             if early_stop_enabled and result.get("all_tiepoints"):
                 stop_state = _tiepoint_early_stop_ready(
@@ -4362,7 +5156,25 @@ def _collect_multiband_tiepoints(
             logger.warning(f"  {band_name} error: {e}")
             result['tiepoint_counts'][band_name] = 0
         finally:
-            for temp_path in [temp_nb_path, temp_nb_coreg_path]:
+            if not keep_temp_for_job:
+                for temp_path in [temp_nb_path, temp_nb_coreg_path]:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+
+    if pending_jobs:
+        try:
+            for job_result in _run_local_band_jobs_parallel(
+                pending_jobs,
+                total_cpus=parallel_total_cpus,
+                start_method=cfg.get("local_band_parallel_start_method"),
+            ):
+                _absorb_local_band_job(result, job_result)
+            result["parallel_bands"] = {"enabled": True, "jobs": len(pending_jobs)}
+        finally:
+            for temp_path in deferred_cleanup:
                 if os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -4390,9 +5202,22 @@ def _merge_tiepoints(
     min_points_required: int = MIN_TIE_POINTS_FOR_POLYNOMIAL,
     spatial_fallback_min_distance: float = 60.0,
     stratification_extent: Optional[Sequence[float]] = None,
+    band_min_median_reliability: Optional[float] = None,
+    band_weight_score: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Merge tiepoints using consensus, composite scoring, and spatial stratification."""
+    """Merge tiepoints using consensus, composite scoring, and spatial stratification.
+
+    Per-band weighting: each S2 band's median tie-point reliability in this scene sets a
+    weight (median / best band median) added to QUALITY_SCORE (``band_weight_score``),
+    and bands whose median reliability is below ``band_min_median_reliability`` are
+    dropped when at least one other band remains.
+    """
     import pandas as pd
+
+    if band_min_median_reliability is None:
+        band_min_median_reliability = float(DEFAULT_CONFIG.get("band_min_median_reliability", 30.0))
+    if band_weight_score is None:
+        band_weight_score = float(DEFAULT_CONFIG.get("band_weight_score", 0.25))
 
     result = {
         'success': False,
@@ -4447,6 +5272,22 @@ def _merge_tiepoints(
             result['error_message'] = "All tie points removed by outlier filter"
             return result
 
+        band_weights: Dict[str, float] = {}
+        if "BAND_LABEL" in combined_df.columns and "RELIABILITY" in combined_df.columns:
+            band_median = combined_df.groupby("BAND_LABEL")["RELIABILITY"].median().dropna()
+            if len(band_median) > 1:
+                weak = [str(b) for b, v in band_median.items() if float(v) < float(band_min_median_reliability)]
+                if weak and len(weak) < len(band_median):
+                    combined_df = combined_df[~combined_df["BAND_LABEL"].astype(str).isin(weak)]
+                    band_median = band_median.drop(index=[b for b in band_median.index if str(b) in weak])
+                    result["fallback_notes"].append(
+                        f"dropped bands with median reliability < {float(band_min_median_reliability):.0f}: {weak}"
+                    )
+            best = float(band_median.max()) if len(band_median) else 0.0
+            if best > 0:
+                band_weights = {str(b): float(v) / best for b, v in band_median.items()}
+        result["band_weights"] = dict(band_weights)
+
         combined_df = combined_df.copy()
         combined_df["CONSENSUS_GROUP_ID"] = _build_consensus_group_ids(
             combined_df,
@@ -4475,11 +5316,20 @@ def _merge_tiepoints(
         result['stage_counts']['03_consensus_filter'] = int(len(consensus_df))
 
         scored_df = _compute_quality_score(consensus_df)
+        if band_weights and float(band_weight_score) != 0.0 and "BAND_LABEL" in scored_df.columns:
+            weights = scored_df["BAND_LABEL"].astype(str).map(band_weights).fillna(0.0).astype(float)
+            scored_df["BAND_WEIGHT"] = weights
+            scored_df["QUALITY_SCORE"] = scored_df["QUALITY_SCORE"] + float(band_weight_score) * weights
         result['stage_counts']['04_quality_score'] = int(len(scored_df))
         result['visualization_df'] = scored_df.copy()
 
+        # Collapse per-band copies of one tie point before stratifying, so the
+        # duplicates do not consume each grid cell's point quota.
+        unique_scored_df = scored_df.sort_values("QUALITY_SCORE", ascending=False).drop_duplicates(
+            subset="CONSENSUS_GROUP_ID", keep="first"
+        )
         strat = _apply_spatial_stratification(
-            scored_df,
+            unique_scored_df,
             grid_rows=max(1, int(grid_rows)),
             grid_cols=max(1, int(grid_cols)),
             max_points_per_cell=max(1, int(max_points_per_cell)),
@@ -4487,7 +5337,7 @@ def _merge_tiepoints(
             min_distance=float(spatial_fallback_min_distance),
             stratification_extent=stratification_extent,
         )
-        selected_df = strat.get("selected_df", scored_df)
+        selected_df = strat.get("selected_df", unique_scored_df)
         result["fallback_notes"].extend(strat.get("fallback_notes", []))
         result["occupied_cells_selected"] = int(strat.get("occupied_cells_selected", 0))
         result["occupied_cells_total"] = int(strat.get("occupied_cells_total", 0))
@@ -4514,6 +5364,13 @@ def _merge_tiepoints(
                     result['fallback_notes'].append(
                         f"reliability threshold relaxed to {threshold:.1f} due to low retained points"
                     )
+            if result['reliability_threshold_used'] is None:
+                # Nothing reached even the lowest floor: never keep sub-floor points.
+                floor = float(min(thresholds))
+                selected_df = selected_df[selected_df['RELIABILITY'] >= floor]
+                result['fallback_notes'].append(
+                    f"no tie points reached the {floor:.1f} reliability floor"
+                )
         result['n_after_reliability_filter'] = int(len(selected_df))
         result['stage_counts']['07_final_reliability_filter'] = int(len(selected_df))
 
@@ -4641,10 +5498,16 @@ def _assess_gcp_geometry_for_order2(merged_df) -> Dict[str, Any]:
         return out
 
     try:
-        design = np.column_stack([np.ones_like(x), x, y, x * y, x * x, y * y])
+        # Centre and scale coordinates (common scale keeps the aspect ratio) so the
+        # condition number reflects point geometry rather than raster size in pixels.
+        half_extent = max(float(np.ptp(x)), float(np.ptp(y)), 1e-9) / 2.0
+        u = (x - 0.5 * (float(np.max(x)) + float(np.min(x)))) / half_extent
+        v = (y - 0.5 * (float(np.max(y)) + float(np.min(y)))) / half_extent
+        design = np.column_stack([np.ones_like(u), u, v, u * v, u * u, v * v])
         cond = float(np.linalg.cond(design))
         out["condition_number"] = cond
-        if np.isfinite(cond) and cond < 1.0e8:
+        # 1e2 on normalised coordinates matches the old raw-pixel 1e8 limit at ~1000 px.
+        if np.isfinite(cond) and cond < 1.0e2:
             out["ok"] = True
             out["reason"] = "geometry conditioning acceptable"
         else:
@@ -4765,12 +5628,16 @@ def _apply_polynomial_warp(
         threads_token = _normalize_gdalwarp_num_threads(gdalwarp_num_threads)
 
         cmd = [
-            gdalwarp_exe, "-order", str(order), "-t_srs", crs_wkt,
+            # The VRT keeps the source geotransform next to the GCPs, and GDAL
+            # prefers a geotransform unless the GCP method is forced explicitly.
+            gdalwarp_exe, "-to", "METHOD=GCP_POLYNOMIAL", "-order", str(order), "-t_srs", crs_wkt,
             "-tr", str(output_resolution), str(output_resolution),
             "-r", str(resampling_alg), "-of", "GTiff",
-            "-co", "COMPRESS=LZW", "-co", "BIGTIFF=YES", "-co", "TILED=YES",
+            "-co", "BIGTIFF=YES", "-co", "TILED=YES",
             "-srcnodata", str(nodata), "-dstnodata", str(nodata),
         ]
+        for co in _gtiff_compression_options(_raster_dtype_or_none(input_raster), for_cli=True):
+            cmd.extend(["-co", co])
         if bool(gdalwarp_multi):
             cmd.append("-multi")
         if threads_token:
@@ -4911,7 +5778,7 @@ def _write_georeferenced_raster(
         "dtype": dtype,
         "crs": crs,
         "transform": transform,
-        "compress": "lzw",
+        **_gtiff_compression_profile(dtype),
         "tiled": True,
         "BIGTIFF": "YES",
     }
@@ -4934,7 +5801,7 @@ def _align_pan_quality_to_reference_grid(
             count=1,
             dtype="uint8",
             nodata=255,
-            compress="lzw",
+            **_gtiff_compression_profile("uint8"),
             tiled=True,
             BIGTIFF="YES",
         )
@@ -4986,6 +5853,26 @@ def _resolve_pan_window_size_for_raster(
         int(max(1, min(req_w, width))),
         int(max(1, min(req_h, height))),
     )
+
+
+def _hs_pan_band_indices(
+    hs_raster_path: Optional[str], wl_min_nm: float = 400.0, wl_max_nm: float = 700.0
+) -> List[int]:
+    """1-based HS bands inside the PRISMA PAN range, from the raster's band metadata."""
+    if not hs_raster_path or not os.path.exists(str(hs_raster_path)):
+        return []
+    try:
+        with rasterio.open(str(hs_raster_path)) as src:
+            meta = _read_raster_spectral_metadata(src)
+    except Exception:
+        return []
+    wl = meta.get("wavelength")
+    if not wl:
+        return []
+    arr = np.asarray(wl, dtype=float)
+    if np.nanmedian(arr) < 10.0:
+        arr = arr * 1000.0
+    return [int(i) + 1 for i in np.where((arr >= wl_min_nm) & (arr <= wl_max_nm))[0]]
 
 
 def _create_synthetic_s2_pan(
@@ -5046,7 +5933,7 @@ def _create_synthetic_s2_pan(
                 count=1,
                 dtype=out_dtype_name,
                 nodata=nodata_value,
-                compress="LZW",
+                **_gtiff_compression_profile(),
                 BIGTIFF="YES",
             )
 
@@ -5137,7 +6024,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
             "s_b4match": 1,
             "path_out": pan_global_path,
             "fmt_out": "GTiff",
-            "out_crea_options": ["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"],
+            "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
             "max_shift": float(max(5.0, max_shift)),
             "ws": tuple(ws),
             "resamp_alg_deshift": "cubic",
@@ -5150,6 +6037,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
         if _supports_constructor_kwarg(COREG, "CPUs"):
             global_kwargs["CPUs"] = int(effective_arosics_cpus)
         with contextlib.redirect_stdout(io.StringIO()):
+            _add_arosics_calc_resampling(COREG, global_kwargs)
             CRG = COREG(
                 synthetic_s2_pan_path,
                 pan_source_path,
@@ -5181,7 +6069,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
         "window_size": tuple(ws),
         "path_out": pan_local_path,
         "fmt_out": "GTiff",
-        "out_crea_options": ["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"],
+        "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
         "r_b4match": 1,
         "s_b4match": 1,
         "max_shift": float(max(5.0, max_shift)),
@@ -5200,6 +6088,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
 
     try:
         with contextlib.redirect_stdout(io.StringIO()):
+            _add_arosics_calc_resampling(COREG_LOCAL, local_kwargs)
             CRL = COREG_LOCAL(
                 synthetic_s2_pan_path,
                 out["global_path"],
@@ -5282,12 +6171,12 @@ def _build_gdalwarp_tps_command(
         "-of",
         "GTiff",
         "-co",
-        "COMPRESS=LZW",
-        "-co",
         "BIGTIFF=YES",
         "-co",
         "TILED=YES",
     ]
+    for co in _gtiff_compression_options(_raster_dtype_or_none(temp_vrt), for_cli=True):
+        cmd.extend(["-co", co])
     threads_token = _normalize_gdalwarp_num_threads(gdalwarp_num_threads)
     if bool(gdalwarp_multi):
         cmd.append("-multi")
@@ -5459,6 +6348,7 @@ def _apply_tps_warp_from_gcps(
     target_extent: Optional[Tuple[float, float, float, float]] = None,
     gdalwarp_multi: bool = True,
     gdalwarp_num_threads: str = "ALL_CPUS",
+    timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Apply thin-plate-spline warp from GCPs to raster using GDAL."""
     result = {"success": False, "output_path": None, "error_message": None}
@@ -5502,7 +6392,7 @@ def _apply_tps_warp_from_gcps(
             gdalwarp_multi=bool(gdalwarp_multi),
             gdalwarp_num_threads=_normalize_gdalwarp_num_threads(gdalwarp_num_threads),
         )
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_s)
 
         if os.path.exists(tmp_output):
             _validate_warp_output(tmp_output)
@@ -5511,6 +6401,8 @@ def _apply_tps_warp_from_gcps(
             result["output_path"] = output_raster
         else:
             result["error_message"] = "TPS warp completed but output was not created."
+    except subprocess.TimeoutExpired:
+        result["error_message"] = f"gdalwarp TPS timed out after {timeout_s:.0f} s (check GCPs for fold-over)."
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
         stdout = (e.stdout or "").strip()
@@ -5529,6 +6421,41 @@ def _apply_tps_warp_from_gcps(
     return result
 
 
+# Quality masks are small uint8 rasters (seconds to ~2 min when healthy).
+QUALITY_MASK_WARP_TIMEOUT_S = 900.0
+_AROSICS_INVALID_SENTINELS = (-9999.0, -9998.0)
+_AROSICS_TIEPOINT_VALUE_COLUMNS = (
+    "X_MAP", "Y_MAP", "X_SHIFT_M", "Y_SHIFT_M", "X_SHIFT_PX", "Y_SHIFT_PX", "ABS_SHIFT", "RELIABILITY",
+)
+_AROSICS_TIEPOINT_OUTLIER_COLUMNS = ("OUTLIER", "L1_OUTLIER", "L2_OUTLIER", "L3_OUTLIER")
+
+
+def _sanitize_arosics_tiepoints(tie_points_df):
+    """Drop AROSICS failed (-9999/-9998 sentinel) and outlier-flagged tie points.
+
+    AROSICS keeps failed matches in CoRegPoints_table with sentinel values in the
+    shift columns; those values are finite, so np.isfinite() checks do not catch them.
+    """
+    import pandas as pd
+
+    if tie_points_df is None or len(tie_points_df) == 0:
+        return tie_points_df
+    df = tie_points_df.copy()
+    keep = np.ones(len(df), dtype=bool)
+    for col in _AROSICS_TIEPOINT_VALUE_COLUMNS:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            keep &= np.isfinite(vals) & ~np.isin(vals, _AROSICS_INVALID_SENTINELS)
+    for col in _AROSICS_TIEPOINT_OUTLIER_COLUMNS:
+        if col in df.columns:
+            try:
+                bad = df[col].astype("boolean").fillna(False).to_numpy(dtype=bool)
+            except Exception:
+                bad = np.asarray(df[col], dtype=bool)
+            keep &= ~bad
+    return df[keep]
+
+
 def _build_tps_gcps_for_source_raster(
     tie_points_df,
     source_raster_path: str,
@@ -5536,6 +6463,7 @@ def _build_tps_gcps_for_source_raster(
 ) -> Dict[str, Any]:
     """Build raster-specific TPS GCPs from map-space tiepoint shifts."""
     out = {"success": False, "gcps": [], "n_gcps": 0, "error_message": None}
+    tie_points_df = _sanitize_arosics_tiepoints(tie_points_df)
     if tie_points_df is None or len(tie_points_df) == 0:
         out["error_message"] = "No tie points available."
         return out
@@ -5840,7 +6768,11 @@ def _sanitize_raster_nonfinite_inplace(path: str, nodata: float = PROCESSING_NOD
                 return result
 
             src_nodata = dst.nodata
-            write_nodata = float(src_nodata) if src_nodata is not None else float(nodata)
+            write_nodata = (
+                float(src_nodata)
+                if src_nodata is not None and np.isfinite(float(src_nodata))
+                else float(nodata)
+            )
             if src_nodata is None or not np.isfinite(float(src_nodata)):
                 dst.nodata = float(write_nodata)
 
@@ -6004,9 +6936,11 @@ def _resolve_selected_band_values(
         return np.full(len(selected), float(default_value), dtype=np.float32)
 
     arr = np.asarray(values, dtype=float).reshape(-1)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
+    finite = np.isfinite(arr)
+    if not np.any(finite):
         return np.full(len(selected), float(default_value), dtype=np.float32)
+    # Keep positions: dropping non-finite entries would shift values onto other bands.
+    arr = np.where(finite, arr, float(default_value))
     if arr.size == 1:
         return np.full(len(selected), float(arr[0]), dtype=np.float32)
     if arr.size == int(source_band_count):
@@ -6164,6 +7098,8 @@ def _stream_copy_raster_with_band_order(
                 if comp == "NONE":
                     # Compression predictors are invalid without compression.
                     profile.pop("predictor", None)
+                elif comp in {"ZSTD", "DEFLATE", "LZW", "LZMA"}:
+                    profile["predictor"] = _gtiff_predictor(profile.get("dtype"))
 
             read_indexes = tuple(src_bands)
 
@@ -6331,7 +7267,7 @@ def _prepare_enmap_processing_source(
                 output_path=output_path,
                 source_bands_1based=src_bands_1based,
                 out_dtype=PROCESSING_DTYPE,
-                compress="LZW",
+                compress=_gtiff_codec(),
                 tile_size=512,
                 band_gains=meta.get("data_gain_values") if radiometric_scaling_required else None,
                 band_offsets=meta.get("data_offset_values") if radiometric_scaling_required else None,
@@ -6657,7 +7593,7 @@ def _write_branch_raster_windowed(
         output_path=output_path,
         source_bands_1based=source_bands_1based,
         out_dtype=out_dtype,
-        compress="LZW",
+        compress=_gtiff_codec(),
         tile_size=512,
     )
 
@@ -6707,6 +7643,21 @@ def _summarize_raster_grid(path: Optional[str]) -> Dict[str, Any]:
         return out
 
 
+def _integer_pixel_offset(src_transform: Affine, dst_transform: Affine, tol: float = 1e-6) -> Optional[Tuple[int, int]]:
+    """(col, row) offset of dst's origin in src pixels when both grids align exactly."""
+    if any(abs(float(v)) > tol for v in (src_transform.b, src_transform.d, dst_transform.b, dst_transform.d)):
+        return None
+    if abs(src_transform.a - dst_transform.a) > tol * max(1.0, abs(src_transform.a)):
+        return None
+    if abs(src_transform.e - dst_transform.e) > tol * max(1.0, abs(src_transform.e)):
+        return None
+    col = (dst_transform.c - src_transform.c) / src_transform.a
+    row = (dst_transform.f - src_transform.f) / src_transform.e
+    if abs(col - round(col)) > 1e-4 or abs(row - round(row)) > 1e-4:
+        return None
+    return int(round(col)), int(round(row))
+
+
 def _resample_raster_to_shared_grid(
     *,
     source_path: str,
@@ -6741,6 +7692,12 @@ def _resample_raster_to_shared_grid(
                 src_nodata = nodata_value
             else:
                 src_nodata = float(src_nodata)
+            # When the source is already pixel-aligned with the target grid (same CRS
+            # and resolution, origin offset by whole pixels), copy pixels exactly instead
+            # of interpolating: avoids a second resampling (blur) and is faster.
+            aligned_offset = _integer_pixel_offset(src.transform, target_transform)
+            exact_copy = bool(_crs_equivalent(src.crs, target_crs_obj) and aligned_offset is not None)
+            out["exact_copy"] = exact_copy
 
             profile = src.profile.copy()
             profile.update(
@@ -6752,11 +7709,14 @@ def _resample_raster_to_shared_grid(
                     "crs": target_crs_obj,
                     "dtype": out_dtype_name,
                     "nodata": nodata_value,
-                    "compress": "LZW",
+                    **_gtiff_compression_profile(out_dtype_name),
                     "tiled": True,
                     "BIGTIFF": "YES",
                 }
             )
+            # Source strip/block sizes are not valid GTiff tile sizes in general.
+            profile.pop("blockxsize", None)
+            profile.pop("blockysize", None)
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with rasterio.open(output_path, "w", **profile) as dst:
@@ -6780,6 +7740,25 @@ def _resample_raster_to_shared_grid(
                             nodata_value,
                             dtype=np.dtype(out_dtype_name),
                         )
+                        if exact_copy:
+                            col_off, row_off = aligned_offset
+                            src_window = Window(
+                                int(dst_window.col_off) + col_off,
+                                int(dst_window.row_off) + row_off,
+                                int(dst_window.width),
+                                int(dst_window.height),
+                            )
+                            data = src.read(
+                                bidx,
+                                window=src_window,
+                                boundless=True,
+                                fill_value=src_nodata,
+                            )
+                            data = np.where(
+                                np.isfinite(data) & (data != src_nodata), data, nodata_value
+                            )
+                            dst.write(data.astype(dst_band.dtype, copy=False), bidx, window=dst_window)
+                            continue
                         dst_window_transform = rasterio.windows.transform(dst_window, target_transform)
                         _reproject_source_window_to_destination(
                             src,
@@ -7025,7 +8004,7 @@ def _recombine_detector_branches_windowed(
                 count=int(vsrc.count + ssrc.count),
                 dtype=out_dtype_name,
                 nodata=nodata_value,
-                compress="LZW",
+                **_gtiff_compression_profile(),
                 tiled=True,
                 BIGTIFF="YES",
             )
@@ -7109,6 +8088,172 @@ def _recombine_detector_branches_windowed(
     except Exception as e:
         out["error"] = str(e)
         return out
+
+
+def _hs_water_mask(hs_path: str, wavelengths_nm: Any, ndwi_threshold: float) -> Optional[Dict[str, Any]]:
+    """McFeeters NDWI (green ~560 nm, NIR ~860 nm) water mask on the HS grid."""
+    try:
+        wl = np.asarray(wavelengths_nm, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if wl.size < 2 or not np.any(np.isfinite(wl)):
+        return None
+    if float(np.nanmedian(wl)) < 10.0:
+        wl = wl * 1000.0
+    g_idx = int(np.nanargmin(np.abs(wl - 560.0)))
+    n_idx = int(np.nanargmin(np.abs(wl - 860.0)))
+    if abs(wl[g_idx] - 560.0) > 40.0 or abs(wl[n_idx] - 860.0) > 60.0 or g_idx == n_idx:
+        return None
+    with rasterio.open(hs_path) as src:
+        if max(g_idx, n_idx) + 1 > src.count:
+            return None
+        green = src.read(g_idx + 1).astype(np.float32)
+        nir = src.read(n_idx + 1).astype(np.float32)
+        nodata_values = resolve_raster_nodata_values(src, nodata_fallback=PROCESSING_NODATA)
+        valid = np.isfinite(green) & np.isfinite(nir)
+        for nd in nodata_values:
+            valid &= (green != float(nd)) & (nir != float(nd))
+        denom = green + nir
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ndwi = np.where(valid & (np.abs(denom) > 1e-6), (green - nir) / denom, np.nan)
+        water = np.isfinite(ndwi) & (ndwi > float(ndwi_threshold))
+        return {"mask": water.astype(np.uint8), "transform": src.transform, "crs": src.crs}
+
+
+def _prepare_matching_reference(
+    s2_stack_path: str,
+    *,
+    hs_raster_path: Optional[str],
+    hs_wavelengths_nm: Any,
+    config: Dict[str, Any],
+    out_dir: str,
+    tag: str,
+) -> Dict[str, Any]:
+    """Write a matching-only copy of the S2 stack: PSF-matched blur plus bad-data masking.
+
+    * Spectral bands are blurred with a Gaussian so the 10 m reference has roughly the
+      HS sensor's sharpness (normalised convolution, so nodata does not bleed in).
+    * Pixels in excluded SCL classes (clouds, shadows, configured extras such as water)
+      and HS water pixels (NDWI) become nodata, so AROSICS places no tie points there.
+      This also applies SCL masking in ``s2_stack_mode="vrt"``, which writes no mask.
+
+    The grid, band order and descriptions are unchanged. The original stack is still
+    used for outputs; only matching reads the copy.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    info: Dict[str, Any] = {"path": s2_stack_path, "applied": False}
+    fwhm_factor = float(config.get("s2_match_psf_fwhm_factor", DEFAULT_CONFIG.get("s2_match_psf_fwhm_factor", 1.0)) or 0.0)
+    exclude = set(_coerce_scl_exclude_classes(config.get("scl_exclude_classes")))
+    extra = config.get("matching_exclude_scl_classes", DEFAULT_CONFIG.get("matching_exclude_scl_classes", [6]))
+    exclude |= set(_coerce_scl_exclude_classes(extra)) if extra not in (None, [], ()) else set()
+    exclude.discard(0)
+    mask_water = bool(config.get("matching_mask_hs_water", DEFAULT_CONFIG.get("matching_mask_hs_water", True)))
+    ndwi_thr = float(config.get("matching_hs_ndwi_threshold", DEFAULT_CONFIG.get("matching_hs_ndwi_threshold", 0.2)))
+
+    try:
+        with rasterio.open(s2_stack_path) as src:
+            profile = src.profile.copy()
+            descriptions = list(src.descriptions)
+            s2_px = float(0.5 * (abs(src.transform.a) + abs(src.transform.e)))
+            height, width = int(src.height), int(src.width)
+            s2_transform, s2_crs = src.transform, src.crs
+            nodata = src.nodata if src.nodata is not None else 0
+            labels = [_normalize_s2_band_label(d) for d in descriptions]
+            scl_bidx = labels.index("SCL") + 1 if "SCL" in labels else None
+
+            bad = np.zeros((height, width), dtype=bool)
+            if scl_bidx is not None and exclude:
+                scl = src.read(scl_bidx)
+                bad |= np.isin(scl, sorted(exclude))
+                info["scl_masked_fraction"] = float(np.mean(bad))
+
+            if mask_water and hs_raster_path:
+                water = _hs_water_mask(hs_raster_path, hs_wavelengths_nm, ndwi_thr)
+                if water is not None:
+                    water_on_s2 = np.zeros((height, width), dtype=np.uint8)
+                    warp.reproject(
+                        source=water["mask"],
+                        destination=water_on_s2,
+                        src_transform=water["transform"],
+                        src_crs=water["crs"],
+                        dst_transform=s2_transform,
+                        dst_crs=s2_crs,
+                        resampling=Resampling.nearest,
+                    )
+                    info["hs_water_fraction"] = float(np.mean(water_on_s2 > 0))
+                    bad |= water_on_s2 > 0
+
+            hs_px = None
+            if hs_raster_path:
+                try:
+                    hx, hy = _infer_raster_native_resolution(hs_raster_path, fallback=30.0)
+                    hs_px = float(0.5 * (hx + hy))
+                except Exception:
+                    hs_px = None
+            sigma_px = 0.0
+            if fwhm_factor > 0 and hs_px and s2_px > 0:
+                # Remaining blur so the 10 m reference (own PSF ~1 GSD) matches the HS PSF.
+                extra_fwhm_m = float(np.sqrt(max(0.0, (fwhm_factor * hs_px) ** 2 - s2_px ** 2)))
+                sigma_px = extra_fwhm_m / 2.3548 / s2_px
+            info["psf_sigma_px"] = float(sigma_px)
+
+            if sigma_px < 0.3 and not np.any(bad):
+                return info
+
+            out_path = os.path.join(out_dir, f"{Path(s2_stack_path).stem}_match_{tag}.tif")
+            profile.update(
+                driver="GTiff",
+                nodata=nodata,
+                tiled=True,
+                BIGTIFF="YES",
+                **_gtiff_compression_profile(profile.get("dtype")),
+            )
+            for key in ("blockxsize", "blockysize"):
+                profile.pop(key, None)
+            dtype = np.dtype(profile["dtype"])
+            with rasterio.open(out_path, "w", **profile) as dst:
+                for bidx in range(1, src.count + 1):
+                    arr = src.read(bidx)
+                    valid = (arr != nodata) & ~bad
+                    if np.issubdtype(arr.dtype, np.floating):
+                        valid &= np.isfinite(arr)
+                    is_spectral = labels[bidx - 1] not in S2_L2A_ANCILLARY_BANDS
+                    if is_spectral and sigma_px >= 0.3:
+                        num = gaussian_filter(np.where(valid, arr, 0).astype(np.float32), sigma_px)
+                        den = gaussian_filter(valid.astype(np.float32), sigma_px)
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            blurred = np.where(den > 1e-3, num / den, 0.0)
+                        out = np.where(valid, blurred, nodata)
+                    else:
+                        out = np.where(valid, arr, nodata)
+                    if np.issubdtype(dtype, np.integer):
+                        info_i = np.iinfo(dtype)
+                        out = np.clip(np.rint(out), info_i.min, info_i.max)
+                    dst.write(out.astype(dtype), bidx)
+                    if descriptions[bidx - 1]:
+                        dst.set_band_description(bidx, descriptions[bidx - 1])
+                dst.update_tags(**src.tags())
+        src_mask = _s2_valid_mask_path(s2_stack_path)
+        if os.path.exists(src_mask):
+            with rasterio.open(src_mask) as msrc:
+                mprof = msrc.profile.copy()
+                mask = msrc.read(1)
+            mask = np.where(bad, 0, mask).astype(mask.dtype)
+            with rasterio.open(_s2_valid_mask_path(out_path), "w", **mprof) as mdst:
+                mdst.write(mask, 1)
+        info.update({"path": out_path, "applied": True, "masked_fraction": float(np.mean(bad))})
+        logger.info(
+            "Matching reference: PSF sigma %.2f px, %.1f%% of pixels masked (SCL classes %s%s).",
+            sigma_px,
+            100.0 * float(np.mean(bad)),
+            sorted(exclude),
+            ", HS water" if "hs_water_fraction" in info else "",
+        )
+    except Exception as exc:
+        logger.warning(_fmt_issue("S2_REF", f"Matching reference preparation failed ({exc}); using the plain stack."))
+        info = {"path": s2_stack_path, "applied": False, "error": str(exc)}
+    return info
 
 
 def _process_detector_branch_candidate(
@@ -7333,7 +8478,7 @@ def _process_detector_branch_candidate(
                             "s_b4match": branch_match_bidx,
                             "path_out": branch_global_out,
                             "fmt_out": "GTiff",
-                            "out_crea_options": ["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"],
+                            "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
                             "max_shift": g_cfg["max_shift"],
                             "ws": g_cfg["ws"],
                             "resamp_alg_deshift": "cubic",
@@ -7345,6 +8490,7 @@ def _process_detector_branch_candidate(
                         }
                         if _supports_constructor_kwarg(COREG, "CPUs"):
                             global_kwargs["CPUs"] = int(arosics_cpus)
+                        _add_arosics_calc_resampling(COREG, global_kwargs)
                         CRG = COREG(
                             s2_raster_path,
                             branch_geo,
@@ -7487,7 +8633,7 @@ def _process_detector_branch_candidate(
                     "cache_hs_narrowbands": bool(
                         config.get(
                             "cache_hs_narrowbands",
-                            DEFAULT_CONFIG.get("cache_hs_narrowbands", True),
+                            DEFAULT_CONFIG.get("cache_hs_narrowbands", False),
                         )
                     ),
                     "hs_narrowband_cache_dir": config.get(
@@ -7511,9 +8657,18 @@ def _process_detector_branch_candidate(
                     max_points_per_cell=max_points_per_cell,
                     min_points_required=warp_min_points,
                     stratification_extent=branch_extent_xy,
+                    band_min_median_reliability=float(
+                        config.get(
+                            "band_min_median_reliability",
+                            DEFAULT_CONFIG.get("band_min_median_reliability", 30.0),
+                        )
+                    ),
+                    band_weight_score=float(
+                        config.get("band_weight_score", DEFAULT_CONFIG.get("band_weight_score", 0.25))
+                    ),
                 )
                 if merged_tp_result.get("success") and merged_tp_result.get("merged_df") is not None:
-                    if str(config.get("transform_model_selection", "rule_based")).strip().lower() == "cv":
+                    if str(config.get("transform_model_selection", DEFAULT_CONFIG.get("transform_model_selection", "cv"))).strip().lower() == "cv":
                         cv_decision = _select_transform_model_cv(
                             merged_tp_result["merged_df"],
                             grid_rows=spatial_grid_rows,
@@ -7577,6 +8732,34 @@ def _process_detector_branch_candidate(
                             grid_rows=spatial_grid_rows,
                             grid_cols=spatial_grid_cols,
                             stratification_extent=branch_extent_xy,
+                        )
+                    checkpoint_kind = (
+                        "tps"
+                        if bool(polynomial_order_decision.get("use_tps", False))
+                        else ("affine" if int(polynomial_order_decision.get("order_used", 2)) <= 1 else "order2")
+                    )
+                    checkpoint = _checkpoint_accuracy(
+                        merged_tp_result["merged_df"],
+                        kind=checkpoint_kind,
+                        holdout_fraction=float(
+                            config.get(
+                                "checkpoint_holdout_fraction",
+                                DEFAULT_CONFIG.get("checkpoint_holdout_fraction", 0.2),
+                            )
+                        ),
+                    )
+                    polynomial_order_decision["checkpoint_accuracy"] = checkpoint
+                    if checkpoint.get("ok"):
+                        logger.info(
+                            "Candidate %d [%s]: independent check points (%s, %d%% held out): "
+                            "RMSE %.2f m, P90 %.2f m, max %.2f m.",
+                            candidate_idx + 1,
+                            branch_name,
+                            checkpoint_kind,
+                            int(round(100 * float(checkpoint["holdout_fraction"]))),
+                            float(checkpoint["checkpoint_rmse_m"]),
+                            float(checkpoint["checkpoint_p90_m"]),
+                            float(checkpoint["checkpoint_max_m"]),
                         )
                     gcp_result = _build_gcps_from_tiepoints(merged_tp_result["merged_df"])
                     min_gcps_for_order = _minimum_gcps_for_polynomial_order(
@@ -7745,7 +8928,7 @@ def _process_detector_branch_candidate(
                     "window_size": _coerce_window_size(matcher_profile.get("local_window_size"), (256, 256)),
                     "path_out": branch_local_out,
                     "fmt_out": "GTiff",
-                    "out_crea_options": ["COMPRESS=LZW", "BIGTIFF=YES", "TILED=YES"],
+                    "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
                     "r_b4match": branch_ref_bidx,
                     "s_b4match": branch_match_bidx,
                     "max_shift": float(matcher_profile.get("local_max_shift", 50.0)),
@@ -7763,6 +8946,7 @@ def _process_detector_branch_candidate(
                 fallback_max_iter = matcher_profile.get("local_max_iter")
                 if fallback_max_iter is not None and _supports_constructor_kwarg(COREG_LOCAL, "max_iter"):
                     fallback_kwargs["max_iter"] = int(fallback_max_iter)
+                _add_arosics_calc_resampling(COREG_LOCAL, fallback_kwargs)
                 CRL = COREG_LOCAL(s2_raster_path, branch_global_out, **fallback_kwargs)
                 CRL.correct_shifts()
 
@@ -7775,7 +8959,7 @@ def _process_detector_branch_candidate(
         tie_points_df = None
         tie_points_viz_df = None
         if CRL is not None:
-            tie_points_df = getattr(CRL, "CoRegPoints_table", None)
+            tie_points_df = _sanitize_arosics_tiepoints(getattr(CRL, "CoRegPoints_table", None))
             tie_points_viz_df = tie_points_df
         elif merged_tp_result.get("merged_df") is not None:
             tie_points_df = merged_tp_result["merged_df"]
@@ -7999,6 +9183,10 @@ def _process_detector_branch_candidate(
     out["polynomial_warp_used"] = bool(poly_used)
     out["tps_warp_used"] = bool(tps_used)
     out["polynomial_order_decision"] = dict(poly_decision)
+    out["checkpoint_accuracy"] = {
+        name: dict(decision.get("checkpoint_accuracy") or {})
+        for name, decision in branch_order_decisions.items()
+    }
     out["polynomial_order_used"] = int(poly_order_used)
     out["local_tiepoints_df"] = tie_points_df
     out["local_tiepoints_visualization_df"] = tie_points_viz_df
@@ -8659,13 +9847,15 @@ def _fallback_rgb_band_indices(
             uniq.append(idx)
             used.add(idx)
             continue
+        replaced = False
         for radius in range(1, band_count):
             for candidate in (idx - radius, idx + radius):
                 if 1 <= candidate <= band_count and candidate not in used:
                     uniq.append(candidate)
                     used.add(candidate)
+                    replaced = True
                     break
-            if len(uniq) == len(raw):
+            if replaced:
                 break
     while len(uniq) < 3:
         uniq.append(min(band_count, len(uniq) + 1))
@@ -8723,9 +9913,9 @@ def _resolve_quicklook_rgb_bands(
         b_idx = _pick_unique_band_index_for_wavelength(targets_nm[2], wl_match_nm, used)
         indices = (int(r_idx), int(g_idx), int(b_idx))
         selected_wl = [
-            float(wl_arr[r_idx - 1]) if np.isfinite(wl_arr[r_idx - 1]) else None,
-            float(wl_arr[g_idx - 1]) if np.isfinite(wl_arr[g_idx - 1]) else None,
-            float(wl_arr[b_idx - 1]) if np.isfinite(wl_arr[b_idx - 1]) else None,
+            float(wl_match_nm[r_idx - 1]) if np.isfinite(wl_match_nm[r_idx - 1]) else None,
+            float(wl_match_nm[g_idx - 1]) if np.isfinite(wl_match_nm[g_idx - 1]) else None,
+            float(wl_match_nm[b_idx - 1]) if np.isfinite(wl_match_nm[b_idx - 1]) else None,
         ]
         return indices, selected_wl, rgb_source
 
@@ -9147,11 +10337,23 @@ def _add_quicklook_scalebar(
     image_shape: Tuple[int, int],
     pixel_size_x: Any,
     pixel_size_y: Any,
+    x_scale: Any = 1.0,
+    y_scale: Any = 1.0,
 ) -> None:
-    """Draw a simple metric scale bar when pixel size is known."""
+    """Draw a simple metric scale bar when pixel size is known.
+
+    ``pixel_size_*`` are source-raster pixel sizes; ``*_scale`` are quicklook pixels per
+    source pixel, so a decimated quicklook gets a correspondingly larger ground pixel.
+    """
     try:
-        px_x = abs(float(pixel_size_x))
-        px_y = abs(float(pixel_size_y))
+        sx = float(x_scale) if x_scale is not None else 1.0
+        sy = float(y_scale) if y_scale is not None else 1.0
+        if not (np.isfinite(sx) and sx > 0):
+            sx = 1.0
+        if not (np.isfinite(sy) and sy > 0):
+            sy = 1.0
+        px_x = abs(float(pixel_size_x)) / sx
+        px_y = abs(float(pixel_size_y)) / sy
     except Exception:
         return
     if not (np.isfinite(px_x) and np.isfinite(px_y)):
@@ -9257,8 +10459,15 @@ def _extract_tiepoint_plot_data_rgb(
     x_offset: int,
     y_offset: int,
     valid_mask: np.ndarray,
+    background_transform: Optional[Affine] = None,
 ) -> Dict[str, Any]:
-    """Extract tiepoint coordinates for inliers/outliers/outside-valid with optional color values."""
+    """Extract tiepoint coordinates for inliers/outliers/outside-valid with optional color values.
+
+    Tie-point X_IM/Y_IM are pixel coordinates of the image AROSICS matched (the HS
+    branch grid), not of the quicklook background, which is the final output on the
+    larger S2-anchored grid. When ``background_transform`` is given, points are placed
+    from their map coordinates (X_MAP/Y_MAP) through the background's own geotransform.
+    """
     empty = {
         "total": 0,
         "inlier_total": 0,
@@ -9292,8 +10501,31 @@ def _extract_tiepoint_plot_data_rgb(
     h = int(valid_mask.shape[0])
     w = int(valid_mask.shape[1])
 
+    use_map = (
+        background_transform is not None
+        and "X_MAP" in df.columns
+        and "Y_MAP" in df.columns
+    )
+    out["coordinate_source"] = "map" if use_map else "image"
+
+    def _raw_pixel_coords(frame) -> Tuple[np.ndarray, np.ndarray]:
+        if use_map:
+            inv = ~background_transform
+            xm = np.asarray(frame["X_MAP"], dtype=float)
+            ym = np.asarray(frame["Y_MAP"], dtype=float)
+            # AROSICS derives X_MAP from X_IM with the corner convention
+            # (x = gt0 + X_IM * gt1), so this inverse reproduces X_IM exactly when the
+            # background is the matched grid, and re-grids it otherwise.
+            cols = inv.a * xm + inv.b * ym + inv.c
+            rows = inv.d * xm + inv.e * ym + inv.f
+            return cols, rows
+        return np.asarray(frame["X_IM"], dtype=float), np.asarray(frame["Y_IM"], dtype=float)
+
     def _classify_points(frame):
-        if "X_IM" not in frame.columns or "Y_IM" not in frame.columns or len(frame) < 1:
+        has_coords = ("X_MAP" in frame.columns and "Y_MAP" in frame.columns) if use_map else (
+            "X_IM" in frame.columns and "Y_IM" in frame.columns
+        )
+        if not has_coords or len(frame) < 1:
             return {
                 "x_in": np.array([], dtype=np.float32),
                 "y_in": np.array([], dtype=np.float32),
@@ -9302,8 +10534,7 @@ def _extract_tiepoint_plot_data_rgb(
                 "finite": np.array([], dtype=bool),
                 "inside_valid": np.array([], dtype=bool),
             }
-        x_raw = np.asarray(frame["X_IM"], dtype=float)
-        y_raw = np.asarray(frame["Y_IM"], dtype=float)
+        x_raw, y_raw = _raw_pixel_coords(frame)
         finite = np.isfinite(x_raw) & np.isfinite(y_raw)
         x_sc = (x_raw[finite] * float(x_scale) - float(x_offset)).astype(np.float32, copy=False)
         y_sc = (y_raw[finite] * float(y_scale) - float(y_offset)).astype(np.float32, copy=False)
@@ -9357,7 +10588,7 @@ def _extract_tiepoint_plot_data_rgb(
         out["outlier_plotted"] = int(out["x_outlier"].size)
         out["outside_valid_plotted"] = int(out["x_outside_valid"].size)
 
-        if len(df_in) > 0 and "X_IM" in df_in.columns and "Y_IM" in df_in.columns:
+        if len(df_in) > 0 and (use_map or ("X_IM" in df_in.columns and "Y_IM" in df_in.columns)):
             def _build_color(values: np.ndarray, label: str, cmap_name: str):
                 finite = cls_in.get("finite", np.array([], dtype=bool))
                 inside_valid = cls_in.get("inside_valid", np.array([], dtype=bool))
@@ -9374,8 +10605,9 @@ def _extract_tiepoint_plot_data_rgb(
                 vals = values[use].astype(np.float32, copy=False)
                 if not (float(np.nanmax(vals)) > float(np.nanmin(vals))):
                     return
-                x_raw = np.asarray(df_in["X_IM"], dtype=float)[use]
-                y_raw = np.asarray(df_in["Y_IM"], dtype=float)[use]
+                x_all, y_all = _raw_pixel_coords(df_in)
+                x_raw = np.asarray(x_all, dtype=float)[use]
+                y_raw = np.asarray(y_all, dtype=float)[use]
                 out["x_color"] = (x_raw * float(x_scale) - float(x_offset)).astype(np.float32, copy=False)
                 out["y_color"] = (y_raw * float(y_scale) - float(y_offset)).astype(np.float32, copy=False)
                 out["color_values"] = vals
@@ -9460,6 +10692,8 @@ def _write_quicklook_png(
                 image_shape=(int(rgb.shape[0]), int(rgb.shape[1])),
                 pixel_size_x=raster_info.get("pixel_size_x"),
                 pixel_size_y=raster_info.get("pixel_size_y"),
+                x_scale=raster_info.get("x_scale", 1.0),
+                y_scale=raster_info.get("y_scale", 1.0),
             )
         _add_quicklook_north_arrow(
             ax,
@@ -9512,6 +10746,12 @@ def _write_tiepoint_quicklook_png(
         rgb = np.zeros_like(rgb, dtype=np.float32)
         rgb[..., :] = np.array([0.08, 0.08, 0.08], dtype=np.float32)
 
+    background_transform = None
+    try:
+        with rasterio.open(background_raster) as bg_src:
+            background_transform = bg_src.transform
+    except Exception:
+        background_transform = None
     tp_plot = _extract_tiepoint_plot_data_rgb(
         tie_points_df=tie_points_df,
         x_scale=float(raster_info.get("x_scale", 1.0)),
@@ -9519,6 +10759,7 @@ def _write_tiepoint_quicklook_png(
         x_offset=int(raster_info.get("x_offset", 0)),
         y_offset=int(raster_info.get("y_offset", 0)),
         valid_mask=valid,
+        background_transform=background_transform,
     )
     px_x = raster_info.get("pixel_size_x")
     px_y = raster_info.get("pixel_size_y")
@@ -9694,6 +10935,8 @@ def _write_tiepoint_quicklook_png(
                 image_shape=(int(rgb.shape[0]), int(rgb.shape[1])),
                 pixel_size_x=raster_info.get("pixel_size_x"),
                 pixel_size_y=raster_info.get("pixel_size_y"),
+                x_scale=raster_info.get("x_scale", 1.0),
+                y_scale=raster_info.get("y_scale", 1.0),
             )
         _add_quicklook_north_arrow(
             ax,
@@ -10189,6 +11432,7 @@ def _write_displacement_vector_cartography_png(
         "occupied_cells_selected": 0,
         "warning": None,
     }
+    points_outside_data = 0
     arrow_len_max_rendered = 0.0
     arrow_len_max_frac_rendered = 0.0
     min_frac_used = float(max(1e-6, arrow_len_min_frac))
@@ -10272,6 +11516,7 @@ def _write_displacement_vector_cartography_png(
     basemap_used = False
     basemap_warning = None
     basemap_extent = None
+    basemap_valid_extent = None
     quiver_scale_used = 50.0
     try:
         ax.set_facecolor("#f4f7fb")
@@ -10298,6 +11543,20 @@ def _write_displacement_vector_cartography_png(
                         b = src.bounds
                         extent = (float(b.left), float(b.right), float(b.bottom), float(b.top))
                     basemap_extent = extent
+                    # The output raster covers the S2 reference extent; frame the plot on
+                    # the part that actually holds data, not the surrounding nodata.
+                    valid_rows = np.where(np.any(valid_arr, axis=1))[0]
+                    valid_cols = np.where(np.any(valid_arr, axis=0))[0]
+                    if valid_rows.size and valid_cols.size:
+                        h_q, w_q = valid_arr.shape
+                        px_w = (extent[1] - extent[0]) / float(w_q)
+                        px_h = (extent[3] - extent[2]) / float(h_q)
+                        basemap_valid_extent = (
+                            extent[0] + valid_cols[0] * px_w,
+                            extent[0] + (valid_cols[-1] + 1) * px_w,
+                            extent[3] - (valid_rows[-1] + 1) * px_h,
+                            extent[3] - valid_rows[0] * px_h,
+                        )
 
                     if np.any(valid_arr):
                         valid_vals = np.asarray(band_arr[valid_arr], dtype=float)
@@ -10401,19 +11660,33 @@ def _write_displacement_vector_cartography_png(
             edgecolor="black",
             alpha=0.95,
             zorder=5,
+            # Centre each (length-exaggerated) arrow on its tie point so arrows at the
+            # footprint edge do not appear to leave the image.
+            pivot="middle",
         )
+        ax.scatter(X, Y, s=2.5, c="black", linewidths=0, zorder=6)
         cbar = fig.colorbar(quiver, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("")
         cbar.ax.tick_params(labelsize=8)
 
         # Ensure full arrow extensions are included in the rendered frame.
-        x_head = X + U_plot
-        y_head = Y + V_plot
-        x_vals = np.concatenate([X, x_head])
-        y_vals = np.concatenate([Y, y_head])
-        if basemap_extent is not None:
-            x_vals = np.concatenate([x_vals, np.array([basemap_extent[0], basemap_extent[1]], dtype=float)])
-            y_vals = np.concatenate([y_vals, np.array([basemap_extent[2], basemap_extent[3]], dtype=float)])
+        x_head = X + 0.5 * U_plot
+        y_head = Y + 0.5 * V_plot
+        x_tail = X - 0.5 * U_plot
+        y_tail = Y - 0.5 * V_plot
+        x_vals = np.concatenate([x_tail, x_head])
+        y_vals = np.concatenate([y_tail, y_head])
+        frame_extent = basemap_valid_extent or basemap_extent
+        if frame_extent is not None:
+            x_vals = np.concatenate([x_vals, np.array([frame_extent[0], frame_extent[1]], dtype=float)])
+            y_vals = np.concatenate([y_vals, np.array([frame_extent[2], frame_extent[3]], dtype=float)])
+        if basemap_valid_extent is not None:
+            vx0, vx1, vy0, vy1 = basemap_valid_extent
+            tol_x = 0.01 * (vx1 - vx0)
+            tol_y = 0.01 * (vy1 - vy0)
+            points_outside_data = int(
+                np.count_nonzero((X < vx0 - tol_x) | (X > vx1 + tol_x) | (Y < vy0 - tol_y) | (Y > vy1 + tol_y))
+            )
         x_vals = x_vals[np.isfinite(x_vals)]
         y_vals = y_vals[np.isfinite(y_vals)]
         if x_vals.size > 0 and y_vals.size > 0:
@@ -10471,6 +11744,7 @@ def _write_displacement_vector_cartography_png(
         "sampling_method": sampling_info.get("method", "none"),
         "occupied_cells_total": int(sampling_info.get("occupied_cells_total", 0) or 0),
         "occupied_cells_sampled": int(sampling_info.get("occupied_cells_selected", 0) or 0),
+        "points_outside_data_extent": int(points_outside_data),
         "arrow_len_max_rendered": float(arrow_len_max_rendered),
         "arrow_len_max_frac_rendered": float(arrow_len_max_frac_rendered),
         "arrow_len_min_frac_target": float(min_frac_used),
@@ -10802,8 +12076,13 @@ def _coregister_prisma_ancillary_outputs(
     radiometric_contract: Optional[Dict[str, Any]] = None,
     radiometric_validation_max_windows: int = 64,
     pan_quality_data: Optional[np.ndarray] = None,
+    pan_reference_source: str = "hs",
 ) -> Dict[str, Any]:
-    """Generate coregistered ancillary outputs (PAN and quality masks)."""
+    """Generate coregistered ancillary outputs (PAN and quality masks).
+
+    ``pan_reference_source``: "hs" matches PAN against a PAN-like band from the
+    coregistered HS cube (falls back to S2); "s2" uses mean(B02, B03, B04, B08).
+    """
     result: Dict[str, Any] = {
         "status": "not_requested",
         "warnings": [],
@@ -10878,7 +12157,7 @@ def _coregister_prisma_ancillary_outputs(
         # product lacks a usable PCO error matrix.
         _cleanup_raster_temp_outputs(pan_quality_out)
         _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".hdr")))
-        _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".aux.xml")))
+        _remove_sidecar_if_exists(f"{pan_quality_out}.aux.xml")
         try:
             if pan_data is None or pan_geo_info is None:
                 raise RuntimeError("PAN source data unavailable.")
@@ -11050,21 +12329,49 @@ def _coregister_prisma_ancillary_outputs(
             )
             pan_tie_points_df = None
             pan_warp_source = pan_src
+            # True when tie points were matched on the PAN grid itself (synthetic S2 PAN
+            # reference); their X_IM/Y_IM are then already PAN pixel coordinates.
+            pan_tp_in_pan_pixel_space = False
 
             if bool(pan_use_synthetic_reference):
-                if not s2_reference_raster_path or not os.path.exists(s2_reference_raster_path):
-                    raise RuntimeError("Sentinel-2 reference stack unavailable for synthetic PAN branch.")
-
-                synth_result = _create_synthetic_s2_pan(
-                    s2_stack_path=s2_reference_raster_path,
-                    output_path=synthetic_s2_pan_path,
-                    s2_band_indices=(
-                        int(MULTIBAND_S2_WAVELENGTHS["B02"]["stack_idx"]),
-                        int(MULTIBAND_S2_WAVELENGTHS["B03"]["stack_idx"]),
-                        int(MULTIBAND_S2_WAVELENGTHS["B04"]["stack_idx"]),
-                        int(MULTIBAND_S2_WAVELENGTHS["B08"]["stack_idx"]),
-                    ),
-                )
+                synth_result: Dict[str, Any] = {"ok": False}
+                if str(pan_reference_source or "hs").strip().lower() == "hs":
+                    # Match PAN against a PAN-like band synthesised from the already
+                    # coregistered HS cube (PAN range 400-700 nm): PAN then follows the HS
+                    # product's geometry exactly instead of an independent S2 match.
+                    hs_pan_bands = _hs_pan_band_indices(hs_reference_raster_path)
+                    if hs_pan_bands:
+                        synth_result = _create_synthetic_s2_pan(
+                            s2_stack_path=str(hs_reference_raster_path),
+                            output_path=synthetic_s2_pan_path,
+                            s2_band_indices=hs_pan_bands,
+                        )
+                    if synth_result.get("ok", False):
+                        result["pan_reference_source"] = "hs"
+                        with rasterio.open(synthetic_s2_pan_path, "r+") as synth_dst:
+                            synth_dst.set_band_description(1, "HS_SYNTHETIC_PAN_400_700NM")
+                    else:
+                        result["warnings"].append(
+                            _fmt_issue(
+                                "ANCILLARY",
+                                "HS-based PAN reference unavailable "
+                                f"({synth_result.get('error', 'no HS bands in 400-700 nm')}); using Sentinel-2.",
+                            )
+                        )
+                if not synth_result.get("ok", False):
+                    if not s2_reference_raster_path or not os.path.exists(s2_reference_raster_path):
+                        raise RuntimeError("Sentinel-2 reference stack unavailable for synthetic PAN branch.")
+                    synth_result = _create_synthetic_s2_pan(
+                        s2_stack_path=s2_reference_raster_path,
+                        output_path=synthetic_s2_pan_path,
+                        s2_band_indices=(
+                            int(MULTIBAND_S2_WAVELENGTHS["B02"]["stack_idx"]),
+                            int(MULTIBAND_S2_WAVELENGTHS["B03"]["stack_idx"]),
+                            int(MULTIBAND_S2_WAVELENGTHS["B04"]["stack_idx"]),
+                            int(MULTIBAND_S2_WAVELENGTHS["B08"]["stack_idx"]),
+                        ),
+                    )
+                    result["pan_reference_source"] = "s2"
                 if not synth_result.get("ok", False):
                     raise RuntimeError(synth_result.get("error", "failed to create synthetic S2 PAN"))
 
@@ -11079,6 +12386,25 @@ def _coregister_prisma_ancillary_outputs(
                     pan_src,
                     requested_window_size=pan_local_window_size,
                 )
+                pan_match_shift = float(pan_shift)
+                if result.get("pan_reference_source") == "hs":
+                    # AROSICS reads ws/max_shift in pixels of the coarser (reference) image.
+                    # The PAN defaults were tuned for a 10 m S2 reference; keep the same ground
+                    # size for the coarser HS reference and clamp to its extent.
+                    with rasterio.open(synthetic_s2_pan_path) as hs_ref_src:
+                        ref_res = float(0.5 * (abs(hs_ref_src.transform.a) + abs(hs_ref_src.transform.e)))
+                        ref_w, ref_h = int(hs_ref_src.width), int(hs_ref_src.height)
+                    scale = 10.0 / ref_res if ref_res > 10.0 else 1.0
+                    pan_ws = (
+                        int(max(32, min(ref_w, round(pan_ws[0] * scale)))),
+                        int(max(32, min(ref_h, round(pan_ws[1] * scale)))),
+                    )
+                    pan_match_shift = float(max(5.0, pan_shift * scale))
+                    result["pan_reference_matching"] = {
+                        "reference_resolution_m": ref_res,
+                        "window_size_px": list(pan_ws),
+                        "max_shift_px": pan_match_shift,
+                    }
                 pan_tp_result = _collect_pan_tiepoints_with_synthetic_reference(
                     synthetic_s2_pan_path=synthetic_s2_pan_path,
                     pan_source_path=pan_src,
@@ -11086,7 +12412,7 @@ def _coregister_prisma_ancillary_outputs(
                     pan_local_path=pan_local_path,
                     ws=pan_ws,
                     grid_res=pan_grid_res,
-                    max_shift=pan_shift,
+                    max_shift=pan_match_shift,
                     tiep_filter_level=pan_tiep_filter,
                     local_max_iter=pan_max_iter,
                     reference_nodata=float(ref_nodata),
@@ -11097,6 +12423,9 @@ def _coregister_prisma_ancillary_outputs(
                     result["warnings"].append(_fmt_issue("ANCILLARY", str(note)))
                 pan_warp_source = str(pan_tp_result.get("global_path") or pan_src)
                 pan_tie_points_df = pan_tp_result.get("tiepoints_df")
+                pan_tp_in_pan_pixel_space = bool(
+                    pan_tie_points_df is not None and len(pan_tie_points_df) > 0
+                )
 
             if pan_tie_points_df is None or len(pan_tie_points_df) == 0:
                 pan_tie_points_df = base_tie_points_df
@@ -11136,7 +12465,10 @@ def _coregister_prisma_ancillary_outputs(
 
             pan_res = float(0.5 * (pan_xres + pan_yres))
             if norm_pan_gcp_mode == "scaled_image":
-                if hs_reference_raster_path and os.path.exists(hs_reference_raster_path):
+                if pan_tp_in_pan_pixel_space:
+                    # Synthetic-reference tie points are already on the PAN grid: no rescale.
+                    hs_res = pan_res
+                elif hs_reference_raster_path and os.path.exists(hs_reference_raster_path):
                     hs_xres, hs_yres = _infer_raster_native_resolution(hs_reference_raster_path, fallback=30.0)
                     hs_res = float(0.5 * (hs_xres + hs_yres))
                 else:
@@ -11412,7 +12744,7 @@ def _coregister_prisma_ancillary_outputs(
                     _cleanup_raster_temp_outputs(pan_quality_out)
                     _remove_sidecar_if_exists(str(Path(pan_quality_out).with_suffix(".hdr")))
                     _remove_sidecar_if_exists(
-                        str(Path(pan_quality_out).with_suffix(".aux.xml"))
+                        f"{pan_quality_out}.aux.xml"
                     )
                     raise RuntimeError(
                         "PAN categorical quality could not be aligned/applied; "
@@ -11532,7 +12864,7 @@ def _coregister_prisma_ancillary_outputs(
             result["outputs"]["pan"] = None
             _cleanup_raster_temp_outputs(pan_out)
             _remove_sidecar_if_exists(str(Path(pan_out).with_suffix(".hdr")))
-            _remove_sidecar_if_exists(str(Path(pan_out).with_suffix(".aux.xml")))
+            _remove_sidecar_if_exists(f"{pan_out}.aux.xml")
             result["warnings"].append(_fmt_issue("ANCILLARY", f"PAN ancillary output failed: {e}"))
         finally:
             for tmp_path in pan_temp_paths:
@@ -11615,6 +12947,7 @@ def _coregister_prisma_ancillary_outputs(
                     nodata=255,
                     gdalwarp_multi=bool(gdalwarp_multi),
                     gdalwarp_num_threads=gdal_threads,
+                    timeout_s=QUALITY_MASK_WARP_TIMEOUT_S,
                 )
                 if not qm_warp.get("success", False):
                     raise RuntimeError(qm_warp.get("error_message", f"unknown {label} quality warp error"))
@@ -12054,7 +13387,7 @@ def _finalize_pipeline_sidecars(
     """Write or clean pipeline sidecars for non-main outputs."""
     result = {"ok": False, "warnings": [], "errors": []}
     hdr_path = str(Path(tif_path).with_suffix(".hdr"))
-    aux_path = str(Path(tif_path).with_suffix(".aux.xml"))
+    aux_path = f"{tif_path}.aux.xml"
 
     if str(artifact_role) in PIPELINE_HDR_ARTIFACT_ROLES:
         hdr_result = _write_envi_header(
@@ -12734,6 +14067,7 @@ def _compute_band_statistics_approx(
     sampled_chunks: List[np.ndarray] = []
     valid_count = 0
     sampled_total = 0
+    sampled_window_px = 0
     data_min = np.inf
     data_max = -np.inf
     sum_val = 0.0
@@ -12748,6 +14082,7 @@ def _compute_band_statistics_approx(
         if (widx % step) != offset:
             continue
         band = src.read(bidx, window=window).astype(np.float64, copy=False)
+        sampled_window_px += int(band.size)
         valid = np.isfinite(band)
         for nodata_candidate in nodata_values:
             valid &= band != float(nodata_candidate)
@@ -12780,16 +14115,20 @@ def _compute_band_statistics_approx(
             "sampled_pixels": 0,
         }, None)
 
+    # Only sampled windows were inspected: extrapolate the valid fraction to the
+    # full raster instead of dividing the sampled count by the full pixel count.
+    valid_fraction = float(valid_count) / float(max(1, sampled_window_px))
+    estimated_valid_count = max(1, int(round(valid_fraction * total_px)))
     mean = sum_val / float(valid_count)
     variance = max(0.0, (sum_sq / float(valid_count)) - (mean * mean))
     stats = {
-        "valid_count": int(valid_count),
-        "invalid_count": max(0, int(total_px - valid_count)),
+        "valid_count": int(estimated_valid_count),
+        "invalid_count": max(0, int(total_px - estimated_valid_count)),
         "minimum": float(data_min),
         "maximum": float(data_max),
         "mean": float(mean),
         "stddev": float(np.sqrt(variance)),
-        "valid_percent": float(100.0 * valid_count / max(1, total_px)),
+        "valid_percent": float(100.0 * valid_fraction),
         "approximate": True,
         "sampled_pixels": int(sampled_total),
     }
@@ -12889,7 +14228,7 @@ def _write_pam_aux_xml(
 ) -> Dict[str, Any]:
     """Write a GDAL PAM .aux.xml sidecar with per-band stats and optional histograms."""
     result = {"ok": False, "warnings": [], "errors": [], "raster_passes": 0}
-    aux_path = str(Path(tif_path).with_suffix(".aux.xml"))
+    aux_path = f"{tif_path}.aux.xml"
     try:
         norm_params = dict(normalization_params or {})
         extension_level = _normalize_metadata_extension_level(metadata_extension_level)
@@ -13061,7 +14400,9 @@ def _write_pam_aux_xml(
                                 ET.SubElement(hist_item, "HistMax").text = f"{hist['hist_max']:.10g}"
                                 ET.SubElement(hist_item, "BucketCount").text = str(hist["bucket_count"])
                                 ET.SubElement(hist_item, "IncludeOutOfRange").text = "0"
-                                ET.SubElement(hist_item, "Approximate").text = "0"
+                                ET.SubElement(hist_item, "Approximate").text = (
+                                    "1" if approximate_stats else "0"
+                                )
                                 ET.SubElement(hist_item, "HistCounts").text = "|".join(
                                     str(int(v)) for v in hist["counts"]
                                 )
@@ -13343,10 +14684,26 @@ def _build_dataset_row(metrics_dict: Dict[str, Any]) -> Dict[str, Any]:
     if total_count is None and metrics_dict.get("multiband_tiepoint_counts_total") is not None:
         total_count = metrics_dict.get("multiband_tiepoint_counts_total")
 
-    if total_count is not None:
-        row["multiband_tiepoint_counts"] = total_count
+    # Always overwrite: an empty per-band dict copied above cannot be written to Excel.
+    row["multiband_tiepoint_counts"] = total_count
 
     return row
+
+
+def _xlsx_safe_value(value: Any) -> Any:
+    """Coerce a value into something openpyxl can store in a cell."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, (dict, list, tuple, set)):
+        try:
+            return json.dumps(value if not isinstance(value, set) else sorted(value, key=str), default=str)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 def _write_single_scene_dataset_xlsx(metrics_dict: Dict[str, Any], xlsx_path: str) -> bool:
@@ -13369,7 +14726,7 @@ def _write_single_scene_dataset_xlsx(metrics_dict: Dict[str, Any], xlsx_path: st
 
         for col_idx, column in enumerate(DATASET_XLSX_COLUMNS, 1):
             ws.cell(row=1, column=col_idx, value=column)
-            ws.cell(row=2, column=col_idx, value=row.get(column))
+            ws.cell(row=2, column=col_idx, value=_xlsx_safe_value(row.get(column)))
 
         wb.save(xlsx_path)
         logger.info("Per-scene dataset workbook written: %s", xlsx_path)
@@ -13507,7 +14864,7 @@ def _write_batch_summary_xlsx(
     for row_idx, (label, value) in enumerate(overview_rows, 1):
         label_cell = ws_overview.cell(row=row_idx, column=1, value=label)
         label_cell.font = Font(bold=True)
-        ws_overview.cell(row=row_idx, column=2, value=value)
+        ws_overview.cell(row=row_idx, column=2, value=_xlsx_safe_value(value))
 
     header_fill = PatternFill(start_color="CCCCCC", fill_type="solid")
     header_font = Font(bold=True)
@@ -13523,7 +14880,7 @@ def _write_batch_summary_xlsx(
             cell.alignment = header_alignment
         for row_idx, row_values in enumerate(rows, 2):
             for col_idx, header in enumerate(BATCH_SUMMARY_XLSX_COLUMNS, 1):
-                ws.cell(row=row_idx, column=col_idx, value=row_values.get(header))
+                ws.cell(row=row_idx, column=col_idx, value=_xlsx_safe_value(row_values.get(header)))
 
     _write_status_sheet("Success", grouped_rows.get("success", []))
     _write_status_sheet("Skipped", grouped_rows.get("skipped", []))
@@ -13589,14 +14946,21 @@ def _finalize_batch_results(
 
     grouped_rows = _collect_batch_summary_rows(results)
     summary_path = os.path.join(output_dir, "batch_summary.txt")
-    _write_batch_summary_txt(summary_path=summary_path, results=results, grouped_rows=grouped_rows)
-    logger.info(f"Summary written: {summary_path}")
+    # Summary files are a convenience: a write failure (e.g. the workbook is open in
+    # Excel) must not discard the results of scenes that already finished.
+    try:
+        _write_batch_summary_txt(summary_path=summary_path, results=results, grouped_rows=grouped_rows)
+        logger.info(f"Summary written: {summary_path}")
+    except Exception as exc:
+        logger.warning(_fmt_issue("BATCH_SUMMARY", f"Could not write {summary_path}: {exc}"))
     try:
         xlsx_path = os.path.join(output_dir, "batch_summary.xlsx")
         _write_batch_summary_xlsx(xlsx_path=xlsx_path, results=results, grouped_rows=grouped_rows)
         logger.info(f"Excel summary written: {xlsx_path}")
     except ImportError:
         logger.debug("openpyxl not available, skipping Excel summary")
+    except Exception as exc:
+        logger.warning(_fmt_issue("BATCH_SUMMARY", f"Could not write Excel summary: {exc}"))
 
     _emit_progress(
         progress_callback,
@@ -14023,15 +15387,17 @@ def _record_batch_scene_result(
     failed_metrics = dict(scene_result.get("failed_metrics", {}) or {})
     if not failed_metrics:
         failed_metrics = _build_failed_scene_metrics(source_key, scene_result.get("hyp_type"), msg)
-    fallback_dataset_path = os.path.join(
-        output_dir,
-        _build_dataset_xlsx_filename(
-            scene_name=failed_metrics.get("scene_name"),
-            filename=failed_metrics.get("filename"),
-        ),
-    )
-    failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
-    _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
+    if not failed_metrics.get("dataset_xlsx_path"):
+        # Only write a root-level workbook when the scene did not already write its own.
+        fallback_dataset_path = os.path.join(
+            output_dir,
+            _build_dataset_xlsx_filename(
+                scene_name=failed_metrics.get("scene_name"),
+                filename=failed_metrics.get("filename"),
+            ),
+        )
+        failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
+        _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
     results["failed_details"].append(failed_metrics)
     results.setdefault("scene_results", []).append(
         {
@@ -14661,7 +16027,7 @@ def _finalize_coreg_output(
             all_warnings.append(_fmt_issue("METADATA", f"ENVI metadata degraded: {error_msg}"))
             metadata_status = "degraded"
 
-        aux_path = str(Path(output_path).with_suffix(".aux.xml"))
+        aux_path = f"{output_path}.aux.xml"
         if metadata_extension == "none":
             if os.path.exists(aux_path):
                 try:
@@ -14847,7 +16213,7 @@ def _promote_s2_stack(source_path, target_path, temp_root=None):
             opts = gdal.TranslateOptions(
                 format="GTiff",
                 bandList=list(range(1, promoted_count + 1)),
-                creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+                creationOptions=_gtiff_compression_options("uint16") + ["TILED=YES", "BIGTIFF=YES"],
             )
             ds = gdal.Translate(target_abs, source_abs, options=opts)
             if ds is None:
@@ -14870,7 +16236,7 @@ def _promote_s2_stack(source_path, target_path, temp_root=None):
             output_path=target_abs,
             source_bands_1based=list(range(1, promoted_count + 1)),
             out_dtype=source_dtype,
-            compress="LZW",
+            compress=_gtiff_codec(),
         )
         if not copy_result.get("ok", False):
             raise RuntimeError(copy_result.get("error", "failed to normalize S2 reference stack"))
@@ -15016,6 +16382,55 @@ class _ProgressHeartbeat:
         return False
 
 
+def _remove_partial_coreg_output(coreg_path: Optional[str]) -> None:
+    """Delete a final output (and its sidecars) left by a scene that then failed."""
+    if not coreg_path:
+        return
+    base = os.path.splitext(str(coreg_path))[0]
+    for candidate in (
+        str(coreg_path),
+        f"{coreg_path}.aux.xml",
+        f"{coreg_path}.ovr",
+        f"{coreg_path}.msk",
+        f"{base}.hdr",
+        f"{base}.aux.xml",
+    ):
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+                logger.info("Removed partial output of failed scene: %s", candidate)
+        except Exception:
+            pass
+
+
+def _set_worker_env(values: Dict[str, str]) -> None:
+    """ProcessPoolExecutor initializer: set environment variables in a worker."""
+    for key, value in (values or {}).items():
+        os.environ[str(key)] = str(value)
+
+
+class _SessionForwardingConfig(dict):
+    """Config copy that writes ``_cdse_session`` through to the caller's dict as well."""
+
+    _FORWARDED_KEYS = frozenset({"_cdse_session"})
+
+    def __init__(self, data: Dict[str, Any], *, parent: Dict[str, Any]):
+        super().__init__(data)
+        self._parent = parent
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(key, value)
+        if key in self._FORWARDED_KEYS:
+            try:
+                self._parent[key] = value
+            except Exception:
+                pass
+
+    def __reduce__(self):
+        # Pickle (process pools) as a plain dict; sessions are never sent across processes.
+        return (dict, (dict(self),))
+
+
 def run_coregistration(
     hs_file: str,
     hyp_type: str,
@@ -15054,12 +16469,22 @@ def run_coregistration(
     logger.info(f"Output directory: {output_dir}")
 
     os.makedirs(output_dir, exist_ok=True)
+    caller_config = config
     config, cpu_guard_warnings = apply_cpu_oversubscription_guard(
         config,
         explicit_keys=config.get("_cpu_guard_explicit_keys", set()) if isinstance(config, dict) else set(),
     )
+    if isinstance(caller_config, dict):
+        # The guard returns a copy; forward refreshed CDSE sessions to the caller's dict so
+        # the next batch scene (and the GUI's next run) reuses them instead of logging in again.
+        config = _SessionForwardingConfig(config, parent=caller_config)
     for warning_msg in cpu_guard_warnings:
         logger.warning(warning_msg)
+    global _ACTIVE_AROSICS_RESAMP_CALC
+    _ACTIVE_AROSICS_RESAMP_CALC = (
+        str(config.get("arosics_resamp_alg_calc", DEFAULT_CONFIG.get("arosics_resamp_alg_calc")) or "")
+        or None
+    )
 
     # Extract config parameters with defaults
     days_window = config.get('days_window', 30)
@@ -15963,8 +17388,28 @@ def run_coregistration(
             )
             config["_cdse_session"] = session
             if items:
-                s2_candidates_list = _rank_s2_candidates(items, hs_time, bbox, min_overlap)
+                s2_candidates_list = _rank_s2_candidates(items, hs_time, bbox, min_overlap, weights=config)
                 config["_cdse_session"] = session
+                if bool(
+                    config.get(
+                        "s2_footprint_cloud_screen", DEFAULT_CONFIG.get("s2_footprint_cloud_screen", True)
+                    )
+                ):
+                    with _ProgressHeartbeat(
+                        progress_callback,
+                        "Screening Sentinel-2 candidates",
+                        scene_idx=scene_idx,
+                        scene_total=scene_total,
+                        substage="Footprint cloud cover from SCL",
+                        interval_s=progress_heartbeat_interval_s,
+                    ):
+                        s2_candidates_list = _screen_s2_candidates_by_footprint_cloud(
+                            session,
+                            s2_candidates_list,
+                            bbox=bbox,
+                            config=config,
+                            work_dir=folder_struct["temp"],
+                        )
         except CDSEAuthenticationError as exc:
             _emit_progress(
                 progress_callback,
@@ -16082,14 +17527,32 @@ def run_coregistration(
                         download_elapsed = 0.0
                         logger.info("Reusing existing Sentinel-2 ZIP: %s", zip_path)
                     else:
+                        s2_download_dir = _resolve_s2_download_dir(config, folder_struct['temp'])
                         zip_path, session = _download_s2_product(
-                            session, s2_candidate, folder_struct['temp'],
+                            session, s2_candidate, s2_download_dir,
                             allow_gui_prompt=allow_gui_prompt,
                             progress_callback=progress_callback,
                             scene_idx=scene_idx,
                             scene_total=scene_total,
                             prompt_userpass_fn=prompt_userpass_fn,
+                            band_only=bool(
+                                config.get(
+                                    "s2_band_only_download",
+                                    DEFAULT_CONFIG.get("s2_band_only_download", True),
+                                )
+                            ),
                         )
+                        if s2_download_dir != folder_struct['temp']:
+                            _prune_s2_product_cache(
+                                s2_download_dir,
+                                float(
+                                    config.get(
+                                        "s2_product_cache_max_gb",
+                                        DEFAULT_CONFIG.get("s2_product_cache_max_gb", 20.0),
+                                    )
+                                ),
+                                keep=[zip_path],
+                            )
                         download_elapsed = _record_stage_timing(timed_stages, "s2_download", t0_s2_download)
                         config["_cdse_session"] = session
                     timed_stages[f"candidate_{cand_idx + 1}_s2_download"] = float(download_elapsed)
@@ -16120,7 +17583,14 @@ def run_coregistration(
                     stack_elapsed = _record_stage_timing(timed_stages, "s2_stack_build", t0_s2_stack)
                     timed_stages[f"candidate_{cand_idx + 1}_s2_stack_build"] = float(stack_elapsed)
                     s2_cache_events.append(candidate_s2_cache_info)
-                    if bool(candidate_s2_cache_info.get("source_zip_can_delete", True)):
+                    zip_in_scene_temp = os.path.abspath(os.path.dirname(str(zip_path))) == os.path.abspath(
+                        str(folder_struct['temp'])
+                    )
+                    if not zip_in_scene_temp:
+                        # Refresh LRU time: a VRT stack may keep reading this cached ZIP.
+                        _touch_quiet(str(zip_path))
+                    if zip_in_scene_temp and bool(candidate_s2_cache_info.get("source_zip_can_delete", True)):
+                        # ZIPs in the persistent product cache are kept for later scenes/reruns.
                         try:
                             os.remove(zip_path)
                         except Exception:
@@ -16314,7 +17784,7 @@ def run_coregistration(
                     )
                     reordered_path = os.path.join(folder_struct['temp'], f"{scene_name}_reordered_c{cand_idx}.tif")
                     reorder_res = _stream_copy_raster_with_band_order(
-                        temp_hs_path, reordered_path, candidate_source_bands_1based, compress="LZW"
+                        temp_hs_path, reordered_path, candidate_source_bands_1based, compress=_gtiff_codec()
                     )
                     if not reorder_res.get("ok", False):
                         raise RuntimeError(
@@ -16401,6 +17871,14 @@ def run_coregistration(
             current_s2_path = coreg_s2_path
             s2_crs = coreg_s2_crs
             candidate_pre_source_path = temp_hs_path
+            matching_reference = _prepare_matching_reference(
+                current_s2_path,
+                hs_raster_path=candidate_pre_source_path,
+                hs_wavelengths_nm=wl,
+                config=config,
+                out_dir=folder_struct['temp'],
+                tag=f"c{cand_idx + 1}",
+            )
             branch_eval = _process_detector_branch_candidate(
                 candidate_idx=cand_idx,
                 scene_name=scene_name,
@@ -16408,7 +17886,7 @@ def run_coregistration(
                 date_tag=date_tag,
                 detector_plan=detector_plan,
                 source_raster_path=candidate_pre_source_path,
-                s2_raster_path=current_s2_path,
+                s2_raster_path=str(matching_reference.get("path") or current_s2_path),
                 s2_crs=s2_crs,
                 hyp_type=hyp_type,
                 folder_struct=folder_struct,
@@ -16466,6 +17944,7 @@ def run_coregistration(
                 "polynomial_warp_used": bool(branch_eval.get("polynomial_warp_used", False)),
                 "tps_warp_used": bool(branch_eval.get("tps_warp_used", False)),
                 "polynomial_order_decision": dict(branch_eval.get("polynomial_order_decision", {})),
+                "checkpoint_accuracy": dict(branch_eval.get("checkpoint_accuracy", {}) or {}),
                 "polynomial_order_used": int(branch_eval.get("polynomial_order_used", preferred_polynomial_order)),
                 "local_tiepoints_df": branch_eval.get("local_tiepoints_df"),
                 "local_tiepoints_visualization_df": branch_eval.get("local_tiepoints_visualization_df"),
@@ -16508,6 +17987,17 @@ def run_coregistration(
                 break
             continue
 
+        except CDSEAuthenticationError as exc:
+            # Authentication will fail for every remaining candidate and scene too;
+            # surface it so the batch can abort instead of reporting "no valid output".
+            _emit_progress(
+                progress_callback,
+                "Failed: CDSE authentication",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                status="error",
+            )
+            _raise_scene_failure(str(exc), CDSEAuthenticationError)
         except Exception as e:
             logger.error(f"Critical error with candidate {cand_idx + 1}: {e}")
             candidate_errors.append(
@@ -16600,312 +18090,337 @@ def run_coregistration(
     }
 
     if final_source_path and os.path.exists(final_source_path):
-        t0_finalize = perf_counter()
-        with _ProgressHeartbeat(
-            progress_callback,
-            "Finalizing output",
-            scene_idx=scene_idx,
-            scene_total=scene_total,
-            substage="Writing final raster and metadata",
-            interval_s=progress_heartbeat_interval_s,
-        ):
-            try:
-                finalize_result = _finalize_coreg_output(
-                    final_source_path,
+        try:
+            t0_finalize = perf_counter()
+            with _ProgressHeartbeat(
+                progress_callback,
+                "Finalizing output",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                substage="Writing final raster and metadata",
+                interval_s=progress_heartbeat_interval_s,
+            ):
+                try:
+                    finalize_result = _finalize_coreg_output(
+                        final_source_path,
+                        coreg_out,
+                        hyp_type,
+                        wl,
+                        fwhm,
+                        band_names,
+                        band_detectors,
+                        source_bands_1based=(
+                            best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
+                        ),
+                        remove_source=True,
+                        normalization_params=normalization_params,
+                        build_overviews=bool(build_overviews),
+                        remove_detector_overlap=remove_detector_overlap_bands,
+                        strict_metadata=bool(strict_metadata),
+                        metadata_extension_level=metadata_extension_level,
+                        metadata_stats_mode=metadata_stats_mode,
+                        metadata_stats_sample_windows=metadata_stats_sample_windows,
+                        metadata_stats_seed=metadata_stats_seed,
+                        metadata_histogram_buckets=metadata_histogram_buckets,
+                        metadata_label_precision=metadata_label_precision,
+                        timing_logs=timing_logs,
+                        radiometric_contract=prisma_radiometric_contract,
+                        radiometric_validation_max_windows=validation_max_windows,
+                    )
+                except Exception as exc:
+                    _raise_scene_failure(str(exc))
+            finalize_elapsed_s = perf_counter() - t0_finalize
+            post_accept_stage_timings["finalize_write_metadata_s"] = float(finalize_elapsed_s)
+            timed_stages["finalize"] = float(finalize_elapsed_s)
+            if isinstance(finalize_result, dict):
+                metadata_status = finalize_result.get("metadata_status", metadata_status)
+                metadata_warnings = list(finalize_result.get("metadata_warnings", []))
+                metadata_schema_version = _safe_parse_int(
+                    finalize_result.get("metadata_schema_version", metadata_schema_version),
+                    metadata_schema_version,
+                    "metadata_schema_version",
+                )
+                finalize_timings = dict(finalize_result.get("timings", {}))
+                finalize_raster_passes = _safe_parse_int(
+                    finalize_result.get("raster_passes", finalize_raster_passes),
+                    finalize_raster_passes,
+                    "finalize_raster_passes",
+                )
+                normalization_mode = str(finalize_result.get("normalization_mode", normalization_mode))
+                if finalize_result.get("normalization_params"):
+                    # Persist sanitized params in downstream metrics/manifest.
+                    norm_cfg = dict(finalize_result.get("normalization_params", {}))
+                    normalization_params = NormalizationParams(
+                        mode=normalize_mode(norm_cfg.get("mode", normalization_mode), default=normalization_mode),
+                        p_low=float(norm_cfg.get("p_low", normalization_params.p_low)),
+                        p_high=float(norm_cfg.get("p_high", normalization_params.p_high)),
+                        clip=bool(norm_cfg.get("clip", normalization_params.clip)),
+                        eps=float(norm_cfg.get("eps", normalization_params.eps)),
+                        min_valid_pixels=_safe_parse_int(
+                            norm_cfg.get("min_valid_pixels", normalization_params.min_valid_pixels),
+                            normalization_params.min_valid_pixels,
+                            "norm_min_valid_pixels",
+                        ),
+                        reservoir_size=_safe_parse_int(
+                            norm_cfg.get("reservoir_size", normalization_params.reservoir_size),
+                            normalization_params.reservoir_size,
+                            "norm_reservoir_size",
+                        ),
+                        seed=_safe_parse_int(
+                            norm_cfg.get("seed", normalization_params.seed),
+                            normalization_params.seed,
+                            "norm_seed",
+                        ),
+                        tile_size=_safe_parse_int(
+                            norm_cfg.get("tile_size", normalization_params.tile_size),
+                            normalization_params.tile_size,
+                            "norm_tile_size",
+                        ),
+                    )
+            if timing_logs:
+                logger.info("Post-accept finalize elapsed: %.2fs", finalize_elapsed_s)
+
+            t0_final_validation = perf_counter()
+            validation_full_scan_requested = bool(validation_full_scan) or int(validation_max_windows) <= 0
+            validation_window_limit = 0 if validation_full_scan_requested else max(1, int(validation_max_windows))
+            if isinstance(finalize_result, dict) and finalize_result.get("output_validation"):
+                final_output_validation = dict(finalize_result.get("output_validation", {}))
+            elif best_candidate is not None and best_candidate.get("output_validation"):
+                # Reuse candidate-stage content validation when finalize did not rewrite pixels.
+                final_output_validation = dict(best_candidate.get("output_validation", {}))
+                final_output_validation["path"] = coreg_out
+            else:
+                final_output_validation = _validate_coreg_raster_content(
                     coreg_out,
+                    nodata=PROCESSING_NODATA,
+                    max_windows=validation_window_limit,
+                    stop_on_first_valid=not validation_full_scan_requested,
+                )
+            post_accept_stage_timings["final_output_validation_s"] = float(perf_counter() - t0_final_validation)
+            if not final_output_validation.get("ok", False):
+                _raise_scene_failure(
+                    _fmt_issue(
+                        "QUALITY",
+                        f"Final output is empty/invalid: {final_output_validation.get('error', 'unknown error')}",
+                    )
+                )
+
+            if save_pre:
+                if best_candidate is None or not best_candidate.get("pre_coreg_source_path"):
+                    _raise_scene_failure(_fmt_issue("PRE_COREG", "No candidate pre-coreg source available."))
+                pre_coreg_output_path = os.path.join(folder_struct['inputs'], f"{scene_name}_pre_coreg.tif")
+                _save_precoreg_output(
+                    best_candidate.get("pre_coreg_source_path"),
+                    pre_coreg_output_path,
                     hyp_type,
                     wl,
-                    fwhm,
-                    band_names,
-                    band_detectors,
                     source_bands_1based=(
-                        best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
+                        best_candidate.get("pre_coreg_source_bands_1based")
+                        if isinstance(best_candidate, dict)
+                        else None
                     ),
-                    remove_source=True,
-                    normalization_params=normalization_params,
-                    build_overviews=bool(build_overviews),
-                    remove_detector_overlap=remove_detector_overlap_bands,
                     strict_metadata=bool(strict_metadata),
-                    metadata_extension_level=metadata_extension_level,
-                    metadata_stats_mode=metadata_stats_mode,
-                    metadata_stats_sample_windows=metadata_stats_sample_windows,
-                    metadata_stats_seed=metadata_stats_seed,
-                    metadata_histogram_buckets=metadata_histogram_buckets,
-                    metadata_label_precision=metadata_label_precision,
-                    timing_logs=timing_logs,
-                    radiometric_contract=prisma_radiometric_contract,
-                    radiometric_validation_max_windows=validation_max_windows,
+                    fwhm=fwhm,
+                    band_names=band_names,
+                    band_detectors=band_detectors,
+                    normalization_mode="none",
+                    normalization_params={
+                        "mode": "none",
+                        "p_low": float(normalization_params.p_low),
+                        "p_high": float(normalization_params.p_high),
+                        "clip": bool(normalization_params.clip),
+                        "eps": float(normalization_params.eps),
+                        "min_valid_pixels": int(normalization_params.min_valid_pixels),
+                        "reservoir_size": int(normalization_params.reservoir_size),
+                        "seed": int(normalization_params.seed),
+                        "tile_size": int(normalization_params.tile_size),
+                    },
+                    radiometric_contract=prisma_source_radiometric_contract,
+                    remove_detector_overlap=remove_detector_overlap_bands,
                 )
-            except Exception as exc:
-                _raise_scene_failure(str(exc))
-        finalize_elapsed_s = perf_counter() - t0_finalize
-        post_accept_stage_timings["finalize_write_metadata_s"] = float(finalize_elapsed_s)
-        timed_stages["finalize"] = float(finalize_elapsed_s)
-        if isinstance(finalize_result, dict):
-            metadata_status = finalize_result.get("metadata_status", metadata_status)
-            metadata_warnings = list(finalize_result.get("metadata_warnings", []))
-            metadata_schema_version = _safe_parse_int(
-                finalize_result.get("metadata_schema_version", metadata_schema_version),
-                metadata_schema_version,
-                "metadata_schema_version",
-            )
-            finalize_timings = dict(finalize_result.get("timings", {}))
-            finalize_raster_passes = _safe_parse_int(
-                finalize_result.get("raster_passes", finalize_raster_passes),
-                finalize_raster_passes,
-                "finalize_raster_passes",
-            )
-            normalization_mode = str(finalize_result.get("normalization_mode", normalization_mode))
-            if finalize_result.get("normalization_params"):
-                # Persist sanitized params in downstream metrics/manifest.
-                norm_cfg = dict(finalize_result.get("normalization_params", {}))
-                normalization_params = NormalizationParams(
-                    mode=normalize_mode(norm_cfg.get("mode", normalization_mode), default=normalization_mode),
-                    p_low=float(norm_cfg.get("p_low", normalization_params.p_low)),
-                    p_high=float(norm_cfg.get("p_high", normalization_params.p_high)),
-                    clip=bool(norm_cfg.get("clip", normalization_params.clip)),
-                    eps=float(norm_cfg.get("eps", normalization_params.eps)),
-                    min_valid_pixels=_safe_parse_int(
-                        norm_cfg.get("min_valid_pixels", normalization_params.min_valid_pixels),
-                        normalization_params.min_valid_pixels,
-                        "norm_min_valid_pixels",
-                    ),
-                    reservoir_size=_safe_parse_int(
-                        norm_cfg.get("reservoir_size", normalization_params.reservoir_size),
-                        normalization_params.reservoir_size,
-                        "norm_reservoir_size",
-                    ),
-                    seed=_safe_parse_int(
-                        norm_cfg.get("seed", normalization_params.seed),
-                        normalization_params.seed,
-                        "norm_seed",
-                    ),
-                    tile_size=_safe_parse_int(
-                        norm_cfg.get("tile_size", normalization_params.tile_size),
-                        normalization_params.tile_size,
-                        "norm_tile_size",
-                    ),
-                )
-        if timing_logs:
-            logger.info("Post-accept finalize elapsed: %.2fs", finalize_elapsed_s)
 
-        t0_final_validation = perf_counter()
-        validation_full_scan_requested = bool(validation_full_scan) or int(validation_max_windows) <= 0
-        validation_window_limit = 0 if validation_full_scan_requested else max(1, int(validation_max_windows))
-        if isinstance(finalize_result, dict) and finalize_result.get("output_validation"):
-            final_output_validation = dict(finalize_result.get("output_validation", {}))
-        elif best_candidate is not None and best_candidate.get("output_validation"):
-            # Reuse candidate-stage content validation when finalize did not rewrite pixels.
-            final_output_validation = dict(best_candidate.get("output_validation", {}))
-            final_output_validation["path"] = coreg_out
-        else:
-            final_output_validation = _validate_coreg_raster_content(
-                coreg_out,
-                nodata=PROCESSING_NODATA,
-                max_windows=validation_window_limit,
-                stop_on_first_valid=not validation_full_scan_requested,
-            )
-        post_accept_stage_timings["final_output_validation_s"] = float(perf_counter() - t0_final_validation)
-        if not final_output_validation.get("ok", False):
-            _raise_scene_failure(
-                _fmt_issue(
-                    "QUALITY",
-                    f"Final output is empty/invalid: {final_output_validation.get('error', 'unknown error')}",
-                )
-            )
-
-        if save_pre:
-            if best_candidate is None or not best_candidate.get("pre_coreg_source_path"):
-                _raise_scene_failure(_fmt_issue("PRE_COREG", "No candidate pre-coreg source available."))
-            pre_coreg_output_path = os.path.join(folder_struct['inputs'], f"{scene_name}_pre_coreg.tif")
-            _save_precoreg_output(
-                best_candidate.get("pre_coreg_source_path"),
-                pre_coreg_output_path,
-                hyp_type,
-                wl,
-                source_bands_1based=(
-                    best_candidate.get("pre_coreg_source_bands_1based")
-                    if isinstance(best_candidate, dict)
-                    else None
-                ),
-                strict_metadata=bool(strict_metadata),
-                fwhm=fwhm,
-                band_names=band_names,
-                band_detectors=band_detectors,
-                normalization_mode="none",
-                normalization_params={
-                    "mode": "none",
-                    "p_low": float(normalization_params.p_low),
-                    "p_high": float(normalization_params.p_high),
-                    "clip": bool(normalization_params.clip),
-                    "eps": float(normalization_params.eps),
-                    "min_valid_pixels": int(normalization_params.min_valid_pixels),
-                    "reservoir_size": int(normalization_params.reservoir_size),
-                    "seed": int(normalization_params.seed),
-                    "tile_size": int(normalization_params.tile_size),
-                },
-                radiometric_contract=prisma_source_radiometric_contract,
-                remove_detector_overlap=remove_detector_overlap_bands,
-            )
-
-        if (
-            save_displacement_vectors
-            and best_candidate is not None
-            and best_candidate.get("local_tiepoints_df") is not None
-        ):
-            accepted_tp_df = best_candidate.get("local_tiepoints_df")
-            visualization_tp_df = best_candidate.get("local_tiepoints_visualization_df", accepted_tp_df)
-            t0_disp_export = perf_counter()
-            if HAS_GEOPANDAS:
+            if (
+                save_displacement_vectors
+                and best_candidate is not None
+                and best_candidate.get("local_tiepoints_df") is not None
+            ):
+                accepted_tp_df = best_candidate.get("local_tiepoints_df")
+                visualization_tp_df = best_candidate.get("local_tiepoints_visualization_df", accepted_tp_df)
+                t0_disp_export = perf_counter()
+                if HAS_GEOPANDAS:
+                    try:
+                        export_result = _export_displacement_shapefile_from_df(
+                            tie_points_df=accepted_tp_df,
+                            shapefile_path=displacement_vectors_path,
+                            fallback_crs=s2_crs,
+                        )
+                        displacement_vectors_written_path = str(export_result.get("path"))
+                        if export_result.get("warning"):
+                            logger.warning(_fmt_issue("REPORTS", str(export_result.get("warning"))))
+                        logger.info(
+                            "Exported accepted displacement vectors (%d points, basis=%s): %s",
+                            int(export_result.get("count", 0)),
+                            export_result.get("abs_shift_basis"),
+                            displacement_vectors_written_path,
+                        )
+                    except Exception as shp_exc:
+                        logger.warning(
+                            _fmt_issue("REPORTS", f"Failed to export accepted displacement vectors: {shp_exc}")
+                        )
+                else:
+                    try:
+                        _, abs_basis, abs_warning = _ensure_abs_shift_column(accepted_tp_df)
+                        if abs_warning:
+                            logger.warning(_fmt_issue("REPORTS", abs_warning))
+                        logger.warning(
+                            _fmt_issue(
+                                "REPORTS",
+                                "GeoPandas is unavailable; displacement vectors shapefile skipped "
+                                f"(ABS_SHIFT basis={abs_basis}).",
+                            )
+                        )
+                    except Exception as abs_exc:
+                        logger.warning(
+                            _fmt_issue(
+                                "REPORTS",
+                                "GeoPandas is unavailable and ABS_SHIFT derivation failed; "
+                                f"displacement vectors shapefile skipped ({abs_exc}).",
+                            )
+                        )
+                post_accept_stage_timings["displacement_export_s"] = float(perf_counter() - t0_disp_export)
+                t0_disp_carto = perf_counter()
                 try:
-                    export_result = _export_displacement_shapefile_from_df(
-                        tie_points_df=accepted_tp_df,
-                        shapefile_path=displacement_vectors_path,
-                        fallback_crs=s2_crs,
+                    carto_result = _write_displacement_vector_cartography_png(
+                        visualization_df=visualization_tp_df,
+                        output_png=displacement_cartography_path,
+                        scene_name=scene_name,
+                        scene_date_utc=hs_time,
+                        basemap_raster_path=s2_path,
+                        basemap_rgb_band_indices=(3, 2, 1),
+                        quiver_cmap="RdYlGn_r",
                     )
-                    displacement_vectors_written_path = str(export_result.get("path"))
-                    if export_result.get("warning"):
-                        logger.warning(_fmt_issue("REPORTS", str(export_result.get("warning"))))
+                    if carto_result.get("warning"):
+                        logger.warning(_fmt_issue("QUICKLOOK", str(carto_result.get("warning"))))
                     logger.info(
-                        "Exported accepted displacement vectors (%d points, basis=%s): %s",
-                        int(export_result.get("count", 0)),
-                        export_result.get("abs_shift_basis"),
-                        displacement_vectors_written_path,
+                        "Exported displacement cartography (%d vectors, mode=%s): %s",
+                        int(carto_result.get("count", 0)),
+                        carto_result.get("mode"),
+                        displacement_cartography_path,
                     )
-                except Exception as shp_exc:
-                    logger.warning(
-                        _fmt_issue("REPORTS", f"Failed to export accepted displacement vectors: {shp_exc}")
-                    )
-            else:
-                try:
-                    _, abs_basis, abs_warning = _ensure_abs_shift_column(accepted_tp_df)
-                    if abs_warning:
-                        logger.warning(_fmt_issue("REPORTS", abs_warning))
+                except Exception as carto_exc:
                     logger.warning(
                         _fmt_issue(
-                            "REPORTS",
-                            "GeoPandas is unavailable; displacement vectors shapefile skipped "
-                            f"(ABS_SHIFT basis={abs_basis}).",
+                            "QUICKLOOK",
+                            f"Failed to export displacement cartography PNG: {carto_exc}",
                         )
                     )
-                except Exception as abs_exc:
-                    logger.warning(
-                        _fmt_issue(
-                            "REPORTS",
-                            "GeoPandas is unavailable and ABS_SHIFT derivation failed; "
-                            f"displacement vectors shapefile skipped ({abs_exc}).",
-                        )
-                    )
-            post_accept_stage_timings["displacement_export_s"] = float(perf_counter() - t0_disp_export)
-            t0_disp_carto = perf_counter()
-            try:
-                carto_result = _write_displacement_vector_cartography_png(
-                    visualization_df=visualization_tp_df,
-                    output_png=displacement_cartography_path,
+                post_accept_stage_timings["displacement_cartography_s"] = float(perf_counter() - t0_disp_carto)
+
+            quicklook_status = "running"
+            t0_quicklook = perf_counter()
+            quicklook_metadata = _generate_mandatory_quicklooks(
+                scene_name=scene_name,
+                scene_date_utc=hs_time,
+                quicklooks_dir=folder_struct["quicklooks"],
+                scene_raster_path=coreg_out,
+                tie_points_df=None if best_candidate is None else best_candidate.get("local_tiepoints_df"),
+                generate_tiepoints_png=bool(gen_tiepoint_pngs),
+                wl=wl,
+                target_wl_nm=s2_ref_wl,
+                max_quicklook_dim=quicklook_max_dim,
+                quicklook_rgb_targets_nm=quicklook_rgb_targets_nm,
+                quicklook_percentiles=quicklook_percentiles,
+                quicklook_gamma=quicklook_gamma,
+                quicklook_dpi=quicklook_dpi,
+                quicklook_crop_to_valid=quicklook_crop_to_valid,
+                quicklook_scalebar=quicklook_scalebar,
+                rgb_source_path=quicklook_rgb_source_path,
+            )
+            quicklook_outputs = dict(quicklook_metadata.get("outputs", {}))
+            quicklook_status = "ok"
+            post_accept_stage_timings["quicklook_generation_s"] = float(perf_counter() - t0_quicklook)
+
+            t0_ancillary = perf_counter()
+            if hyp_type == "PRISMA" and (save_pan or save_quality_mask):
+                ancillary_result = _coregister_prisma_ancillary_outputs(
                     scene_name=scene_name,
-                    scene_date_utc=hs_time,
-                    basemap_raster_path=s2_path,
-                    basemap_rgb_band_indices=(3, 2, 1),
-                    quiver_cmap="RdYlGn_r",
+                    folder_struct=folder_struct,
+                    s2_crs=s2_crs,
+                    save_pan=bool(save_pan),
+                    save_quality_mask=bool(save_quality_mask),
+                    pan_data=pan_data,
+                    pan_geo_info=pan_geo_info,
+                    pan_quality_data=pan_quality_data,
+                    vnir_quality_data=vnir_quality_data,
+                    swir_quality_data=swir_quality_data,
+                    lat_qm=lat_qm,
+                    lon_qm=lon_qm,
+                    best_candidate=best_candidate,
+                    hs_reference_raster_path=coreg_out,
+                    s2_reference_raster_path=s2_path,
+                    matcher_profile=matcher_profile,
+                    pan_gcp_mode=pan_gcp_mode,
+                    pan_map_dxdy_source=pan_map_dxdy_source,
+                    pan_target_aligned_pixels=pan_target_aligned_pixels,
+                    pan_use_synthetic_reference=pan_use_synthetic_reference,
+                    pan_min_points_for_poly2=pan_min_points_for_poly2,
+                    pan_local_window_size=pan_local_window_size,
+                    pan_local_grid_res=pan_local_grid_res,
+                    pan_local_max_shift=pan_local_max_shift,
+                    pan_local_tieP_filter_level=pan_local_tieP_filter_level,
+                    pan_local_max_iter=pan_local_max_iter,
+                    pan_residual_check=pan_residual_check,
+                    pan_residual_threshold_px=pan_residual_threshold_px,
+                    pan_residual_max_dim=pan_residual_max_dim,
+                    use_geolocation_mesh_affine=use_geolocation_mesh_affine,
+                    geolocation_mesh_stride=geolocation_mesh_stride,
+                    arosics_cpus=int(arosics_cpus),
+                    gdalwarp_multi=bool(gdalwarp_multi),
+                    gdalwarp_num_threads=gdalwarp_num_threads,
+                    radiometric_contract=prisma_pan_radiometric_contract,
+                    radiometric_validation_max_windows=validation_max_windows,
+                    pan_reference_source=str(
+                        config.get("pan_reference_source", DEFAULT_CONFIG.get("pan_reference_source", "hs"))
+                    ),
                 )
-                if carto_result.get("warning"):
-                    logger.warning(_fmt_issue("QUICKLOOK", str(carto_result.get("warning"))))
-                logger.info(
-                    "Exported displacement cartography (%d vectors, mode=%s): %s",
-                    int(carto_result.get("count", 0)),
-                    carto_result.get("mode"),
-                    displacement_cartography_path,
+                for anc_warning in ancillary_result.get("warnings", []):
+                    logger.warning(anc_warning)
+            elif hyp_type == "ENMAP":
+                ancillary_result = _coregister_enmap_auxiliary_outputs(
+                    scene_name=scene_name,
+                    enmap_spectral_image=hs_file,
+                    folder_struct=folder_struct,
+                    s2_crs=s2_crs,
+                    best_candidate=best_candidate,
+                    hs_reference_raster_path=coreg_out,
+                    gdalwarp_multi=bool(gdalwarp_multi),
+                    gdalwarp_num_threads=gdalwarp_num_threads,
+                    coregister_ql=bool(save_quality_mask),
                 )
-            except Exception as carto_exc:
-                logger.warning(
-                    _fmt_issue(
-                        "QUICKLOOK",
-                        f"Failed to export displacement cartography PNG: {carto_exc}",
-                    )
-                )
-            post_accept_stage_timings["displacement_cartography_s"] = float(perf_counter() - t0_disp_carto)
-
-        quicklook_status = "running"
-        t0_quicklook = perf_counter()
-        quicklook_metadata = _generate_mandatory_quicklooks(
-            scene_name=scene_name,
-            scene_date_utc=hs_time,
-            quicklooks_dir=folder_struct["quicklooks"],
-            scene_raster_path=coreg_out,
-            tie_points_df=None if best_candidate is None else best_candidate.get("local_tiepoints_df"),
-            generate_tiepoints_png=bool(gen_tiepoint_pngs),
-            wl=wl,
-            target_wl_nm=s2_ref_wl,
-            max_quicklook_dim=quicklook_max_dim,
-            quicklook_rgb_targets_nm=quicklook_rgb_targets_nm,
-            quicklook_percentiles=quicklook_percentiles,
-            quicklook_gamma=quicklook_gamma,
-            quicklook_dpi=quicklook_dpi,
-            quicklook_crop_to_valid=quicklook_crop_to_valid,
-            quicklook_scalebar=quicklook_scalebar,
-            rgb_source_path=quicklook_rgb_source_path,
-        )
-        quicklook_outputs = dict(quicklook_metadata.get("outputs", {}))
-        quicklook_status = "ok"
-        post_accept_stage_timings["quicklook_generation_s"] = float(perf_counter() - t0_quicklook)
-
-        t0_ancillary = perf_counter()
-        if hyp_type == "PRISMA" and (save_pan or save_quality_mask):
-            ancillary_result = _coregister_prisma_ancillary_outputs(
-                scene_name=scene_name,
-                folder_struct=folder_struct,
-                s2_crs=s2_crs,
-                save_pan=bool(save_pan),
-                save_quality_mask=bool(save_quality_mask),
-                pan_data=pan_data,
-                pan_geo_info=pan_geo_info,
-                pan_quality_data=pan_quality_data,
-                vnir_quality_data=vnir_quality_data,
-                swir_quality_data=swir_quality_data,
-                lat_qm=lat_qm,
-                lon_qm=lon_qm,
-                best_candidate=best_candidate,
-                hs_reference_raster_path=coreg_out,
-                s2_reference_raster_path=s2_path,
-                matcher_profile=matcher_profile,
-                pan_gcp_mode=pan_gcp_mode,
-                pan_map_dxdy_source=pan_map_dxdy_source,
-                pan_target_aligned_pixels=pan_target_aligned_pixels,
-                pan_use_synthetic_reference=pan_use_synthetic_reference,
-                pan_min_points_for_poly2=pan_min_points_for_poly2,
-                pan_local_window_size=pan_local_window_size,
-                pan_local_grid_res=pan_local_grid_res,
-                pan_local_max_shift=pan_local_max_shift,
-                pan_local_tieP_filter_level=pan_local_tieP_filter_level,
-                pan_local_max_iter=pan_local_max_iter,
-                pan_residual_check=pan_residual_check,
-                pan_residual_threshold_px=pan_residual_threshold_px,
-                pan_residual_max_dim=pan_residual_max_dim,
-                use_geolocation_mesh_affine=use_geolocation_mesh_affine,
-                geolocation_mesh_stride=geolocation_mesh_stride,
-                arosics_cpus=int(arosics_cpus),
-                gdalwarp_multi=bool(gdalwarp_multi),
-                gdalwarp_num_threads=gdalwarp_num_threads,
-                radiometric_contract=prisma_pan_radiometric_contract,
-                radiometric_validation_max_windows=validation_max_windows,
+                for anc_warning in ancillary_result.get("warnings", []):
+                    logger.warning(anc_warning)
+            post_accept_stage_timings["ancillary_generation_s"] = float(perf_counter() - t0_ancillary)
+        except SceneProcessingError:
+            _remove_partial_coreg_output(coreg_out)
+            raise
+        except CDSEAuthenticationError:
+            _remove_partial_coreg_output(coreg_out)
+            raise
+        except Exception as post_accept_exc:
+            # Any failure after a candidate was accepted (pre-coreg copy, metadata,
+            # quicklooks, ancillaries) must still clean temp, write FAIL reports and
+            # never leave a partial _coreg.tif behind.
+            logger.exception("Post-acceptance processing failed")
+            _remove_partial_coreg_output(coreg_out)
+            status_code = "FAIL"
+            _emit_progress(
+                progress_callback,
+                "Failed: finalizing output",
+                scene_idx=scene_idx,
+                scene_total=scene_total,
+                status="error",
             )
-            for anc_warning in ancillary_result.get("warnings", []):
-                logger.warning(anc_warning)
-        elif hyp_type == "ENMAP":
-            ancillary_result = _coregister_enmap_auxiliary_outputs(
-                scene_name=scene_name,
-                enmap_spectral_image=hs_file,
-                folder_struct=folder_struct,
-                s2_crs=s2_crs,
-                best_candidate=best_candidate,
-                hs_reference_raster_path=coreg_out,
-                gdalwarp_multi=bool(gdalwarp_multi),
-                gdalwarp_num_threads=gdalwarp_num_threads,
-                coregister_ql=bool(save_quality_mask),
-            )
-            for anc_warning in ancillary_result.get("warnings", []):
-                logger.warning(anc_warning)
-        post_accept_stage_timings["ancillary_generation_s"] = float(perf_counter() - t0_ancillary)
+            _raise_scene_failure(f"Post-acceptance processing failed: {post_accept_exc}")
     else:
         status_code = "FAIL"
         _emit_progress(progress_callback, "Failed: no valid output produced", scene_idx=scene_idx, scene_total=scene_total, status="error")
@@ -17012,6 +18527,7 @@ def run_coregistration(
         'polynomial_order_used': best_candidate.get('polynomial_order_used') if best_candidate else None,
         'polynomial_n_gcps': poly_decision.get('n_gcps') if isinstance(poly_decision, dict) else None,
         'polynomial_order_decision': poly_decision if isinstance(poly_decision, dict) else {},
+        **_summarize_checkpoint_accuracy(best_candidate.get('checkpoint_accuracy') if best_candidate else None),
         'merged_tiepoint_stages': best_candidate.get('merged_tiepoint_stages', {}) if best_candidate else {},
         'multiband_tiepoint_counts': (
             best_candidate.get('multiband_tiepoint_counts', {}) if best_candidate else {}
@@ -17432,7 +18948,16 @@ def run_batch_coregistration(
         worker_base_config.pop("_cdse_session", None)
         worker_base_config.pop("prompt_userpass_fn", None)
         cdse_userpass_credentials = _get_cached_cdse_public_credentials()
-        executor = ProcessPoolExecutor(max_workers=worker_count)
+        worker_gdal_threads = None
+        if str(os.environ.get("GDAL_NUM_THREADS") or "ALL_CPUS").strip().upper() == "ALL_CPUS":
+            # Avoid worker_count x ALL_CPUS GDAL threads. Set only inside the workers so
+            # this process (e.g. the GUI's next run) keeps its own setting.
+            worker_gdal_threads = str(max(1, int(os.cpu_count() or 1) // int(worker_count)))
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_set_worker_env,
+            initargs=({"GDAL_NUM_THREADS": worker_gdal_threads} if worker_gdal_threads else {},),
+        )
         abort_executor = False
         try:
             future_map = {}
@@ -17661,16 +19186,23 @@ def run_batch_coregistration(
             msg = str(e)
             results['failed'].append(source_key)
             results['errors'][source_key] = msg
-            failed_metrics = _build_failed_scene_metrics(hs_file, scene_hyp_type, msg)
-            fallback_dataset_path = os.path.join(
-                output_dir,
-                _build_dataset_xlsx_filename(
-                    scene_name=failed_metrics.get("scene_name"),
-                    filename=failed_metrics.get("filename"),
-                ),
-            )
-            failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
-            _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
+            # SceneProcessingError carries the scene-local failure metrics (candidate
+            # errors, metrics JSON path); keep them, as the parallel worker path does.
+            attached_metrics = getattr(e, "metrics", None)
+            if isinstance(attached_metrics, dict):
+                failed_metrics = dict(attached_metrics)
+            else:
+                failed_metrics = _build_failed_scene_metrics(hs_file, scene_hyp_type, msg)
+            if not failed_metrics.get("dataset_xlsx_path"):
+                fallback_dataset_path = os.path.join(
+                    output_dir,
+                    _build_dataset_xlsx_filename(
+                        scene_name=failed_metrics.get("scene_name"),
+                        filename=failed_metrics.get("filename"),
+                    ),
+                )
+                failed_metrics["dataset_xlsx_path"] = fallback_dataset_path
+                _write_single_scene_dataset_xlsx(failed_metrics, fallback_dataset_path)
             results["failed_details"].append(failed_metrics)
             results["scene_results"].append({
                 "source_path": source_key,

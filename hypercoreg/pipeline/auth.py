@@ -35,10 +35,13 @@ TOKEN_REFRESH_MARGIN_S = 300.0
 PromptUserpassFn = Callable[[], Tuple[str, str, Optional[str]]]
 TokenFactoryFn = Callable[[], str]
 _CDSE_CREDENTIAL_CACHE_LOCK = threading.Lock()
-_CDSE_CREDENTIAL_CACHE: Dict[str, Optional[str]] = {
+# NOTE: the TOTP *code* is never cached (it is single-use and expires within
+# ~30 s). Only a boolean "totp_required" flag is remembered so that later
+# reconnects know a fresh code must be obtained instead of replaying one.
+_CDSE_CREDENTIAL_CACHE: Dict[str, Any] = {
     "username": None,
     "password": None,
-    "totp": None,
+    "totp_required": False,
 }
 
 
@@ -60,30 +63,40 @@ def _cache_cdse_public_credentials(
     password: Optional[str],
     totp: Optional[str] = None,
 ) -> None:
+    """Cache username/password for reconnects.
+
+    The ``totp`` argument is accepted for backwards compatibility but the code
+    itself is never stored; only the fact that the account uses 2FA is kept.
+    """
     user = str(username or "").strip()
     pwd = str(password or "")
-    otp = str(totp).strip() if totp is not None else ""
+    totp_required = bool(str(totp).strip()) if totp is not None else False
     with _CDSE_CREDENTIAL_CACHE_LOCK:
         _CDSE_CREDENTIAL_CACHE["username"] = user or None
         _CDSE_CREDENTIAL_CACHE["password"] = pwd if pwd else None
-        _CDSE_CREDENTIAL_CACHE["totp"] = otp or None
+        _CDSE_CREDENTIAL_CACHE["totp_required"] = totp_required
 
 
 def _get_cached_cdse_public_credentials() -> Optional[Tuple[str, str, Optional[str]]]:
     with _CDSE_CREDENTIAL_CACHE_LOCK:
         user = str(_CDSE_CREDENTIAL_CACHE.get("username") or "").strip()
         pwd = _CDSE_CREDENTIAL_CACHE.get("password") or ""
-        otp = str(_CDSE_CREDENTIAL_CACHE.get("totp") or "").strip() or None
     if user and pwd:
-        return user, str(pwd), otp
+        # The third element (TOTP code) is always None: codes are never cached.
+        return user, str(pwd), None
     return None
+
+
+def _cached_cdse_account_requires_totp() -> bool:
+    with _CDSE_CREDENTIAL_CACHE_LOCK:
+        return bool(_CDSE_CREDENTIAL_CACHE.get("totp_required"))
 
 
 def _clear_cached_cdse_public_credentials() -> None:
     with _CDSE_CREDENTIAL_CACHE_LOCK:
         _CDSE_CREDENTIAL_CACHE["username"] = None
         _CDSE_CREDENTIAL_CACHE["password"] = None
-        _CDSE_CREDENTIAL_CACHE["totp"] = None
+        _CDSE_CREDENTIAL_CACHE["totp_required"] = False
 
 
 def _resolve_cdse_credentials_file_path() -> str:
@@ -223,6 +236,10 @@ class _RefreshableBearerAuth(AuthBase):
             )
         self.token = token
         self.expires_at = _decode_jwt_exp(token)
+        if self.expires_at is None:
+            factory_exp = getattr(self._token_factory, "access_expires_at", None)
+            if isinstance(factory_exp, (int, float)):
+                self.expires_at = float(factory_exp)
         if self.expires_at is not None:
             logger.debug(
                 "Refreshed CDSE token from %s; expires at %s UTC.",
@@ -295,6 +312,18 @@ def _force_refresh_cdse_session(session: Any) -> bool:
 
 
 def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
+    """Return only the access token string (backwards-compatible API)."""
+    return str(_request_cdse_token_response(payload, flow_name)["access_token"])
+
+
+def _request_cdse_token_response(payload: Dict[str, str], flow_name: str) -> Dict[str, Any]:
+    """POST ``payload`` to the CDSE token endpoint and return the JSON response.
+
+    The returned dict always contains a non-empty ``access_token`` and may
+    contain ``expires_in``, ``refresh_token`` and ``refresh_expires_in``.
+    Non-retryable HTTP errors (e.g. 401 wrong password) are raised immediately
+    without resending credentials.
+    """
     attempts = max(1, int(HTTP_AUTH_RETRY_ATTEMPTS))
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
@@ -320,12 +349,13 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
                     )
                 )
 
-            token = response.json().get("access_token")
+            body = response.json()
+            token = body.get("access_token") if isinstance(body, dict) else None
             if not token:
                 raise CDSEAuthenticationError(
                     _fmt_issue("AUTH", f"{flow_name} token response missing access_token.")
                 )
-            return token
+            return dict(body)
         except requests.RequestException as exc:
             last_error = exc
             if attempt < attempts:
@@ -342,6 +372,9 @@ def _request_cdse_access_token(payload: Dict[str, str], flow_name: str) -> str:
             raise CDSEAuthenticationError(
                 _fmt_issue("AUTH", f"{flow_name} token request failed: {exc}")
             ) from exc
+        except CDSEAuthenticationError:
+            # A non-retryable rejection (e.g. wrong password); do not resend credentials.
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < attempts:
@@ -395,19 +428,154 @@ def _generate_cdse_client_access_token(client_id: str, client_secret: str) -> st
     return _request_cdse_access_token(payload, flow_name="client-credentials")
 
 
+TotpProviderFn = Callable[[], Optional[str]]
+
+
+def _expiry_from_seconds(value: Any, now: float) -> Optional[float]:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        # Keycloak reports 0 for "no expiry"/offline tokens; treat as unknown.
+        return None
+    return now + seconds
+
+
+class _CDSEPublicTokenFactory:
+    """Token factory for the ``cdse-public`` password flow.
+
+    * First call: ``grant_type=password`` (+ ``totp`` if supplied). The TOTP
+      code is consumed and dropped immediately; it is never replayed.
+    * Later calls: ``grant_type=refresh_token`` while the refresh token is
+      valid (no password/TOTP sent).
+    * If the refresh fails or the refresh token has expired: fall back to the
+      password grant. For 2FA accounts a *fresh* code is requested from
+      ``totp_provider``; if none is available a clear
+      :class:`CDSEAuthenticationError` is raised.
+    """
+
+    client_id = "cdse-public"
+    flow_name = "cdse-public"
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        totp: Optional[str] = None,
+        *,
+        totp_provider: Optional[TotpProviderFn] = None,
+    ):
+        self._username = username
+        self._password = password
+        first_totp = str(totp).strip() if totp is not None else ""
+        self._pending_totp: Optional[str] = first_totp or None
+        self.totp_required = bool(first_totp)
+        self._totp_provider = totp_provider
+        self._refresh_token: Optional[str] = None
+        self._refresh_expires_at: Optional[float] = None
+        self.access_expires_at: Optional[float] = None
+        self._initial_grant_done = False
+        self._lock = threading.Lock()
+
+    def __repr__(self) -> str:  # never expose secrets
+        return f"<_CDSEPublicTokenFactory user={self._username!r} totp_required={self.totp_required}>"
+
+    def _store_response(self, body: Dict[str, Any]) -> str:
+        now = time.time()
+        self.access_expires_at = _expiry_from_seconds(body.get("expires_in"), now)
+        refresh_token = str(body.get("refresh_token") or "").strip()
+        if refresh_token:
+            self._refresh_token = refresh_token
+            self._refresh_expires_at = _expiry_from_seconds(body.get("refresh_expires_in"), now)
+        else:
+            self._refresh_token = None
+            self._refresh_expires_at = None
+        return str(body["access_token"])
+
+    def _refresh_token_usable(self) -> bool:
+        if not self._refresh_token:
+            return False
+        if self._refresh_expires_at is None:
+            return True
+        # Leave a small safety margin so the request does not race expiry.
+        return (self._refresh_expires_at - time.time()) > 5.0
+
+    def _refresh_grant(self) -> str:
+        payload = {
+            "client_id": self.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": str(self._refresh_token),
+        }
+        body = _request_cdse_token_response(payload, flow_name=f"{self.flow_name} refresh")
+        return self._store_response(body)
+
+    def _obtain_fresh_totp(self) -> str:
+        code: Optional[str] = None
+        if self._totp_provider is not None:
+            code = str(self._totp_provider() or "").strip() or None
+        if not code:
+            raise CDSEAuthenticationError(
+                _fmt_issue(
+                    "AUTH",
+                    "CDSE session expired and the account requires a TOTP (2FA) code, "
+                    "but no fresh code is available. TOTP codes are single-use and are "
+                    "never replayed; log in again with a new code.",
+                )
+            )
+        return code
+
+    def _password_grant(self, totp: Optional[str]) -> str:
+        payload = {
+            "client_id": self.client_id,
+            "grant_type": "password",
+            "username": self._username,
+            "password": self._password,
+        }
+        if totp:
+            payload["totp"] = totp
+        body = _request_cdse_token_response(payload, flow_name=self.flow_name)
+        return self._store_response(body)
+
+    def __call__(self) -> str:
+        with self._lock:
+            if not self._initial_grant_done:
+                # Consume the caller-supplied TOTP exactly once, even on failure.
+                totp, self._pending_totp = self._pending_totp, None
+                self._initial_grant_done = True
+                return self._password_grant(totp)
+
+            if self._refresh_token_usable():
+                try:
+                    return self._refresh_grant()
+                except CDSEAuthenticationError as exc:
+                    logger.info(
+                        _fmt_issue(
+                            "AUTH",
+                            f"CDSE refresh-token grant failed ({exc}); falling back to password grant.",
+                        )
+                    )
+                    self._refresh_token = None
+                    self._refresh_expires_at = None
+
+            totp = self._obtain_fresh_totp() if self.totp_required else None
+            return self._password_grant(totp)
+
+
 def _create_cdse_public_session(
     username: str,
     password: str,
     totp: Optional[str] = None,
+    *,
+    totp_provider: Optional[TotpProviderFn] = None,
 ) -> requests.Session:
-    return _create_cdse_refreshable_bearer_session(
-        lambda: _generate_cdse_public_access_token(
-            username=username,
-            password=password,
-            totp=totp,
-        ),
-        source_name="cdse-public",
+    factory = _CDSEPublicTokenFactory(
+        username,
+        password,
+        totp,
+        totp_provider=totp_provider,
     )
+    return _create_cdse_refreshable_bearer_session(factory, source_name="cdse-public")
 
 
 def _create_cdse_client_session(client_id: str, client_secret: str) -> requests.Session:
@@ -660,18 +828,55 @@ def _request_cdse_userpass(
     return _prompt_cdse_userpass_cli()
 
 
+def _make_interactive_totp_provider(
+    username: str,
+    allow_gui_prompt: bool,
+    prompt_userpass_fn: Optional[PromptUserpassFn],
+) -> TotpProviderFn:
+    """Return a provider that asks the user for a *fresh* TOTP code.
+
+    Used only by sessions created from an interactive prompt. Failures (no
+    terminal, cancelled, different user) yield ``None`` so the token factory
+    raises its explicit "fresh TOTP required" error.
+    """
+
+    def _provider() -> Optional[str]:
+        try:
+            logger.warning(
+                _fmt_issue("AUTH", "CDSE session expired; a fresh TOTP code is required to continue.")
+            )
+            user, _pwd, totp = _request_cdse_userpass(
+                allow_gui_prompt=allow_gui_prompt,
+                prompt_userpass_fn=prompt_userpass_fn,
+            )
+        except Exception:
+            return None
+        if str(user or "").strip() != str(username or "").strip():
+            return None
+        return str(totp or "").strip() or None
+
+    return _provider
+
+
 def _create_public_session_with_retry(
     allow_gui_prompt: bool = False,
     max_prompt_attempts: int = 2,
     prompt_userpass_fn: Optional[PromptUserpassFn] = None,
 ) -> requests.Session:
     last_error: Optional[Exception] = None
+    # TOTP codes are single-use: if this process already logged in with one,
+    # any configured/cached code is stale and must not be replayed.
+    totp_required = _cached_cdse_account_requires_totp()
     cached_userpass = _get_cached_cdse_public_credentials()
-    if cached_userpass is not None:
-        user, pwd, totp = cached_userpass
+    if cached_userpass is not None and totp_required:
+        logger.info(
+            "Cached CDSE account uses 2FA; a fresh TOTP code is required for session refresh."
+        )
+    elif cached_userpass is not None:
+        user, pwd, _ = cached_userpass
         try:
             logger.info("Reusing cached CDSE username/password for session refresh.")
-            return _create_cdse_public_session(user, pwd, totp=totp)
+            return _create_cdse_public_session(user, pwd)
         except Exception as exc:
             logger.warning(
                 _fmt_issue(
@@ -686,7 +891,12 @@ def _create_public_session_with_retry(
         include_env=True,
         include_file=True,
     )
-    if configured_userpass is not None:
+    if configured_userpass is not None and totp_required:
+        logger.info(
+            "Skipping configured CDSE credentials: the account uses 2FA and configured "
+            "TOTP codes are never replayed."
+        )
+    elif configured_userpass is not None:
         user, pwd, totp, source = configured_userpass
         try:
             logger.info(
@@ -718,12 +928,29 @@ def _create_public_session_with_retry(
                 allow_gui_prompt=allow_gui_prompt,
                 prompt_userpass_fn=prompt_userpass_fn,
             )
-            sess = _create_cdse_public_session(user, pwd, totp=totp)
+            sess = _create_cdse_public_session(
+                user,
+                pwd,
+                totp=totp,
+                totp_provider=(
+                    _make_interactive_totp_provider(user, allow_gui_prompt, prompt_userpass_fn)
+                    if totp
+                    else None
+                ),
+            )
             _cache_cdse_public_credentials(username=user, password=pwd, totp=totp)
             return sess
         except CDSEAuthenticationError as exc:
             lower_msg = str(exc).lower()
             if "cancelled" in lower_msg or "no interactive terminal" in lower_msg:
+                if totp_required:
+                    raise CDSEAuthenticationError(
+                        _fmt_issue(
+                            "AUTH",
+                            "CDSE session expired and the account requires a fresh TOTP "
+                            f"(2FA) code, which could not be obtained: {exc}",
+                        )
+                    ) from exc
                 raise
             last_error = exc
         except RuntimeError as exc:
@@ -784,6 +1011,7 @@ __all__ = [
     "_prompt_cdse_userpass_gui",
     "_read_cdse_credentials_file",
     "_request_cdse_access_token",
+    "_request_cdse_token_response",
     "_request_cdse_userpass",
     "_resolve_cdse_credentials_file_path",
 ]

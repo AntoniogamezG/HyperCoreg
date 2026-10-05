@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hypercoreg"
-version = "0.6.0"
+version = "0.7.0"
 description = "Automated hyperspectral PRISMA/EnMAP to Sentinel-2 coregistration"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -60,7 +60,6 @@ Homepage = "https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectr
 Documentation = "https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP#readme"
 Repository = "https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP"
 Issues = "https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP/issues"
-Changelog = "https://github.com/AntoniogamezG/HyperCoreg-An-optimized-hyperspectral-to-Sentinel-2-co-registration-pipeline-for-PRISMA-and-EnMAP/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -68,3 +67,7 @@ include = ["hypercoreg*"]
 
 [tool.setuptools.package-data]
 hypercoreg = ["py.typed", "data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
