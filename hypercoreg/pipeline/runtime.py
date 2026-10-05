@@ -8256,6 +8256,106 @@ def _prepare_matching_reference(
     return info
 
 
+def _measure_inter_detector_offset(
+    raster_path: Optional[str],
+    wavelengths: Any,
+    detectors: Sequence[str],
+    nodata: float = PROCESSING_NODATA,
+    tile_size: int = 200,
+    vnir_range_nm: Tuple[float, float] = (840.0, 900.0),
+    swir_range_nm: Tuple[float, float] = (1030.0, 1080.0),
+) -> Dict[str, Any]:
+    """Measure the VNIR/SWIR misregistration inside one raster, in pixels.
+
+    A VNIR composite (``vnir_range_nm``) is phase-correlated with a SWIR composite
+    (``swir_range_nm``); both sample the NIR plateau, so they look alike. Only tiles
+    that are fully valid are used, so a shared nodata edge cannot pull the estimate
+    toward zero. ``median_dy_px``/``median_dx_px`` is the shift that moves SWIR onto
+    VNIR; ``tile_p90_px`` is the 90th percentile of the per-tile shift magnitudes.
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "n_tiles": 0,
+        "median_dy_px": None,
+        "median_dx_px": None,
+        "median_offset_px": None,
+        "tile_p90_px": None,
+        "vnir_range_nm": [float(v) for v in vnir_range_nm],
+        "swir_range_nm": [float(v) for v in swir_range_nm],
+    }
+    try:
+        from skimage.registration import phase_cross_correlation
+    except Exception as exc:
+        out["error"] = f"scikit-image unavailable: {exc}"
+        return out
+    try:
+        if not raster_path or not os.path.exists(raster_path):
+            out["error"] = f"raster missing: {raster_path}"
+            return out
+        wl = np.asarray(wavelengths, dtype=float).reshape(-1)
+        det = [str(d).upper() for d in list(detectors or [])]
+        if len(det) != int(wl.size):
+            out["error"] = f"detector/wavelength count mismatch ({len(det)} vs {int(wl.size)})"
+            return out
+        v_idx = [i + 1 for i in range(wl.size) if det[i] == "VNIR" and vnir_range_nm[0] <= wl[i] <= vnir_range_nm[1]]
+        s_idx = [i + 1 for i in range(wl.size) if det[i] == "SWIR" and swir_range_nm[0] <= wl[i] <= swir_range_nm[1]]
+        if not v_idx or not s_idx:
+            out["error"] = "no VNIR or SWIR bands inside the composite wavelength ranges"
+            return out
+        with rasterio.open(raster_path) as src:
+            if int(src.count) != int(wl.size):
+                out["error"] = f"raster band count {src.count} does not match {int(wl.size)} wavelengths"
+                return out
+            nod = src.nodata if src.nodata is not None and np.isfinite(float(src.nodata)) else float(nodata)
+            v_stack = src.read(v_idx).astype(np.float32, copy=False)
+            s_stack = src.read(s_idx).astype(np.float32, copy=False)
+
+        def _composite(stack: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            valid = np.all(np.isfinite(stack) & (stack != nod) & (stack > 0), axis=0)
+            return stack.mean(axis=0), valid
+
+        v_img, v_valid = _composite(v_stack)
+        s_img, s_valid = _composite(s_stack)
+        valid = v_valid & s_valid
+        tile = int(max(32, tile_size))
+        window = np.outer(np.hanning(tile), np.hanning(tile))
+        shifts: List[Tuple[float, float]] = []
+        height, width = valid.shape
+        for y0 in range(0, height - tile + 1, tile):
+            for x0 in range(0, width - tile + 1, tile):
+                win = (slice(y0, y0 + tile), slice(x0, x0 + tile))
+                if not bool(valid[win].all()):
+                    continue
+                a = v_img[win].astype(np.float64)
+                b = s_img[win].astype(np.float64)
+                if a.std() <= 0 or b.std() <= 0:
+                    continue
+                a = (a - a.mean()) / a.std() * window
+                b = (b - b.mean()) / b.std() * window
+                try:
+                    shift = phase_cross_correlation(a, b, upsample_factor=100, normalization=None)[0]
+                except TypeError:  # scikit-image < 0.19 has no normalization argument
+                    shift = phase_cross_correlation(a, b, upsample_factor=100)[0]
+                shifts.append((float(shift[0]), float(shift[1])))
+        out["n_tiles"] = int(len(shifts))
+        if not shifts:
+            out["error"] = f"no fully valid {tile}x{tile} tiles"
+            return out
+        arr = np.asarray(shifts, dtype=float)
+        dy = float(np.median(arr[:, 0]))
+        dx = float(np.median(arr[:, 1]))
+        out["median_dy_px"] = dy
+        out["median_dx_px"] = dx
+        out["median_offset_px"] = float(np.hypot(dy, dx))
+        out["tile_p90_px"] = float(np.percentile(np.hypot(arr[:, 0], arr[:, 1]), 90))
+        out["ok"] = True
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+
+
 def _process_detector_branch_candidate(
     *,
     candidate_idx: int,
@@ -8299,15 +8399,24 @@ def _process_detector_branch_candidate(
     s2_ref_wavelength_nm: float,
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Process one candidate by splitting VNIR/SWIR branches and recombining with nodata union."""
-    import pandas as pd
+    """Process one candidate with a single transform shared by the VNIR and SWIR detectors.
 
+    PRISMA L2D and EnMAP L2A deliver VNIR and SWIR already co-registered on one grid,
+    so warping each detector with its own transform can only add relative
+    misregistration. The full cube therefore gets one global shift (VNIR vs B08,
+    SWIR vs B11 as fallback); tie points are collected on that same cube, one
+    transform model is fitted, and the cube is warped once. With the default
+    ``joint_tiepoint_source="vnir_primary"`` the fit uses VNIR points (vs B02-B08)
+    and pools SWIR points (vs B11/B12) only when VNIR cannot support it; "pooled"
+    always merges both. Per-detector tie-point counts and post-warp QA are kept for
+    reporting.
+    """
     out: Dict[str, Any] = {
         "validation": {
             "is_valid": False,
             "confidence": 0.0,
             "shift_m": 0.0,
-            "message": "branch processing not executed",
+            "message": "joint detector processing not executed",
             "branch_validations": {},
             "ssim_before": None,
             "ssim_after": None,
@@ -8329,8 +8438,9 @@ def _process_detector_branch_candidate(
         "merged_tiepoint_stages": {},
         "multiband_tiepoint_counts": {},
         "branch_results": {},
-        "recombine_result": {"ok": False, "error": "not run"},
-        "branch_harmonization": {"ok": False, "error": "not run", "applied": False},
+        "recombine_result": {"ok": True, "applied": False, "reason": "joint transform: single warp, no recombination"},
+        "branch_harmonization": {"ok": True, "applied": False, "reason": "joint transform: single warp, no recombination"},
+        "inter_detector_offset": {},
         "temp_global_path": {},
         "temp_local_path": {},
         "pre_coreg_source_bands_1based": [],
@@ -8369,6 +8479,25 @@ def _process_detector_branch_candidate(
     out["output_band_names"] = list(detector_plan.get("final_band_names") or [])
     out["output_band_detectors"] = list(detector_plan.get("final_band_detectors") or [])
 
+    joint_wl = np.asarray(out["output_wl"], dtype=float).reshape(-1)
+    joint_fwhm = out["output_fwhm"]
+    joint_detectors = [str(d).upper() for d in out["output_band_detectors"]]
+    if joint_wl.size < 1 or len(joint_detectors) != int(joint_wl.size):
+        raise RuntimeError(
+            _fmt_issue(
+                "HS_PREP",
+                f"Candidate {candidate_idx + 1}: detector plan wavelengths/detectors are inconsistent "
+                f"({int(joint_wl.size)} vs {len(joint_detectors)}).",
+            )
+        )
+
+    def _detector_band_1based(detector: str, target_wl_nm: float) -> Optional[int]:
+        """Band (1-based, joint cube order) of ``detector`` closest to ``target_wl_nm``."""
+        idxs = [i for i, d in enumerate(joint_detectors) if d == detector]
+        if not idxs:
+            return None
+        return int(min(idxs, key=lambda i: abs(float(joint_wl[i]) - float(target_wl_nm)))) + 1
+
     with rasterio.open(s2_raster_path) as s2_src:
         s2_bounds = s2_src.bounds
         s2_extent = (
@@ -8380,84 +8509,76 @@ def _process_detector_branch_candidate(
 
     _emit_progress(
         progress_callback,
-        "Global/local coregistration by detector branch",
+        "Global/local coregistration (joint VNIR+SWIR)",
         scene_idx=scene_idx,
         scene_total=scene_total,
     )
-    log_section_header("DETECTOR-BRANCH COREGISTRATION (VNIR + SWIR)")
-
-    branch_results: Dict[str, Dict[str, Any]] = {}
-    branch_multiband_counts: Dict[str, int] = {}
-    branch_stage_counts: Dict[str, Dict[str, Any]] = {}
-    branch_order_decisions: Dict[str, Dict[str, Any]] = {}
-    branch_paths_for_recombine: Dict[str, Optional[str]] = {"VNIR": None, "SWIR": None}
-    branch_quality_flags: List[bool] = []
+    log_section_header("JOINT DETECTOR COREGISTRATION (VNIR + SWIR, ONE TRANSFORM)")
     stage_timings: Dict[str, float] = {}
 
-    for branch_name in ("VNIR", "SWIR"):
-        branch_cfg = dict(plan_branches.get(branch_name, {}))
-        branch_indices = [int(v) for v in branch_cfg.get("indices_1based", [])]
-        if not branch_indices:
-            raise RuntimeError(_fmt_issue("HS_PREP", f"Candidate {candidate_idx + 1}: no {branch_name} source bands."))
-
-        branch_input = os.path.join(
-            folder_struct["temp"], f"{scene_name}_{branch_name}_SRC_c{candidate_idx}.tif"
-        )
-        split_res = _write_branch_raster_windowed(
-            source_path=source_raster_path,
-            output_path=branch_input,
-            source_bands_1based=branch_indices,
-            out_dtype=PROCESSING_DTYPE,
-        )
-        if not split_res.get("ok", False):
-            raise RuntimeError(
-                _fmt_issue(
-                    "HS_PREP",
-                    f"Candidate {candidate_idx + 1}: failed {branch_name} split: "
-                    f"{split_res.get('error', 'unknown error')}",
-                )
+    joint_input = os.path.join(folder_struct["temp"], f"{scene_name}_JOINT_SRC_c{candidate_idx}.tif")
+    split_res = _write_branch_raster_windowed(
+        source_path=source_raster_path,
+        output_path=joint_input,
+        source_bands_1based=out["pre_coreg_source_bands_1based"],
+        out_dtype=PROCESSING_DTYPE,
+    )
+    if not split_res.get("ok", False):
+        raise RuntimeError(
+            _fmt_issue(
+                "HS_PREP",
+                f"Candidate {candidate_idx + 1}: failed to write joint detector cube: "
+                f"{split_res.get('error', 'unknown error')}",
             )
-
-        branch_wl = np.asarray(branch_cfg.get("wl", []), dtype=float).reshape(-1)
-        if branch_wl.size < 1:
-            raise RuntimeError(
-                _fmt_issue("HS_PREP", f"Candidate {candidate_idx + 1}: branch {branch_name} has no wavelengths.")
-            )
-        branch_target_wl = float(branch_cfg.get("global_target_wl_nm", s2_ref_wavelength_nm))
-        branch_match_bidx = int(np.argmin(np.abs(branch_wl - branch_target_wl))) + 1
-        branch_ref_bidx = int(branch_cfg.get("global_s2_stack_idx", s2_ref_stack_idx))
-        branch_s2_subset = tuple(branch_cfg.get("s2_subset", ()))
-
-        branch_global_out = os.path.join(
-            folder_struct["temp"], f"{scene_name}_{branch_name}_GLOBAL_c{candidate_idx}.tif"
-        )
-        branch_local_out = os.path.join(
-            folder_struct["temp"], f"{scene_name}_{branch_name}_LOCAL_c{candidate_idx}.tif"
-        )
-        branch_poly_out = os.path.join(
-            folder_struct["temp"], f"{scene_name}_{branch_name}_POLY_c{candidate_idx}.tif"
-        )
-        branch_tps_out = os.path.join(
-            folder_struct["temp"], f"{scene_name}_{branch_name}_TPS_c{candidate_idx}.tif"
         )
 
-        out["temp_global_path"][branch_name] = branch_global_out
-        out["temp_local_path"][branch_name] = branch_local_out
+    inter_detector_pre = _measure_inter_detector_offset(joint_input, joint_wl, joint_detectors)
+    if inter_detector_pre.get("ok"):
+        logger.info(
+            "Candidate %d: VNIR/SWIR offset in source cube: median %.3f px (dy=%.3f, dx=%.3f), tile P90 %.3f px, %d tiles.",
+            candidate_idx + 1,
+            float(inter_detector_pre["median_offset_px"]),
+            float(inter_detector_pre["median_dy_px"]),
+            float(inter_detector_pre["median_dx_px"]),
+            float(inter_detector_pre["tile_p90_px"]),
+            int(inter_detector_pre["n_tiles"]),
+        )
 
-        branch_geo = GeoArray(branch_input)
-        branch_nodata = branch_geo.nodata if branch_geo.nodata is not None else PROCESSING_NODATA
+    joint_global_out = os.path.join(folder_struct["temp"], f"{scene_name}_JOINT_GLOBAL_c{candidate_idx}.tif")
+    joint_local_out = os.path.join(folder_struct["temp"], f"{scene_name}_JOINT_LOCAL_c{candidate_idx}.tif")
+    joint_poly_out = os.path.join(folder_struct["temp"], f"{scene_name}_JOINT_POLY_c{candidate_idx}.tif")
+    joint_tps_out = os.path.join(folder_struct["temp"], f"{scene_name}_JOINT_TPS_c{candidate_idx}.tif")
+    out["temp_global_path"]["JOINT"] = joint_global_out
+    out["temp_local_path"]["JOINT"] = joint_local_out
 
-        global_ladder = matcher_profile.get("global_attempt_ladder", [{"ws": (256, 256), "max_shift": 150.0}])
-        branch_validation = {
-            "is_valid": False,
-            "confidence": 0.0,
-            "shift_m": 0.0,
-            "message": f"{branch_name}: global validation unavailable",
-            "branch": branch_name,
-        }
-        branch_global_success = False
+    joint_geo = GeoArray(joint_input)
+    joint_nodata = joint_geo.nodata if joint_geo.nodata is not None else PROCESSING_NODATA
 
-        t0_branch_global = perf_counter()
+    # --- Global: one shift for the whole cube; VNIR (10 m B08) first, SWIR (B11) as fallback.
+    global_ladder = matcher_profile.get("global_attempt_ladder", [{"ws": (256, 256), "max_shift": 150.0}])
+    validation = {
+        "is_valid": False,
+        "confidence": 0.0,
+        "shift_m": 0.0,
+        "message": "global validation unavailable",
+    }
+    global_success = False
+    global_detector_used: Optional[str] = None
+    match_bidx_by_detector: Dict[str, int] = {}
+    ref_bidx_by_detector: Dict[str, int] = {}
+    for detector in ("VNIR", "SWIR"):
+        det_cfg = dict(plan_branches.get(detector, {}))
+        target_wl = float(det_cfg.get("global_target_wl_nm", s2_ref_wavelength_nm))
+        match_bidx = _detector_band_1based(detector, target_wl)
+        if match_bidx is None:
+            continue
+        match_bidx_by_detector[detector] = int(match_bidx)
+        ref_bidx_by_detector[detector] = int(det_cfg.get("global_s2_stack_idx", s2_ref_stack_idx))
+
+    t0_global = perf_counter()
+    for detector in ("VNIR", "SWIR"):
+        if detector not in match_bidx_by_detector or global_success:
+            continue
         for g_idx, g_cfg in enumerate(global_ladder, 1):
             try:
                 with _ProgressHeartbeat(
@@ -8466,7 +8587,7 @@ def _process_detector_branch_candidate(
                     scene_idx=scene_idx,
                     scene_total=scene_total,
                     substage=(
-                        f"Candidate {candidate_idx + 1} [{branch_name}]: attempt {g_idx}/{len(global_ladder)} "
+                        f"Candidate {candidate_idx + 1} [joint, {detector} match]: attempt {g_idx}/{len(global_ladder)} "
                         f"(ws={g_cfg['ws'][0]}x{g_cfg['ws'][1]})"
                     ),
                     interval_s=progress_heartbeat_interval_s,
@@ -8474,15 +8595,15 @@ def _process_detector_branch_candidate(
                     captured_output = io.StringIO()
                     with contextlib.redirect_stdout(captured_output):
                         global_kwargs = {
-                            "r_b4match": branch_ref_bidx,
-                            "s_b4match": branch_match_bidx,
-                            "path_out": branch_global_out,
+                            "r_b4match": ref_bidx_by_detector[detector],
+                            "s_b4match": match_bidx_by_detector[detector],
+                            "path_out": joint_global_out,
                             "fmt_out": "GTiff",
                             "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
                             "max_shift": g_cfg["max_shift"],
                             "ws": g_cfg["ws"],
                             "resamp_alg_deshift": "cubic",
-                            "nodata": (0, branch_nodata),
+                            "nodata": (0, joint_nodata),
                             "progress": True,
                             "ignore_errors": True,
                             "v": False,
@@ -8493,13 +8614,13 @@ def _process_detector_branch_candidate(
                         _add_arosics_calc_resampling(COREG, global_kwargs)
                         CRG = COREG(
                             s2_raster_path,
-                            branch_geo,
+                            joint_geo,
                             **global_kwargs,
                         )
                         CRG.correct_shifts()
 
                     hb_global.update(
-                        substage=f"Candidate {candidate_idx + 1} [{branch_name}]: validating global shift"
+                        substage=f"Candidate {candidate_idx + 1} [joint, {detector} match]: validating global shift"
                     )
                     validation_candidate = _validate_coreg_hybrid(
                         CRG,
@@ -8507,86 +8628,105 @@ def _process_detector_branch_candidate(
                         sensor_type=hyp_type,
                         max_displacement=max_displacement,
                     )
-                if float(validation_candidate.get("confidence", 0.0)) >= float(branch_validation.get("confidence", 0.0)):
-                    branch_validation = dict(validation_candidate)
-                    branch_validation["branch"] = branch_name
+                if float(validation_candidate.get("confidence", 0.0)) >= float(validation.get("confidence", 0.0)):
+                    validation = dict(validation_candidate)
+                    validation["global_match_detector"] = detector
                 if validation_candidate.get("is_valid", False):
-                    branch_global_success = True
+                    global_success = True
+                    global_detector_used = detector
+                    validation = dict(validation_candidate)
+                    validation["global_match_detector"] = detector
                     break
             except Exception as g_exc:
-                logger.warning("Candidate %d [%s] global error: %s", candidate_idx + 1, branch_name, g_exc)
-
-        if not branch_global_success:
-            forward_res = stream_copy_raster_to_path(
-                source_path=branch_input,
-                output_path=branch_global_out,
-                nodata_fallback=PROCESSING_NODATA,
-                expected_band_count=int(branch_wl.size),
-                source_bands_1based=None,
-                tile_size=256,
-                collect_band_stats=False,
+                logger.warning("Candidate %d [joint, %s match] global error: %s", candidate_idx + 1, detector, g_exc)
+        if not global_success and detector == "VNIR" and "SWIR" in match_bidx_by_detector:
+            logger.info(
+                "Candidate %d: VNIR global match failed on every ladder step; trying SWIR (B11) for the joint global shift.",
+                candidate_idx + 1,
             )
-            if not forward_res.get("ok", False):
-                err = "; ".join(list(forward_res.get("errors", []) or ["unknown copy error"]))
-                raise RuntimeError(
-                    _fmt_issue(
-                        "HS_PREP",
-                        f"Candidate {candidate_idx + 1} [{branch_name}] failed global bypass copy: {err}",
-                    )
-                )
 
-        _record_stage_timing(
-            stage_timings,
-            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_global",
-            t0_branch_global,
+    if not global_success:
+        forward_res = stream_copy_raster_to_path(
+            source_path=joint_input,
+            output_path=joint_global_out,
+            nodata_fallback=PROCESSING_NODATA,
+            expected_band_count=int(joint_wl.size),
+            source_bands_1based=None,
+            tile_size=256,
+            collect_band_stats=False,
         )
-        try:
-            with rasterio.open(branch_global_out) as branch_global_src:
-                branch_extent_xy = (
-                    0.0,
-                    0.0,
-                    float(branch_global_src.width),
-                    float(branch_global_src.height),
+        if not forward_res.get("ok", False):
+            err = "; ".join(list(forward_res.get("errors", []) or ["unknown copy error"]))
+            raise RuntimeError(
+                _fmt_issue(
+                    "HS_PREP",
+                    f"Candidate {candidate_idx + 1} [joint] failed global bypass copy: {err}",
                 )
-        except Exception:
-            branch_extent_xy = None
+            )
+    else:
+        logger.info(
+            "Candidate %d: joint global shift from %s match applied to all %d bands.",
+            candidate_idx + 1,
+            global_detector_used,
+            int(joint_wl.size),
+        )
+    _record_stage_timing(stage_timings, f"candidate_{candidate_idx + 1}_joint_global", t0_global)
 
-        merged_tp_result: Dict[str, Any] = {"merged_df": None, "stage_counts": {}}
-        polynomial_order_decision: Dict[str, Any] = {
-            "preferred_order": int(preferred_polynomial_order),
-            "order_used": int(preferred_polynomial_order),
-            "downgraded": False,
-            "reason": "polynomial path not used",
-            "n_gcps": 0,
-        }
-        warp_min_points = int(_minimum_gcps_for_polynomial_order(2))
-        multiband_result: Dict[str, Any] = {}
-        poly_success = False
-        tps_success = False
-        poly_error_message: Optional[str] = None
-        tps_gcps_error_message: Optional[str] = None
-        tps_error_message: Optional[str] = None
-        CRL = None
+    try:
+        with rasterio.open(joint_global_out) as joint_global_src:
+            joint_extent_xy = (
+                0.0,
+                0.0,
+                float(joint_global_src.width),
+                float(joint_global_src.height),
+            )
+    except Exception:
+        joint_extent_xy = None
 
-        t0_branch_local = perf_counter()
-        with _ProgressHeartbeat(
-            progress_callback,
-            "Local coregistration (multi-band)",
-            scene_idx=scene_idx,
-            scene_total=scene_total,
-            substage=f"Candidate {candidate_idx + 1} [{branch_name}]: collecting tie points",
-            interval_s=progress_heartbeat_interval_s,
-        ) as hb_local:
-            multiband_result = _collect_multiband_tiepoints(
+    # --- Local: tie points per detector on the same globally shifted cube, pooled into one merge.
+    merged_tp_result: Dict[str, Any] = {"merged_df": None, "stage_counts": {}}
+    polynomial_order_decision: Dict[str, Any] = {
+        "preferred_order": int(preferred_polynomial_order),
+        "order_used": int(preferred_polynomial_order),
+        "downgraded": False,
+        "reason": "polynomial path not used",
+        "n_gcps": 0,
+    }
+    warp_min_points = int(_minimum_gcps_for_polynomial_order(2))
+    multiband_by_detector: Dict[str, Dict[str, Any]] = {}
+    tiepoint_source_used: Optional[str] = None
+    poly_success = False
+    tps_success = False
+    poly_error_message: Optional[str] = None
+    tps_gcps_error_message: Optional[str] = None
+    tps_error_message: Optional[str] = None
+    CRL = None
+
+    t0_local = perf_counter()
+    with _ProgressHeartbeat(
+        progress_callback,
+        "Local coregistration (multi-band)",
+        scene_idx=scene_idx,
+        scene_total=scene_total,
+        substage=f"Candidate {candidate_idx + 1} [joint]: collecting tie points",
+        interval_s=progress_heartbeat_interval_s,
+    ) as hb_local:
+        def _collect_detector_tiepoints(detector: str) -> List[Any]:
+            """Collect one detector's tie points on the joint cube, tagged with DETECTOR."""
+            det_cfg = dict(plan_branches.get(detector, {}))
+            hb_local.update(substage=f"Candidate {candidate_idx + 1} [joint]: collecting {detector} tie points")
+            # Collected on the joint cube with the joint wavelength table, so fixed
+            # band-pair indices resolve against the full band order they are defined for.
+            det_result = _collect_multiband_tiepoints(
                 s2_path=s2_raster_path,
-                hs_path=branch_global_out,
-                hs_wl=branch_wl,
+                hs_path=joint_global_out,
+                hs_wl=joint_wl,
                 temp_folder=folder_struct["temp"],
-                sensor_tag=f"{sensor_tag}_{branch_name}",
+                sensor_tag=f"{sensor_tag}_{detector}",
                 date_tag=date_tag,
                 cand_idx=candidate_idx,
-                s2_band_subset=branch_s2_subset,
-                hs_fwhm=branch_cfg.get("fwhm"),
+                s2_band_subset=tuple(det_cfg.get("s2_subset", ())),
+                hs_fwhm=joint_fwhm,
                 config={
                     "synthetic_s2_band_mode": config.get(
                         "synthetic_s2_band_mode",
@@ -8629,7 +8769,7 @@ def _process_detector_branch_candidate(
                     ),
                     "early_stop_grid_rows": int(spatial_grid_rows),
                     "early_stop_grid_cols": int(spatial_grid_cols),
-                    "early_stop_extent": branch_extent_xy,
+                    "early_stop_extent": joint_extent_xy,
                     "cache_hs_narrowbands": bool(
                         config.get(
                             "cache_hs_narrowbands",
@@ -8642,87 +8782,134 @@ def _process_detector_branch_candidate(
                     ),
                 },
             )
+            multiband_by_detector[detector] = det_result
+            tagged: List[Any] = []
+            for tp_df in list(det_result.get("all_tiepoints") or []):
+                if tp_df is None or len(tp_df) == 0:
+                    continue
+                tp_df = tp_df.copy()
+                tp_df["DETECTOR"] = detector
+                tagged.append(tp_df)
+            logger.info(
+                "Candidate %d [joint]: %s tie points per S2 band: %s",
+                candidate_idx + 1,
+                detector,
+                dict(det_result.get("tiepoint_counts", {})),
+            )
+            return tagged
 
-            if multiband_result.get("success") and multiband_result.get("all_tiepoints"):
-                merged_tp_result = _merge_tiepoints(
-                    multiband_result["all_tiepoints"],
-                    min_reliability=MIN_RELIABILITY_THRESHOLD,
-                    trim_by_residual=True,
-                    residual_mad_factor=residual_mad_factor,
-                    min_band_support=min_band_support,
-                    allow_single_band_fallback=allow_single_band_fallback,
-                    consensus_group_rounding_px=consensus_group_rounding_px,
-                    grid_rows=spatial_grid_rows,
-                    grid_cols=spatial_grid_cols,
-                    max_points_per_cell=max_points_per_cell,
-                    min_points_required=warp_min_points,
-                    stratification_extent=branch_extent_xy,
-                    band_min_median_reliability=float(
-                        config.get(
-                            "band_min_median_reliability",
-                            DEFAULT_CONFIG.get("band_min_median_reliability", 30.0),
-                        )
-                    ),
-                    band_weight_score=float(
-                        config.get("band_weight_score", DEFAULT_CONFIG.get("band_weight_score", 0.25))
-                    ),
-                )
-                if merged_tp_result.get("success") and merged_tp_result.get("merged_df") is not None:
-                    if str(config.get("transform_model_selection", DEFAULT_CONFIG.get("transform_model_selection", "cv"))).strip().lower() == "cv":
-                        cv_decision = _select_transform_model_cv(
-                            merged_tp_result["merged_df"],
-                            grid_rows=spatial_grid_rows,
-                            grid_cols=spatial_grid_cols,
-                            stratification_extent=branch_extent_xy,
-                            folds=int(config.get("transform_cv_folds", DEFAULT_CONFIG.get("transform_cv_folds", 5))),
-                            repeats=int(config.get("transform_cv_repeats", DEFAULT_CONFIG.get("transform_cv_repeats", 3))),
-                            holdout_fraction=float(
-                                config.get(
-                                    "transform_cv_holdout_fraction",
-                                    DEFAULT_CONFIG.get("transform_cv_holdout_fraction", 0.25),
-                                )
-                            ),
-                            seed=int(config.get("transform_cv_seed", DEFAULT_CONFIG.get("transform_cv_seed", 1337))),
-                            min_tps_gcps=int(
-                                config.get("transform_cv_min_tps_gcps", DEFAULT_CONFIG.get("transform_cv_min_tps_gcps", 20))
-                            ),
-                            min_tps_cells=int(
-                                config.get("transform_cv_min_tps_cells", DEFAULT_CONFIG.get("transform_cv_min_tps_cells", 8))
-                            ),
-                            tps_min_p90_improvement_m=float(
-                                config.get(
-                                    "transform_cv_tps_min_p90_improvement_m",
-                                    DEFAULT_CONFIG.get("transform_cv_tps_min_p90_improvement_m", 1.0),
-                                )
-                            ),
-                            edge_instability_factor=float(
-                                config.get(
-                                    "transform_cv_edge_instability_factor",
-                                    DEFAULT_CONFIG.get("transform_cv_edge_instability_factor", 2.5),
-                                )
-                            ),
-                        )
-                        if cv_decision.get("ok", False):
-                            polynomial_order_decision = cv_decision
-                        else:
-                            logger.info(
-                                "Candidate %d [%s]: CV transform selection unavailable (%s); using rule-based order selection.",
-                                candidate_idx + 1,
-                                branch_name,
-                                cv_decision.get("reason") or cv_decision.get("error") or "unknown",
+        def _merge_joint_tiepoints(tiepoint_dfs: List[Any]) -> Dict[str, Any]:
+            return _merge_tiepoints(
+                tiepoint_dfs,
+                min_reliability=MIN_RELIABILITY_THRESHOLD,
+                trim_by_residual=True,
+                residual_mad_factor=residual_mad_factor,
+                min_band_support=min_band_support,
+                allow_single_band_fallback=allow_single_band_fallback,
+                consensus_group_rounding_px=consensus_group_rounding_px,
+                grid_rows=spatial_grid_rows,
+                grid_cols=spatial_grid_cols,
+                max_points_per_cell=max_points_per_cell,
+                min_points_required=warp_min_points,
+                stratification_extent=joint_extent_xy,
+                band_min_median_reliability=float(
+                    config.get(
+                        "band_min_median_reliability",
+                        DEFAULT_CONFIG.get("band_min_median_reliability", 30.0),
+                    )
+                ),
+                band_weight_score=float(
+                    config.get("band_weight_score", DEFAULT_CONFIG.get("band_weight_score", 0.25))
+                ),
+            )
+
+        # VNIR points (10 m S2 bands) carry the fit; SWIR points (20 m B11/B12) are pooled
+        # in only when VNIR cannot support one, or when "pooled" is configured. Either
+        # way the resulting transform is applied to every band.
+        tiepoint_source = str(
+            config.get("joint_tiepoint_source", DEFAULT_CONFIG.get("joint_tiepoint_source", "vnir_primary"))
+        ).strip().lower()
+        vnir_min_points = int(max(int(min_tie_points), int(warp_min_points)))
+        tiepoints_by_detector: Dict[str, List[Any]] = {}
+        selected_tiepoints: List[Any] = []
+        if tiepoint_source != "pooled":
+            tiepoints_by_detector["VNIR"] = _collect_detector_tiepoints("VNIR")
+            if tiepoints_by_detector["VNIR"]:
+                hb_local.update(substage=f"Candidate {candidate_idx + 1} [joint]: merging VNIR tie points")
+                vnir_merge = _merge_joint_tiepoints(tiepoints_by_detector["VNIR"])
+                vnir_df = vnir_merge.get("merged_df")
+                n_vnir = int(len(vnir_df)) if vnir_merge.get("success") and vnir_df is not None else 0
+                if n_vnir >= vnir_min_points:
+                    merged_tp_result = vnir_merge
+                    selected_tiepoints = tiepoints_by_detector["VNIR"]
+                    tiepoint_source_used = "VNIR"
+                else:
+                    logger.info(
+                        "Candidate %d [joint]: VNIR tie points insufficient (%d merged < %d); pooling SWIR tie points.",
+                        candidate_idx + 1,
+                        n_vnir,
+                        vnir_min_points,
+                    )
+        if tiepoint_source_used is None:
+            for detector in ("VNIR", "SWIR"):
+                if detector not in tiepoints_by_detector:
+                    tiepoints_by_detector[detector] = _collect_detector_tiepoints(detector)
+            selected_tiepoints = list(tiepoints_by_detector.get("VNIR", [])) + list(tiepoints_by_detector.get("SWIR", []))
+            if selected_tiepoints:
+                hb_local.update(substage=f"Candidate {candidate_idx + 1} [joint]: merging pooled VNIR+SWIR tie points")
+                merged_tp_result = _merge_joint_tiepoints(selected_tiepoints)
+                tiepoint_source_used = "VNIR+SWIR"
+        logger.info(
+            "Candidate %d [joint]: transform fitted on %s tie points (joint_tiepoint_source=%s).",
+            candidate_idx + 1,
+            tiepoint_source_used or "no",
+            tiepoint_source,
+        )
+
+        if selected_tiepoints:
+            if merged_tp_result.get("success") and merged_tp_result.get("merged_df") is not None:
+                if str(config.get("transform_model_selection", DEFAULT_CONFIG.get("transform_model_selection", "cv"))).strip().lower() == "cv":
+                    cv_decision = _select_transform_model_cv(
+                        merged_tp_result["merged_df"],
+                        grid_rows=spatial_grid_rows,
+                        grid_cols=spatial_grid_cols,
+                        stratification_extent=joint_extent_xy,
+                        folds=int(config.get("transform_cv_folds", DEFAULT_CONFIG.get("transform_cv_folds", 5))),
+                        repeats=int(config.get("transform_cv_repeats", DEFAULT_CONFIG.get("transform_cv_repeats", 3))),
+                        holdout_fraction=float(
+                            config.get(
+                                "transform_cv_holdout_fraction",
+                                DEFAULT_CONFIG.get("transform_cv_holdout_fraction", 0.25),
                             )
-                            polynomial_order_decision = _decide_polynomial_order(
-                                merged_df=merged_tp_result["merged_df"],
-                                preferred_order=preferred_polynomial_order,
-                                auto_downgrade=auto_downgrade_polynomial_order,
-                                min_gcps_order2=min_gcps_order2,
-                                min_cells_order2=min_cells_order2,
-                                grid_rows=spatial_grid_rows,
-                                grid_cols=spatial_grid_cols,
-                                stratification_extent=branch_extent_xy,
+                        ),
+                        seed=int(config.get("transform_cv_seed", DEFAULT_CONFIG.get("transform_cv_seed", 1337))),
+                        min_tps_gcps=int(
+                            config.get("transform_cv_min_tps_gcps", DEFAULT_CONFIG.get("transform_cv_min_tps_gcps", 20))
+                        ),
+                        min_tps_cells=int(
+                            config.get("transform_cv_min_tps_cells", DEFAULT_CONFIG.get("transform_cv_min_tps_cells", 8))
+                        ),
+                        tps_min_p90_improvement_m=float(
+                            config.get(
+                                "transform_cv_tps_min_p90_improvement_m",
+                                DEFAULT_CONFIG.get("transform_cv_tps_min_p90_improvement_m", 1.0),
                             )
-                            polynomial_order_decision["cv_fallback"] = cv_decision
+                        ),
+                        edge_instability_factor=float(
+                            config.get(
+                                "transform_cv_edge_instability_factor",
+                                DEFAULT_CONFIG.get("transform_cv_edge_instability_factor", 2.5),
+                            )
+                        ),
+                    )
+                    if cv_decision.get("ok", False):
+                        polynomial_order_decision = cv_decision
                     else:
+                        logger.info(
+                            "Candidate %d [joint]: CV transform selection unavailable (%s); using rule-based order selection.",
+                            candidate_idx + 1,
+                            cv_decision.get("reason") or cv_decision.get("error") or "unknown",
+                        )
                         polynomial_order_decision = _decide_polynomial_order(
                             merged_df=merged_tp_result["merged_df"],
                             preferred_order=preferred_polynomial_order,
@@ -8731,474 +8918,343 @@ def _process_detector_branch_candidate(
                             min_cells_order2=min_cells_order2,
                             grid_rows=spatial_grid_rows,
                             grid_cols=spatial_grid_cols,
-                            stratification_extent=branch_extent_xy,
+                            stratification_extent=joint_extent_xy,
                         )
-                    checkpoint_kind = (
-                        "tps"
-                        if bool(polynomial_order_decision.get("use_tps", False))
-                        else ("affine" if int(polynomial_order_decision.get("order_used", 2)) <= 1 else "order2")
+                        polynomial_order_decision["cv_fallback"] = cv_decision
+                else:
+                    polynomial_order_decision = _decide_polynomial_order(
+                        merged_df=merged_tp_result["merged_df"],
+                        preferred_order=preferred_polynomial_order,
+                        auto_downgrade=auto_downgrade_polynomial_order,
+                        min_gcps_order2=min_gcps_order2,
+                        min_cells_order2=min_cells_order2,
+                        grid_rows=spatial_grid_rows,
+                        grid_cols=spatial_grid_cols,
+                        stratification_extent=joint_extent_xy,
                     )
-                    checkpoint = _checkpoint_accuracy(
-                        merged_tp_result["merged_df"],
-                        kind=checkpoint_kind,
-                        holdout_fraction=float(
-                            config.get(
-                                "checkpoint_holdout_fraction",
-                                DEFAULT_CONFIG.get("checkpoint_holdout_fraction", 0.2),
-                            )
-                        ),
+                checkpoint_kind = (
+                    "tps"
+                    if bool(polynomial_order_decision.get("use_tps", False))
+                    else ("affine" if int(polynomial_order_decision.get("order_used", 2)) <= 1 else "order2")
+                )
+                checkpoint = _checkpoint_accuracy(
+                    merged_tp_result["merged_df"],
+                    kind=checkpoint_kind,
+                    holdout_fraction=float(
+                        config.get(
+                            "checkpoint_holdout_fraction",
+                            DEFAULT_CONFIG.get("checkpoint_holdout_fraction", 0.2),
+                        )
+                    ),
+                )
+                polynomial_order_decision["checkpoint_accuracy"] = checkpoint
+                if checkpoint.get("ok"):
+                    logger.info(
+                        "Candidate %d [joint]: independent check points (%s, %d%% held out): "
+                        "RMSE %.2f m, P90 %.2f m, max %.2f m.",
+                        candidate_idx + 1,
+                        checkpoint_kind,
+                        int(round(100 * float(checkpoint["holdout_fraction"]))),
+                        float(checkpoint["checkpoint_rmse_m"]),
+                        float(checkpoint["checkpoint_p90_m"]),
+                        float(checkpoint["checkpoint_max_m"]),
                     )
-                    polynomial_order_decision["checkpoint_accuracy"] = checkpoint
-                    if checkpoint.get("ok"):
+                gcp_result = _build_gcps_from_tiepoints(merged_tp_result["merged_df"])
+                if gcp_result.get("success"):
+                    polynomial_order_decision["n_gcps"] = int(gcp_result.get("n_gcps", 0))
+                min_gcps_for_order = _minimum_gcps_for_polynomial_order(
+                    int(polynomial_order_decision.get("order_used", 2))
+                )
+                if bool(polynomial_order_decision.get("use_tps", False)):
+                    poly_error_message = "CV selected TPS transform model"
+                    logger.info(
+                        "Candidate %d [joint]: CV selected TPS; skipping polynomial warp.",
+                        candidate_idx + 1,
+                    )
+                elif gcp_result.get("success") and int(gcp_result.get("n_gcps", 0)) >= int(min_gcps_for_order):
+                    hb_local.update(
+                        substage=f"Candidate {candidate_idx + 1} [joint]: applying polynomial warp to all bands"
+                    )
+                    t0_warp = perf_counter()
+                    poly_result = _apply_polynomial_warp(
+                        input_raster=joint_global_out,
+                        output_raster=joint_poly_out,
+                        gcps=gcp_result["gcps"],
+                        target_crs=s2_crs,
+                        polynomial_order=int(polynomial_order_decision.get("order_used", 2)),
+                        output_resolution=PRISMA_OUTPUT_RESOLUTION,
+                        nodata=PROCESSING_NODATA,
+                        resampling="cubic",
+                        s2_bounds=s2_extent,
+                        gdalwarp_multi=bool(gdalwarp_multi),
+                        gdalwarp_num_threads=gdalwarp_num_threads,
+                    )
+                    _record_stage_timing(stage_timings, f"candidate_{candidate_idx + 1}_warp", t0_warp)
+                    if poly_result.get("success", False):
+                        poly_success = True
+                        shutil.move(joint_poly_out, joint_local_out)
+                    else:
+                        poly_error_message = str(poly_result.get("error_message", "unknown polynomial warp failure"))
                         logger.info(
-                            "Candidate %d [%s]: independent check points (%s, %d%% held out): "
-                            "RMSE %.2f m, P90 %.2f m, max %.2f m.",
+                            "Candidate %d [joint]: polynomial warp failed: %s",
                             candidate_idx + 1,
-                            branch_name,
-                            checkpoint_kind,
-                            int(round(100 * float(checkpoint["holdout_fraction"]))),
-                            float(checkpoint["checkpoint_rmse_m"]),
-                            float(checkpoint["checkpoint_p90_m"]),
-                            float(checkpoint["checkpoint_max_m"]),
+                            poly_error_message,
                         )
-                    gcp_result = _build_gcps_from_tiepoints(merged_tp_result["merged_df"])
-                    min_gcps_for_order = _minimum_gcps_for_polynomial_order(
-                        int(polynomial_order_decision.get("order_used", 2))
+                else:
+                    poly_error_message = (
+                        "Polynomial warp skipped: insufficient GCPs "
+                        f"({int(gcp_result.get('n_gcps', 0))} < {int(min_gcps_for_order)})"
                     )
-                    if bool(polynomial_order_decision.get("use_tps", False)):
-                        poly_error_message = "CV selected TPS transform model"
-                        logger.info(
-                            "Candidate %d [%s]: CV selected TPS; skipping polynomial warp.",
-                            candidate_idx + 1,
-                            branch_name,
-                        )
-                    elif gcp_result.get("success") and int(gcp_result.get("n_gcps", 0)) >= int(min_gcps_for_order):
-                        hb_local.update(
-                            substage=f"Candidate {candidate_idx + 1} [{branch_name}]: applying polynomial warp"
-                        )
-                        t0_branch_warp = perf_counter()
-                        poly_result = _apply_polynomial_warp(
-                            input_raster=branch_global_out,
-                            output_raster=branch_poly_out,
-                            gcps=gcp_result["gcps"],
+                    logger.info("Candidate %d [joint]: %s", candidate_idx + 1, poly_error_message)
+
+                if not poly_success:
+                    hb_local.update(
+                        substage=f"Candidate {candidate_idx + 1} [joint]: polynomial failed, trying TPS"
+                    )
+                    tps_gcps_result = _build_tps_gcps_for_source_raster(
+                        tie_points_df=merged_tp_result["merged_df"],
+                        source_raster_path=joint_global_out,
+                        min_gcps=warp_min_points,
+                    )
+                    if tps_gcps_result.get("success", False):
+                        t0_warp = perf_counter()
+                        tps_result = _apply_tps_warp_from_gcps(
+                            input_raster=joint_global_out,
+                            output_raster=joint_tps_out,
+                            gcps=tps_gcps_result.get("gcps", []),
                             target_crs=s2_crs,
-                            polynomial_order=int(polynomial_order_decision.get("order_used", 2)),
-                            output_resolution=PRISMA_OUTPUT_RESOLUTION,
-                            nodata=PROCESSING_NODATA,
+                            x_res=float(PRISMA_OUTPUT_RESOLUTION),
+                            y_res=float(PRISMA_OUTPUT_RESOLUTION),
                             resampling="cubic",
-                            s2_bounds=s2_extent,
+                            nodata=PROCESSING_NODATA,
+                            target_aligned_pixels=False,
+                            target_extent=s2_extent,
                             gdalwarp_multi=bool(gdalwarp_multi),
                             gdalwarp_num_threads=gdalwarp_num_threads,
                         )
-                        warp_elapsed = _record_stage_timing(
-                            stage_timings,
-                            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_warp",
-                            t0_branch_warp,
-                        )
-                        stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
-                            stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
-                        ) + float(warp_elapsed)
-                        if poly_result.get("success", False):
-                            poly_success = True
-                            shutil.move(branch_poly_out, branch_local_out)
+                        _record_stage_timing(stage_timings, f"candidate_{candidate_idx + 1}_warp", t0_warp)
+                        if tps_result.get("success", False):
+                            tps_success = True
+                            shutil.move(joint_tps_out, joint_local_out)
                         else:
-                            poly_error_message = str(poly_result.get("error_message", "unknown polynomial warp failure"))
+                            tps_error_message = str(tps_result.get("error_message", "unknown TPS warp failure"))
                             logger.info(
-                                "Candidate %d [%s]: polynomial warp failed: %s",
+                                "Candidate %d [joint]: TPS warp failed: %s",
                                 candidate_idx + 1,
-                                branch_name,
-                                poly_error_message,
+                                tps_error_message,
                             )
                     else:
-                        poly_error_message = (
-                            "Polynomial warp skipped: insufficient GCPs "
-                            f"({int(gcp_result.get('n_gcps', 0))} < {int(min_gcps_for_order)})"
+                        tps_gcps_error_message = str(
+                            tps_gcps_result.get("error_message", "failed to derive TPS GCPs")
                         )
                         logger.info(
-                            "Candidate %d [%s]: %s",
+                            "Candidate %d [joint]: TPS GCP build failed: %s",
                             candidate_idx + 1,
-                            branch_name,
-                            poly_error_message,
+                            tps_gcps_error_message,
                         )
-
-                    if not poly_success:
-                        hb_local.update(
-                            substage=f"Candidate {candidate_idx + 1} [{branch_name}]: polynomial failed, trying TPS"
-                        )
-                        tps_gcps_result = _build_tps_gcps_for_source_raster(
-                            tie_points_df=merged_tp_result["merged_df"],
-                            source_raster_path=branch_global_out,
-                            min_gcps=warp_min_points,
-                        )
-                        if tps_gcps_result.get("success", False):
-                            t0_branch_warp = perf_counter()
-                            tps_result = _apply_tps_warp_from_gcps(
-                                input_raster=branch_global_out,
-                                output_raster=branch_tps_out,
-                                gcps=tps_gcps_result.get("gcps", []),
-                                target_crs=s2_crs,
-                                x_res=float(PRISMA_OUTPUT_RESOLUTION),
-                                y_res=float(PRISMA_OUTPUT_RESOLUTION),
-                                resampling="cubic",
-                                nodata=PROCESSING_NODATA,
-                                target_aligned_pixels=False,
-                                target_extent=s2_extent,
-                                gdalwarp_multi=bool(gdalwarp_multi),
-                                gdalwarp_num_threads=gdalwarp_num_threads,
-                            )
-                            warp_elapsed = _record_stage_timing(
-                                stage_timings,
-                                f"candidate_{candidate_idx + 1}_{branch_name.lower()}_warp",
-                                t0_branch_warp,
-                            )
-                            stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
-                                stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
-                            ) + float(warp_elapsed)
-                            if tps_result.get("success", False):
-                                tps_success = True
-                                shutil.move(branch_tps_out, branch_local_out)
-                            else:
-                                tps_error_message = str(tps_result.get("error_message", "unknown TPS warp failure"))
-                                logger.info(
-                                    "Candidate %d [%s]: TPS warp failed: %s",
-                                    candidate_idx + 1,
-                                    branch_name,
-                                    tps_error_message,
-                                )
-                        else:
-                            tps_gcps_error_message = str(
-                                tps_gcps_result.get("error_message", "failed to derive TPS GCPs")
-                            )
-                            logger.info(
-                                "Candidate %d [%s]: TPS GCP build failed: %s",
-                                candidate_idx + 1,
-                                branch_name,
-                                tps_gcps_error_message,
-                            )
-                else:
-                    logger.info(
-                        "Candidate %d [%s]: merged tiepoints unavailable for polynomial/TPS "
-                        "(error=%s, stages=%s).",
-                        candidate_idx + 1,
-                        branch_name,
-                        str(merged_tp_result.get("error_message") or "unknown merge failure"),
-                        dict(merged_tp_result.get("stage_counts", {})),
-                    )
             else:
                 logger.info(
-                    "Candidate %d [%s]: multiband tiepoint collection unavailable "
-                    "(success=%s, counts=%s, error=%s).",
+                    "Candidate %d [joint]: merged tiepoints unavailable for polynomial/TPS "
+                    "(error=%s, stages=%s).",
                     candidate_idx + 1,
-                    branch_name,
-                    bool(multiband_result.get("success", False)),
-                    dict(multiband_result.get("tiepoint_counts", {})),
-                    str(multiband_result.get("error_message") or ""),
+                    str(merged_tp_result.get("error_message") or "unknown merge failure"),
+                    dict(merged_tp_result.get("stage_counts", {})),
                 )
-            if not poly_success and not tps_success and POLYNOMIAL_FALLBACK_TO_AROSICS:
-                fallback_reasons: List[str] = []
-                merge_error = str(merged_tp_result.get("error_message") or "").strip()
-                if merge_error:
-                    fallback_reasons.append(f"merge failed ({merge_error})")
-                if poly_error_message:
-                    fallback_reasons.append(poly_error_message)
-                if tps_gcps_error_message:
-                    fallback_reasons.append(f"TPS GCPs unavailable ({tps_gcps_error_message})")
-                if tps_error_message:
-                    fallback_reasons.append(f"TPS warp failed ({tps_error_message})")
-                if not fallback_reasons:
-                    fallback_reasons.append("polynomial/TPS path did not produce an output")
+        else:
+            logger.info(
+                "Candidate %d [joint]: no tie points collected from either detector (VNIR=%s, SWIR=%s).",
+                candidate_idx + 1,
+                str(multiband_by_detector.get("VNIR", {}).get("error_message") or ""),
+                str(multiband_by_detector.get("SWIR", {}).get("error_message") or ""),
+            )
+
+        if not poly_success and not tps_success and POLYNOMIAL_FALLBACK_TO_AROSICS and "VNIR" in match_bidx_by_detector:
+            fallback_reasons: List[str] = []
+            merge_error = str(merged_tp_result.get("error_message") or "").strip()
+            if merge_error:
+                fallback_reasons.append(f"merge failed ({merge_error})")
+            if poly_error_message:
+                fallback_reasons.append(poly_error_message)
+            if tps_gcps_error_message:
+                fallback_reasons.append(f"TPS GCPs unavailable ({tps_gcps_error_message})")
+            if tps_error_message:
+                fallback_reasons.append(f"TPS warp failed ({tps_error_message})")
+            if not fallback_reasons:
+                fallback_reasons.append("polynomial/TPS path did not produce an output")
+            logger.info(
+                "Candidate %d [joint]: fallback local AROSICS (VNIR match, all bands) triggered because %s.",
+                candidate_idx + 1,
+                "; ".join(fallback_reasons),
+            )
+            hb_local.update(substage=f"Candidate {candidate_idx + 1} [joint]: fallback local AROSICS")
+            fallback_align_grids = bool(matcher_profile.get("local_align_grids", True))
+            if not fallback_align_grids and _normalize_sensor_name(hyp_type) == "PRISMA":
                 logger.info(
-                    "Candidate %d [%s]: fallback local AROSICS triggered because %s.",
+                    "Candidate %d [joint]: using PRISMA native-grid local fallback (align_grids=False).",
                     candidate_idx + 1,
-                    branch_name,
-                    "; ".join(fallback_reasons),
                 )
-                hb_local.update(
-                    substage=f"Candidate {candidate_idx + 1} [{branch_name}]: fallback local AROSICS"
-                )
-                fallback_align_grids = bool(matcher_profile.get("local_align_grids", True))
-                if not fallback_align_grids and _normalize_sensor_name(hyp_type) == "PRISMA":
-                    logger.info(
-                        "Candidate %d [%s]: using PRISMA native-grid local fallback (align_grids=False).",
-                        candidate_idx + 1,
-                        branch_name,
-                    )
-                fallback_kwargs = {
-                    "grid_res": int(matcher_profile.get("local_grid_res", LOCAL_GRID_RES_M)),
-                    "window_size": _coerce_window_size(matcher_profile.get("local_window_size"), (256, 256)),
-                    "path_out": branch_local_out,
-                    "fmt_out": "GTiff",
-                    "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
-                    "r_b4match": branch_ref_bidx,
-                    "s_b4match": branch_match_bidx,
-                    "max_shift": float(matcher_profile.get("local_max_shift", 50.0)),
-                    "resamp_alg_deshift": "cubic",
-                    "align_grids": fallback_align_grids,
-                    "tieP_filter_level": int(matcher_profile.get("local_tieP_filter_level", 1)),
-                    "outFillVal": branch_nodata,
-                    "nodata": (0, branch_nodata),
-                    "CPUs": int(arosics_cpus),
-                    "progress": True,
-                    "v": False,
-                    "q": False,
-                    "ignore_errors": True,
-                }
-                fallback_max_iter = matcher_profile.get("local_max_iter")
-                if fallback_max_iter is not None and _supports_constructor_kwarg(COREG_LOCAL, "max_iter"):
-                    fallback_kwargs["max_iter"] = int(fallback_max_iter)
-                _add_arosics_calc_resampling(COREG_LOCAL, fallback_kwargs)
-                CRL = COREG_LOCAL(s2_raster_path, branch_global_out, **fallback_kwargs)
-                CRL.correct_shifts()
+            fallback_kwargs = {
+                "grid_res": int(matcher_profile.get("local_grid_res", LOCAL_GRID_RES_M)),
+                "window_size": _coerce_window_size(matcher_profile.get("local_window_size"), (256, 256)),
+                "path_out": joint_local_out,
+                "fmt_out": "GTiff",
+                "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
+                "r_b4match": ref_bidx_by_detector["VNIR"],
+                "s_b4match": match_bidx_by_detector["VNIR"],
+                "max_shift": float(matcher_profile.get("local_max_shift", 50.0)),
+                "resamp_alg_deshift": "cubic",
+                "align_grids": fallback_align_grids,
+                "tieP_filter_level": int(matcher_profile.get("local_tieP_filter_level", 1)),
+                "outFillVal": joint_nodata,
+                "nodata": (0, joint_nodata),
+                "CPUs": int(arosics_cpus),
+                "progress": True,
+                "v": False,
+                "q": False,
+                "ignore_errors": True,
+            }
+            fallback_max_iter = matcher_profile.get("local_max_iter")
+            if fallback_max_iter is not None and _supports_constructor_kwarg(COREG_LOCAL, "max_iter"):
+                fallback_kwargs["max_iter"] = int(fallback_max_iter)
+            _add_arosics_calc_resampling(COREG_LOCAL, fallback_kwargs)
+            CRL = COREG_LOCAL(s2_raster_path, joint_global_out, **fallback_kwargs)
+            CRL.correct_shifts()
 
-        _record_stage_timing(
-            stage_timings,
-            f"candidate_{candidate_idx + 1}_{branch_name.lower()}_local",
-            t0_branch_local,
-        )
+    _record_stage_timing(stage_timings, f"candidate_{candidate_idx + 1}_joint_local", t0_local)
 
-        tie_points_df = None
-        tie_points_viz_df = None
-        if CRL is not None:
-            tie_points_df = _sanitize_arosics_tiepoints(getattr(CRL, "CoRegPoints_table", None))
-            tie_points_viz_df = tie_points_df
-        elif merged_tp_result.get("merged_df") is not None:
-            tie_points_df = merged_tp_result["merged_df"]
-            tie_points_viz_df = merged_tp_result.get("visualization_df", tie_points_df)
+    tie_points_df = None
+    tie_points_viz_df = None
+    if CRL is not None:
+        tie_points_df = _sanitize_arosics_tiepoints(getattr(CRL, "CoRegPoints_table", None))
+        tie_points_viz_df = tie_points_df
+    elif merged_tp_result.get("merged_df") is not None:
+        tie_points_df = merged_tp_result["merged_df"]
+        tie_points_viz_df = merged_tp_result.get("visualization_df", tie_points_df)
 
-        tp_residuals = _compute_tiepoint_residuals(tie_points_df, pixel_size_m=30.0)
-        local_tp_count = int(tp_residuals.get("n_tiepoints_used", 0) or 0)
+    tp_residuals = _compute_tiepoint_residuals(tie_points_df, pixel_size_m=30.0)
+    local_tp_count = int(tp_residuals.get("n_tiepoints_used", 0) or 0)
 
-        branch_output_path = branch_local_out if os.path.exists(branch_local_out) else branch_global_out
-        if branch_output_path and not os.path.exists(branch_output_path):
-            branch_output_path = None
-        branch_output_validation = _validate_coreg_raster_content(
-            branch_output_path,
-            nodata=PROCESSING_NODATA,
-            max_windows=0,
-            stop_on_first_valid=True,
-        )
-        branch_output_ok = bool(branch_output_validation.get("ok", False))
+    output_path = joint_local_out if os.path.exists(joint_local_out) else joint_global_out
+    if output_path and not os.path.exists(output_path):
+        output_path = None
+    output_validation = _validate_coreg_raster_content(
+        output_path,
+        nodata=PROCESSING_NODATA,
+        max_windows=0,
+        stop_on_first_valid=True,
+    )
+    output_ok = bool(output_validation.get("ok", False))
 
-        branch_phasecorr = _run_postwarp_phasecorr_qa(
+    # Post-warp QA per detector on the single output (VNIR vs its S2 band, SWIR vs B11).
+    phasecorr_by_detector: Dict[str, Dict[str, Any]] = {}
+    for detector in ("VNIR", "SWIR"):
+        if detector not in match_bidx_by_detector:
+            continue
+        det_phasecorr = _run_postwarp_phasecorr_qa(
             enabled=bool(postwarp_phasecorr_check),
             reference_raster_path=s2_raster_path,
-            candidate_raster_path=branch_output_path,
-            reference_band=int(branch_ref_bidx),
-            candidate_band=int(max(1, min(branch_match_bidx, int(branch_wl.size)))),
+            candidate_raster_path=output_path,
+            reference_band=int(ref_bidx_by_detector[detector]),
+            candidate_band=int(match_bidx_by_detector[detector]),
             warn_threshold_px=float(postwarp_phasecorr_warn_threshold_px),
             reject_threshold_px=float(postwarp_phasecorr_reject_threshold_px),
             reject_bad=bool(postwarp_phasecorr_reject_bad),
             max_dim=int(postwarp_phasecorr_max_dim),
         )
-        if branch_phasecorr.get("enabled", False) and branch_phasecorr.get("ok", False):
-            if branch_phasecorr.get("reject", False):
-                branch_output_ok = False
+        phasecorr_by_detector[detector] = dict(det_phasecorr)
+        if det_phasecorr.get("enabled", False) and det_phasecorr.get("ok", False) and det_phasecorr.get("reject", False):
+            output_ok = False
 
-        branch_final_ok = (
-            float(branch_validation.get("confidence", 0.0)) >= (float(min_accuracy) / 100.0)
-            and int(local_tp_count) >= int(min_tie_points)
-            and bool(branch_output_ok)
+    inter_detector_post = (
+        _measure_inter_detector_offset(output_path, joint_wl, joint_detectors)
+        if output_ok
+        else {"ok": False, "error": "no valid output"}
+    )
+    if inter_detector_post.get("ok"):
+        logger.info(
+            "Candidate %d: VNIR/SWIR offset after joint warp: median %.3f px (dy=%.3f, dx=%.3f), tile P90 %.3f px, %d tiles.",
+            candidate_idx + 1,
+            float(inter_detector_post["median_offset_px"]),
+            float(inter_detector_post["median_dy_px"]),
+            float(inter_detector_post["median_dx_px"]),
+            float(inter_detector_post["tile_p90_px"]),
+            int(inter_detector_post["n_tiles"]),
         )
+    out["inter_detector_offset"] = {"pre": dict(inter_detector_pre), "post": dict(inter_detector_post)}
 
-        mb_counts = dict(multiband_result.get("tiepoint_counts", {}) or {}) if isinstance(multiband_result, dict) else {}
-        for band_label, count in mb_counts.items():
-            try:
-                branch_multiband_counts[str(band_label)] = int(branch_multiband_counts.get(str(band_label), 0)) + int(count)
-            except Exception:
-                continue
+    final_ok = (
+        float(validation.get("confidence", 0.0)) >= (float(min_accuracy) / 100.0)
+        and int(local_tp_count) >= int(min_tie_points)
+        and bool(output_ok)
+    )
 
-        branch_stage_counts[branch_name] = dict(merged_tp_result.get("stage_counts", {}))
-        branch_order_decisions[branch_name] = dict(polynomial_order_decision)
-        branch_paths_for_recombine[branch_name] = str(branch_output_path) if branch_output_ok and branch_output_path else None
-        branch_quality_flags.append(bool(branch_final_ok))
-        branch_results[branch_name] = {
-            "validation": dict(branch_validation),
-            "global_success": bool(branch_global_success),
-            "local_valid_tp_count": int(local_tp_count),
-            "tp_residuals": dict(tp_residuals),
-            "polynomial_warp_used": bool(poly_success),
-            "tps_warp_used": bool(tps_success),
-            "polynomial_order_decision": dict(polynomial_order_decision),
-            "merged_tiepoint_stages": dict(merged_tp_result.get("stage_counts", {})),
-            "multiband_tiepoint_counts": dict(mb_counts),
-            "band_match_modes": dict(multiband_result.get("band_match_modes", {}) or {}),
-            "band_weights": dict(multiband_result.get("band_weights", {}) or {}),
-            "local_tiepoints_df": tie_points_df,
-            "local_tiepoints_visualization_df": tie_points_viz_df,
-            "output_path": branch_output_path,
-            "output_content_valid": bool(branch_output_ok),
-            "output_validation": dict(branch_output_validation),
-            "postwarp_phasecorr_qa": dict(branch_phasecorr),
+    # Per-detector reporting: raw tie points per S2 band, and how many of the final
+    # pooled points each detector contributed.
+    merged_df = merged_tp_result.get("merged_df") if isinstance(merged_tp_result, dict) else None
+    multiband_counts: Dict[str, int] = {}
+    branch_results: Dict[str, Dict[str, Any]] = {}
+    for detector in ("VNIR", "SWIR"):
+        det_result = multiband_by_detector.get(detector, {})
+        det_counts = {str(k): int(v) for k, v in dict(det_result.get("tiepoint_counts", {}) or {}).items()}
+        for band_label, count in det_counts.items():
+            multiband_counts[band_label] = int(multiband_counts.get(band_label, 0)) + int(count)
+        n_final = None
+        if merged_df is not None and "DETECTOR" in getattr(merged_df, "columns", []):
+            n_final = int((merged_df["DETECTOR"] == detector).sum())
+        branch_results[detector] = {
+            "transform_scope": "joint",
+            "tiepoints_collected": bool(detector in multiband_by_detector),
+            "global_match_detector": global_detector_used,
+            "multiband_tiepoint_counts": det_counts,
+            "band_match_modes": dict(det_result.get("band_match_modes", {}) or {}),
+            "band_weights": dict(det_result.get("band_weights", {}) or {}),
+            "n_raw_tiepoints": int(sum(det_counts.values())),
+            "n_final_tiepoints": n_final,
+            "postwarp_phasecorr_qa": dict(phasecorr_by_detector.get(detector, {})),
+            "output_path": output_path,
         }
-
-    vnir_path = branch_paths_for_recombine.get("VNIR")
-    swir_path = branch_paths_for_recombine.get("SWIR")
-    recombined_path = os.path.join(folder_struct["temp"], f"{scene_name}_BRANCH_COMBINED_c{candidate_idx}.tif")
-    recombine_result = {"ok": False, "error": "missing VNIR/SWIR branch output paths"}
-    harmonize_result: Dict[str, Any] = {
-        "ok": False,
-        "error": "missing VNIR/SWIR branch output paths",
-        "applied": False,
-        "vnir_path": vnir_path,
-        "swir_path": swir_path,
-    }
-    t0_recombine_warp = perf_counter()
-    if vnir_path and swir_path:
-        harmonize_result = _harmonize_detector_branch_grids(
-            vnir_raster_path=vnir_path,
-            swir_raster_path=swir_path,
-            output_dir=folder_struct["temp"],
-            scene_name=scene_name,
-            candidate_idx=candidate_idx,
-            s2_extent=s2_extent,
-            target_resolution=float(PRISMA_OUTPUT_RESOLUTION),
-            nodata=PROCESSING_NODATA,
-            out_dtype=PROCESSING_DTYPE,
+    if merged_df is not None and "DETECTOR" in getattr(merged_df, "columns", []):
+        logger.info(
+            "Candidate %d [joint]: final pooled tie points by detector: %s",
+            candidate_idx + 1,
+            {d: branch_results[d]["n_final_tiepoints"] for d in branch_results},
         )
-        if harmonize_result.get("ok", False):
-            vnir_path = str(harmonize_result.get("vnir_path") or vnir_path)
-            swir_path = str(harmonize_result.get("swir_path") or swir_path)
-            if harmonize_result.get("applied", False):
-                grid_info = dict(harmonize_result.get("target_grid", {}))
-                logger.info(
-                    "Detector branch harmonization applied for candidate %d: grid=%sx%s, res=%s.",
-                    candidate_idx + 1,
-                    grid_info.get("width"),
-                    grid_info.get("height"),
-                    grid_info.get("res"),
-                )
-            recombine_result = _recombine_detector_branches_windowed(
-                vnir_raster_path=vnir_path,
-                swir_raster_path=swir_path,
-                output_raster_path=recombined_path,
-                nodata=PROCESSING_NODATA,
-                out_dtype=PROCESSING_DTYPE,
-            )
-        else:
-            recombine_result = {
-                "ok": False,
-                "error": f"Branch harmonization failed: {harmonize_result.get('error', 'unknown error')}",
-            }
-            logger.warning(
-                "Detector branch harmonization failed for candidate %d: %s",
-                candidate_idx + 1,
-                harmonize_result.get("error", "unknown error"),
-            )
-    stage_timings[f"candidate_{candidate_idx + 1}_warp"] = float(
-        stage_timings.get(f"candidate_{candidate_idx + 1}_warp", 0.0)
-    ) + float(max(0.0, perf_counter() - t0_recombine_warp))
-    out["branch_harmonization"] = dict(harmonize_result)
-    out["recombine_result"] = dict(recombine_result)
 
-    candidate_output_path = recombined_path if recombine_result.get("ok", False) and os.path.exists(recombined_path) else None
-    candidate_output_validation = _validate_coreg_raster_content(
-        candidate_output_path,
-        nodata=PROCESSING_NODATA,
-        max_windows=0,
-        stop_on_first_valid=True,
-    )
-    candidate_output_ok = bool(candidate_output_validation.get("ok", False))
+    validation["branch_validations"] = {"JOINT": dict(validation)}
+    validation.setdefault("ssim_before", None)
+    validation.setdefault("ssim_after", None)
+    validation.setdefault("ssim_delta", None)
 
-    validation_by_branch = {name: dict(data.get("validation", {})) for name, data in branch_results.items()}
-    confs = [float(v.get("confidence", 0.0)) for v in validation_by_branch.values()]
-    shifts = [float(v.get("shift_m", 0.0)) for v in validation_by_branch.values()]
-    msgs = [str(v.get("message", "")).strip() for v in validation_by_branch.values() if str(v.get("message", "")).strip()]
-
-    merged_validation = {
-        "is_valid": bool(all(v.get("is_valid", False) for v in validation_by_branch.values())),
-        "confidence": float(min(confs)) if confs else 0.0,
-        "shift_m": float(max(shifts)) if shifts else 0.0,
-        "message": " | ".join(msgs) if msgs else "No branch validation messages.",
-        "branch_validations": validation_by_branch,
-        "ssim_before": None,
-        "ssim_after": None,
-        "ssim_delta": None,
-    }
-    try:
-        before_vals = [float(v.get("ssim_before")) for v in validation_by_branch.values() if v.get("ssim_before") is not None]
-        after_vals = [float(v.get("ssim_after")) for v in validation_by_branch.values() if v.get("ssim_after") is not None]
-        delta_vals = [float(v.get("ssim_delta")) for v in validation_by_branch.values() if v.get("ssim_delta") is not None]
-        if before_vals:
-            merged_validation["ssim_before"] = float(np.mean(before_vals))
-        if after_vals:
-            merged_validation["ssim_after"] = float(np.mean(after_vals))
-        if delta_vals:
-            merged_validation["ssim_delta"] = float(np.mean(delta_vals))
-    except Exception:
-        pass
-
-    merged_tp_frames = [
-        branch_results[name].get("local_tiepoints_df")
-        for name in ("VNIR", "SWIR")
-        if branch_results.get(name, {}).get("local_tiepoints_df") is not None
-        and len(branch_results.get(name, {}).get("local_tiepoints_df")) > 0
-    ]
-    tie_points_df = pd.concat(merged_tp_frames, ignore_index=True) if merged_tp_frames else None
-    merged_tp_viz_frames = [
-        branch_results[name].get("local_tiepoints_visualization_df")
-        for name in ("VNIR", "SWIR")
-        if branch_results.get(name, {}).get("local_tiepoints_visualization_df") is not None
-        and len(branch_results.get(name, {}).get("local_tiepoints_visualization_df")) > 0
-    ]
-    tie_points_viz_df = (
-        pd.concat(merged_tp_viz_frames, ignore_index=True)
-        if merged_tp_viz_frames
-        else tie_points_df
-    )
-    tp_residuals = _compute_tiepoint_residuals(tie_points_df, pixel_size_m=30.0)
-    local_valid_tp_count = int(sum(int(branch_results.get(name, {}).get("local_valid_tp_count", 0)) for name in ("VNIR", "SWIR")))
-
-    poly_used = bool(any(bool(branch_results.get(name, {}).get("polynomial_warp_used", False)) for name in ("VNIR", "SWIR")))
-    tps_used = bool(any(bool(branch_results.get(name, {}).get("tps_warp_used", False)) for name in ("VNIR", "SWIR")))
-    poly_order_used = int(
-        min(
-            int(branch_order_decisions.get(name, {}).get("order_used", preferred_polynomial_order))
-            for name in ("VNIR", "SWIR")
-        )
-    )
-    poly_decision = {
-        "branches": {k: dict(v) for k, v in branch_order_decisions.items()},
-        "order_used": int(poly_order_used),
-        "n_gcps": int(sum(int(branch_order_decisions.get(k, {}).get("n_gcps", 0)) for k in branch_order_decisions)),
-        "downgraded": bool(any(bool(branch_order_decisions.get(k, {}).get("downgraded", False)) for k in branch_order_decisions)),
-        "reason": "; ".join([f"{k}: {branch_order_decisions.get(k, {}).get('reason', 'n/a')}" for k in ("VNIR", "SWIR")]),
-        "tps_fallback_used": bool(tps_used),
-    }
+    poly_decision = dict(polynomial_order_decision)
+    poly_decision["transform_scope"] = "joint_vnir_swir"
+    poly_decision["tiepoint_source_used"] = tiepoint_source_used
+    poly_decision["tps_fallback_used"] = bool(tps_success)
     scene_quality_summary = _summarize_scene_tiepoint_quality(
         tie_points_df,
         grid_rows=spatial_grid_rows,
         grid_cols=spatial_grid_cols,
     )
-    geometry_reasons = [
-        str(branch_order_decisions.get(name, {}).get("geometry_reason", ""))
-        for name in ("VNIR", "SWIR")
-    ]
-    if any("clustered" in reason.lower() for reason in geometry_reasons):
+    if "clustered" in str(polynomial_order_decision.get("geometry_reason", "")).lower():
         scene_quality_summary["is_clustered"] = True
 
-    out["validation"] = merged_validation
-    out["final_quality_pass"] = bool(all(branch_quality_flags)) and bool(candidate_output_ok)
-    out["local_valid_tp_count"] = int(local_valid_tp_count)
+    out["validation"] = validation
+    out["final_quality_pass"] = bool(final_ok)
+    out["local_valid_tp_count"] = int(local_tp_count)
     out["tp_residuals"] = dict(tp_residuals)
-    out["polynomial_warp_used"] = bool(poly_used)
-    out["tps_warp_used"] = bool(tps_used)
-    out["polynomial_order_decision"] = dict(poly_decision)
-    out["checkpoint_accuracy"] = {
-        name: dict(decision.get("checkpoint_accuracy") or {})
-        for name, decision in branch_order_decisions.items()
-    }
-    out["polynomial_order_used"] = int(poly_order_used)
+    out["polynomial_warp_used"] = bool(poly_success)
+    out["tps_warp_used"] = bool(tps_success)
+    out["polynomial_order_decision"] = poly_decision
+    out["checkpoint_accuracy"] = {"JOINT": dict(polynomial_order_decision.get("checkpoint_accuracy") or {})}
+    out["polynomial_order_used"] = int(polynomial_order_decision.get("order_used", preferred_polynomial_order))
     out["local_tiepoints_df"] = tie_points_df
     out["local_tiepoints_visualization_df"] = tie_points_viz_df
-    out["output_path"] = candidate_output_path
-    out["output_content_valid"] = bool(candidate_output_ok)
-    out["output_validation"] = dict(candidate_output_validation)
-    out["postwarp_phasecorr_qa"] = {
-        "branches": {name: dict(branch_results.get(name, {}).get("postwarp_phasecorr_qa", {})) for name in ("VNIR", "SWIR")}
-    }
-    out["merged_tiepoint_stages"] = dict(branch_stage_counts)
-    out["multiband_tiepoint_counts"] = dict(branch_multiband_counts)
-    out["branch_results"] = {k: dict(v) for k, v in branch_results.items()}
+    out["output_path"] = output_path if output_ok else None
+    out["output_content_valid"] = bool(output_ok)
+    out["output_validation"] = dict(output_validation)
+    out["postwarp_phasecorr_qa"] = {"branches": phasecorr_by_detector}
+    out["merged_tiepoint_stages"] = {"JOINT": dict(merged_tp_result.get("stage_counts", {}))}
+    out["multiband_tiepoint_counts"] = multiband_counts
+    out["branch_results"] = branch_results
     out["spatial_spread_score"] = scene_quality_summary.get("spatial_spread_score")
     out["hull_bbox_ratio"] = scene_quality_summary.get("hull_bbox_ratio")
     out["is_clustered"] = scene_quality_summary.get("is_clustered")
@@ -17960,6 +18016,7 @@ def run_coregistration(
                 "branch_results": dict(branch_eval.get("branch_results", {})),
                 "branch_harmonization": dict(branch_eval.get("branch_harmonization", {})),
                 "recombine_result": dict(branch_eval.get("recombine_result", {})),
+                "inter_detector_offset": dict(branch_eval.get("inter_detector_offset", {}) or {}),
                 "s2_metadata": dict(selected_s2_metadata),
                 "output_wl": branch_eval.get("output_wl"),
                 "output_fwhm": branch_eval.get("output_fwhm"),
@@ -18533,6 +18590,7 @@ def run_coregistration(
             best_candidate.get('multiband_tiepoint_counts', {}) if best_candidate else {}
         ),
         'postwarp_phasecorr_qa': best_candidate.get('postwarp_phasecorr_qa', {}) if best_candidate else {},
+        'inter_detector_offset': best_candidate.get('inter_detector_offset', {}) if best_candidate else {},
         'status': status_code,
         'notes': notes_text,
         'rmse_global': rmse_scene.get('rmse_global'),

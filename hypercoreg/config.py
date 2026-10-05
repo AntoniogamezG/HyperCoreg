@@ -304,6 +304,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     'transform_model_selection': "cv",
     # Share of merged tie points held out to report independent check-point accuracy.
     'checkpoint_holdout_fraction': 0.2,
+    # Tie points for the single VNIR+SWIR transform: "vnir_primary" fits on VNIR points
+    # (10 m S2 bands) and pools SWIR points only when VNIR cannot support a fit;
+    # "pooled" always merges VNIR and SWIR points.
+    'joint_tiepoint_source': "vnir_primary",
     'transform_cv_folds': 5,
     'transform_cv_repeats': 3,
     'transform_cv_holdout_fraction': 0.25,
