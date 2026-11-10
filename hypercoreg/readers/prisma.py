@@ -153,6 +153,68 @@ def estimate_prisma_geotransform(
     return _solve_affine(pixel, line, lon_vals, lat_vals)
 
 
+def prisma_fill_mask_from_native(vnir: np.ndarray, swir: np.ndarray) -> np.ndarray:
+    """Return a (rows, cols) mask of L2D fill pixels (DN 0 in all bands).
+
+    Detector cubes are laid out (rows, bands, cols).  Real scenes contain
+    whole bands of zeros inside the swath, so only all-band zeros count.
+    """
+    fill = np.ones((vnir.shape[0], vnir.shape[2]), dtype=bool)
+    for cube in (vnir, swir):
+        for b in range(cube.shape[1]):
+            fill &= cube[:, b, :] == 0
+    return fill
+
+
+def prisma_start_lines_mask(
+    vnir: np.ndarray,
+    swir: np.ndarray,
+    fill_mask: np.ndarray,
+    max_lines: int = 3,
+    tolerance: float = 0.2,
+) -> Tuple[np.ndarray, int]:
+    """Return a mask of defective acquisition-start lines at the top swath edge.
+
+    In most L2D products the first one or two valid lines along the top edge
+    are partly exposed: VNIR is too dark, SWIR too bright (up to ~200x).  Each
+    of the first ``max_lines`` lines below the top edge (per column) is
+    compared with lines 4-8 on a few well-exposed bands; lines whose median
+    ratio deviates by more than ``tolerance`` in either detector are masked,
+    counting from the edge.
+    """
+    rows, cols = fill_mask.shape
+    valid = ~fill_mask
+    first = np.argmax(valid, axis=0)
+    usable = valid[first, np.arange(cols)] & (first + 9 < rows)
+    cidx = np.nonzero(usable)[0]
+    mask = np.zeros_like(fill_mask)
+    if cidx.size < 20:
+        return mask, 0
+    line_rows = first[cidx][None, :] + np.arange(9)[:, None]
+    n_bad = 0
+    for cube in (vnir, swir):
+        bands = range(0, cube.shape[1], max(1, cube.shape[1] // 8))
+        worst = np.zeros(max_lines)
+        for b in bands:
+            prof = cube[:, b, :][line_rows, cidx[None, :]].astype(np.float64)
+            ref = np.median(prof[4:9], axis=0)
+            ok = ref > 0
+            # Skip near-empty bands (absorption, detector edges): a few DN of
+            # noise there gives meaningless ratios.
+            if np.count_nonzero(ok) < 20 or np.median(ref[ok]) < 1000:
+                continue
+            ratio = np.median(prof[:max_lines, ok] / ref[ok], axis=1)
+            worst = np.maximum(worst, np.abs(ratio - 1.0))
+        n_det = 0
+        while n_det < max_lines and worst[n_det] > tolerance:
+            n_det += 1
+        n_bad = max(n_bad, n_det)
+    if n_bad:
+        top_rows = first[cidx][None, :] + np.arange(n_bad)[:, None]
+        mask[top_rows, np.broadcast_to(cidx, top_rows.shape)] = True
+    return mask, n_bad
+
+
 def read_prisma_cube_and_meta(
     prisma_file: str,
     remove_detector_overlap: bool = False,
@@ -200,6 +262,26 @@ def read_prisma_cube_and_meta(
         logger.info(f"VNIR: {VNIR.shape}")
         logger.info(f"SWIR: {SWIR.shape}")
 
+        # L2D fill outside the rotated swath is DN 0 in every band of both
+        # detectors.  Detect it on the native samples, before decoding turns
+        # it into scale_min, so it can be written as NoData downstream.
+        fill_mask = prisma_fill_mask_from_native(VNIR, SWIR)
+        start_mask, n_start = prisma_start_lines_mask(VNIR, SWIR, fill_mask)
+        if n_start:
+            logger.info(
+                "PRISMA top swath edge: first %d acquisition line(s) are defective "
+                "(partly exposed) and will be NoData.",
+                n_start,
+            )
+            fill_mask |= start_mask
+        n_fill = int(np.count_nonzero(fill_mask))
+        logger.info(
+            "PRISMA fill (DN 0 in all bands): %d of %d pixels (%.1f%%) will be NoData.",
+            n_fill,
+            int(fill_mask.size),
+            100.0 * n_fill / max(1, int(fill_mask.size)),
+        )
+
         # Extract wavelengths
         attrs = f.attrs
         if resolved_radiometric_mode == "reflectance":
@@ -222,6 +304,14 @@ def read_prisma_cube_and_meta(
                 "PRISMA radiometric mode 'native-dn' selected: retaining encoded values; "
                 "use source gain/offset metadata for quantitative interpretation."
             )
+            if n_fill:
+                VNIR = VNIR.astype(np.float32)
+                SWIR = SWIR.astype(np.float32)
+        if n_fill:
+            # Detector arrays are (rows, bands, cols); NaN is sanitized to the
+            # processing NoData value when the georeferenced raster is written.
+            VNIR.transpose(0, 2, 1)[fill_mask] = np.nan
+            SWIR.transpose(0, 2, 1)[fill_mask] = np.nan
         wl_vnir = np.array(attrs["List_Cw_Vnir"])
         wl_swir = np.array(attrs["List_Cw_Swir"])
 
@@ -361,6 +451,8 @@ def read_prisma_pan_and_geo(
             else:
                 pan_data = pan_cube
             pan_data = validate_prisma_native_samples(pan_data, "PAN")
+            # As for the VNIR/SWIR cube, L2D fill outside the swath is native DN 0.
+            pan_fill = pan_data == 0
 
             if resolved_radiometric_mode == "reflectance":
                 pan_scale = _read_prisma_scale_pair(f.attrs, "PAN")
@@ -374,6 +466,12 @@ def read_prisma_pan_and_geo(
                 # The downstream processing dtype is float32, but values remain
                 # exact native uint16 samples in compatibility mode.
                 pan_data = pan_data.astype(np.float32)
+            pan_data[pan_fill] = np.nan
+            logger.info(
+                "PAN fill (DN 0): %d of %d pixels will be NoData.",
+                int(np.count_nonzero(pan_fill)),
+                int(pan_fill.size),
+            )
 
             # Log statistics before cleaning
             logger.info(
@@ -381,8 +479,8 @@ def read_prisma_pan_and_geo(
                 f"mean={np.nanmean(pan_data):.2f}"
             )
 
-            # Validity is deliberately independent from radiometric value.
-            # Native zero is not treated as NoData without a product mask.
+            # Validity is independent from the decoded radiometric value: only
+            # native DN 0 (swath fill) is NoData.
             valid_mask = np.isfinite(pan_data)
             if np.any(valid_mask):
                 logger.info(

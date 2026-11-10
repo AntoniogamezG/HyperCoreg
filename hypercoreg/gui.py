@@ -31,6 +31,42 @@ GUI_PROMPT_WAIT_TIMEOUT_S = 120
 GUI_METADATA_EXTENSION_LEVEL = DEFAULT_CONFIG["metadata_extension_level"]
 GUI_METADATA_LABEL_PRECISION = int(DEFAULT_CONFIG["metadata_label_precision"])
 GUI_METADATA_EXTENSION_CHOICES = ("none", "stats")
+TRANSFORM_MODEL_GUI_CHOICES = ("auto", "affine", "polynomial2", "tps")
+WARP_RESAMPLING_GUI_CHOICES = ("nearest", "bilinear", "cubic")
+
+TRANSFORM_MODEL_INFO = (
+    "How the image is fitted to Sentinel-2.\n\n"
+    "auto: picks the best model from the tie points.\n"
+    "affine: shift, rotation and scale. Most stable.\n"
+    "polynomial2: also corrects smooth bending.\n"
+    "tps: follows local distortions; can deform where tie points are few."
+)
+WARP_RESAMPLING_INFO = (
+    "How pixel values are computed when warping.\n\n"
+    "nearest: keeps original values; blocky.\n"
+    "bilinear: smooth, no artificial negatives.\n"
+    "cubic: sharper, but can create negatives at strong edges."
+)
+OUTPUT_CRS_INFO = (
+    "Coordinate system of the output.\n\n"
+    "auto: same as the Sentinel-2 tile.\n"
+    "Or type an EPSG code, e.g. EPSG:32633."
+)
+MASTER_GRID_INFO = (
+    "Optional. Puts the output on the pixel grid of a master image "
+    "(PRISMA .he5 or GeoTIFF) so different dates align. The whole scene is kept. "
+    "Overrides Output CRS."
+)
+
+
+def _info_button(parent: Any, root: Any, title: str, text: str) -> Any:
+    """Small 'i' button that opens a short explanation."""
+    return tk.Button(
+        parent,
+        text="i",
+        width=2,
+        command=lambda: messagebox.showinfo(title, text, parent=root),
+    )
 
 
 def _normalize_gui_metadata_level(extension_level: Any) -> str:
@@ -134,6 +170,10 @@ def _build_gui_runtime_config(
         'remove_detector_overlap_bands': config_vars['remove_detector_overlap_bands'].get(),
         'prisma_radiometric_mode': str(config_vars['prisma_radiometric_mode'].get()).strip().lower(),
         'normalization_mode': str(config_vars['normalization_mode'].get()).strip().lower(),
+        'warp_resampling': str(config_vars['warp_resampling'].get()).strip().lower(),
+        'transform_model': str(config_vars['transform_model'].get()).strip().lower(),
+        'output_crs': str(config_vars['output_crs'].get()).strip() or "auto",
+        'master_grid': str(config_vars['master_grid'].get()).strip() or None,
         'norm_p_low': DEFAULT_CONFIG['norm_p_low'],
         'norm_p_high': DEFAULT_CONFIG['norm_p_high'],
         'norm_clip': DEFAULT_CONFIG['norm_clip'],
@@ -430,6 +470,46 @@ def gui_get_inputs() -> Dict[str, Any]:
     return config
 
 
+def _build_scene_list(parent: Any, input_path: str, batch_mode: bool) -> None:
+    """Table of the scenes that will be processed (sensor, file, date, CRS)."""
+    from hypercoreg.scene_listing import (
+        describe_input_scenes,
+        find_hyperspectral_inputs,
+        format_scene_crs,
+        format_scene_date,
+        log_scene_table,
+    )
+
+    paths = find_hyperspectral_inputs(input_path) if batch_mode else [input_path]
+    rows = describe_input_scenes(paths)
+    log_scene_table(paths, rows)
+
+    tk.Label(parent, text=f"Scenes to process: {len(rows)}", anchor='w').pack(fill='x', pady=(4, 0))
+    table_frame = tk.Frame(parent)
+    table_frame.pack(fill='both', expand=True)
+    columns = ("sensor", "date", "crs", "file")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=min(6, max(1, len(rows))))
+    for col, title, width in (
+        ("sensor", "Sensor", 60),
+        ("date", "Date (UTC)", 130),
+        ("crs", "CRS", 130),
+        ("file", "File", 260),
+    ):
+        tree.heading(col, text=title)
+        tree.column(col, width=width, anchor='w', stretch=(col == "file"))
+    for row in rows:
+        file_text = row["file"] if not row.get("error") else f"{row['file']} (not readable)"
+        tree.insert(
+            "",
+            "end",
+            values=(row.get("sensor") or "?", format_scene_date(row), format_scene_crs(row), file_text),
+        )
+    scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scroll.set)
+    tree.pack(side='left', fill='both', expand=True)
+    scroll.pack(side='right', fill='y')
+
+
 def _show_parameter_dialog(
     input_path: str,
     output_dir: str,
@@ -455,7 +535,7 @@ def _show_parameter_dialog(
 
     # Window size
     window_width = 560
-    window_height = 650
+    window_height = 760
     param_root.geometry(f"{window_width}x{window_height}")
     param_root.resizable(True, True)
     param_root.minsize(500, 500)
@@ -489,6 +569,10 @@ def _show_parameter_dialog(
         'remove_detector_overlap_bands': tk.BooleanVar(value=DEFAULT_CONFIG['remove_detector_overlap_bands']),
         'prisma_radiometric_mode': tk.StringVar(value=DEFAULT_CONFIG['prisma_radiometric_mode']),
         'normalization_mode': tk.StringVar(value=DEFAULT_CONFIG['normalization_mode']),
+        'warp_resampling': tk.StringVar(value=DEFAULT_CONFIG['warp_resampling']),
+        'transform_model': tk.StringVar(value=DEFAULT_CONFIG['transform_model']),
+        'output_crs': tk.StringVar(value=DEFAULT_CONFIG['output_crs']),
+        'master_grid': tk.StringVar(value=DEFAULT_CONFIG['master_grid'] or ""),
         'build_overviews': tk.BooleanVar(value=DEFAULT_CONFIG['build_overviews']),
         'strict_metadata': tk.BooleanVar(value=DEFAULT_CONFIG['strict_metadata']),
         'metadata_extension_level': tk.StringVar(value=GUI_METADATA_EXTENSION_LEVEL),
@@ -527,6 +611,7 @@ def _show_parameter_dialog(
 
     tk.Label(io_frame, text=f"Input: {os.path.basename(input_path)}", anchor='w').pack(fill='x')
     tk.Label(io_frame, text=f"Output: {output_dir}", anchor='w').pack(fill='x')
+    _build_scene_list(io_frame, input_path, batch_mode)
 
     # Notebook for parameter tabs
     notebook = ttk.Notebook(param_root)
@@ -614,6 +699,61 @@ def _show_parameter_dialog(
         anchor='w',
     ).grid(row=row_idx + 1, column=0, columnspan=3, sticky='w', pady=(8, 2))
 
+    # Tab: Warping
+    tab_warp = ttk.Frame(notebook)
+    notebook.add(tab_warp, text="Warping")
+
+    warp_frame = tk.Frame(tab_warp, padx=10, pady=10)
+    warp_frame.pack(fill='both', expand=True)
+
+    warp_rows = [
+        ("Transform model:", 'transform_model', TRANSFORM_MODEL_GUI_CHOICES,
+         "Transform model", TRANSFORM_MODEL_INFO),
+        ("Resampling:", 'warp_resampling', WARP_RESAMPLING_GUI_CHOICES,
+         "Resampling", WARP_RESAMPLING_INFO),
+    ]
+    for i, (label, key, choices, info_title, info_text) in enumerate(warp_rows):
+        tk.Label(warp_frame, text=label, anchor='w').grid(row=i, column=0, sticky='w', pady=4)
+        ttk.Combobox(
+            warp_frame,
+            state="readonly",
+            values=list(choices),
+            textvariable=config_vars[key],
+            width=14,
+        ).grid(row=i, column=1, sticky='w', padx=5, pady=4)
+        _info_button(warp_frame, param_root, info_title, info_text).grid(row=i, column=2, sticky='w', pady=4)
+
+    crs_row = len(warp_rows)
+    tk.Label(warp_frame, text="Output CRS:", anchor='w').grid(row=crs_row, column=0, sticky='w', pady=4)
+    tk.Entry(warp_frame, textvariable=config_vars['output_crs'], width=14).grid(
+        row=crs_row, column=1, sticky='w', padx=5, pady=4
+    )
+    _info_button(warp_frame, param_root, "Output CRS", OUTPUT_CRS_INFO).grid(
+        row=crs_row, column=2, sticky='w', pady=4
+    )
+
+    master_row = crs_row + 1
+    tk.Label(warp_frame, text="Master grid image:", anchor='w').grid(
+        row=master_row, column=0, sticky='w', pady=4
+    )
+    master_frame = tk.Frame(warp_frame)
+    master_frame.grid(row=master_row, column=1, sticky='w', padx=5, pady=4)
+    tk.Entry(master_frame, textvariable=config_vars['master_grid'], width=28).pack(side='left')
+
+    def browse_master_grid():
+        path = filedialog.askopenfilename(
+            parent=param_root,
+            title="Select master grid image (PRISMA .he5 or GeoTIFF)",
+            filetypes=[("PRISMA / GeoTIFF", "*.he5 *.tif *.tiff"), ("All files", "*.*")],
+        )
+        if path:
+            config_vars['master_grid'].set(path)
+
+    tk.Button(master_frame, text="...", command=browse_master_grid).pack(side='left', padx=(4, 0))
+    _info_button(warp_frame, param_root, "Master grid image", MASTER_GRID_INFO).grid(
+        row=master_row, column=2, sticky='w', pady=4
+    )
+
     # Tab 3: Output Options
     tab3 = ttk.Frame(notebook)
     notebook.add(tab3, text="Output")
@@ -654,27 +794,6 @@ def _show_parameter_dialog(
         width=12,
     )
     norm_mode_combo.grid(row=norm_row, column=1, sticky='w', padx=5, pady=(10, 2))
-
-    strict_row = norm_row + 1
-    tk.Checkbutton(
-        out_frame,
-        text="Strict metadata writes",
-        variable=config_vars['strict_metadata'],
-        anchor='w',
-    ).grid(row=strict_row, column=0, columnspan=3, sticky='w', pady=(6, 2))
-
-    metadata_row = strict_row + 1
-    tk.Label(out_frame, text="Metadata extension level:", anchor='w').grid(
-        row=metadata_row, column=0, sticky='w', pady=(10, 2)
-    )
-    metadata_combo = ttk.Combobox(
-        out_frame,
-        state="readonly",
-        values=list(GUI_METADATA_EXTENSION_CHOICES),
-        textvariable=config_vars['metadata_extension_level'],
-        width=12,
-    )
-    metadata_combo.grid(row=metadata_row, column=1, sticky='w', padx=5, pady=(10, 2))
 
     # Buttons
     button_frame = tk.Frame(param_root)

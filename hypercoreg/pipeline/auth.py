@@ -588,21 +588,68 @@ def _create_cdse_client_session(client_id: str, client_secret: str) -> requests.
     )
 
 
+def _try_cdse_credential_source(
+    label: str,
+    factory: Callable[[], requests.Session],
+) -> Optional[requests.Session]:
+    """Create a session from one configured source; log and return None on failure.
+
+    A wrong password or revoked client in the environment or credentials file
+    must not hide the interactive login, so failures fall through to the next
+    source and finally to the prompt.
+    """
+    try:
+        return factory()
+    except (CDSEAuthenticationError, requests.RequestException, ValueError, KeyError) as exc:
+        logger.warning(
+            _fmt_issue(
+                "AUTH",
+                f"CDSE login with {label} failed ({type(exc).__name__}: {exc}); "
+                "trying the next credential source.",
+            )
+        )
+        return None
+
+
+def _static_cdse_token_is_usable(access_token: str, label: str) -> bool:
+    """Return False for a bearer token that is expired or about to expire."""
+    exp = _decode_jwt_exp(access_token)
+    if exp is None:
+        return True
+    remaining_s = float(exp) - time.time()
+    if remaining_s > TOKEN_REFRESH_MARGIN_S:
+        return True
+    state = "expired" if remaining_s <= 0 else f"expires in {int(remaining_s)} s"
+    logger.warning(
+        _fmt_issue("AUTH", f"Ignoring CDSE bearer token from {label}: it {state} and cannot be renewed.")
+    )
+    return False
+
+
 def _create_cdse_session_from_environment() -> Optional[requests.Session]:
     public_creds = _resolve_configured_public_credentials(include_env=True, include_file=False)
     if public_creds is not None:
         username, password, totp, source = public_creds
         logger.info("Using CDSE username/password from %s.", source)
-        sess = _create_cdse_public_session(username=username, password=password, totp=totp)
-        _cache_cdse_public_credentials(username=username, password=password, totp=totp)
-        return sess
+        sess = _try_cdse_credential_source(
+            f"username/password from {source}",
+            lambda: _create_cdse_public_session(username=username, password=password, totp=totp),
+        )
+        if sess is not None:
+            _cache_cdse_public_credentials(username=username, password=password, totp=totp)
+            return sess
 
     client_id = (os.environ.get("CDSE_CLIENT_ID") or "").strip()
     client_secret = (os.environ.get("CDSE_CLIENT_SECRET") or "").strip()
     if client_id and client_secret:
         logger.info("Using CDSE client credentials from environment.")
-        return _create_cdse_client_session(client_id=client_id, client_secret=client_secret)
-    if client_id or client_secret:
+        sess = _try_cdse_credential_source(
+            "client credentials from environment",
+            lambda: _create_cdse_client_session(client_id=client_id, client_secret=client_secret),
+        )
+        if sess is not None:
+            return sess
+    elif client_id or client_secret:
         logger.warning(
             _fmt_issue(
                 "AUTH",
@@ -612,7 +659,7 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
         )
 
     access_token = (os.environ.get("CDSE_ACCESS_TOKEN") or "").strip()
-    if access_token:
+    if access_token and _static_cdse_token_is_usable(access_token, "CDSE_ACCESS_TOKEN"):
         logger.info("Using non-renewable CDSE bearer token from environment (CDSE_ACCESS_TOKEN).")
         return _create_cdse_bearer_session(access_token)
 
@@ -629,17 +676,21 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
         if public_file_creds is not None:
             file_username, file_password, file_totp, source = public_file_creds
             logger.info("Using CDSE username/password from %s.", source)
-            sess = _create_cdse_public_session(
-                username=file_username,
-                password=file_password,
-                totp=file_totp,
+            sess = _try_cdse_credential_source(
+                f"username/password from {source}",
+                lambda: _create_cdse_public_session(
+                    username=file_username,
+                    password=file_password,
+                    totp=file_totp,
+                ),
             )
-            _cache_cdse_public_credentials(
-                username=file_username,
-                password=file_password,
-                totp=file_totp,
-            )
-            return sess
+            if sess is not None:
+                _cache_cdse_public_credentials(
+                    username=file_username,
+                    password=file_password,
+                    totp=file_totp,
+                )
+                return sess
 
         file_client_id = _extract_cdse_credential_value(
             file_creds,
@@ -653,11 +704,16 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
         )
         if file_client_id and file_client_secret:
             logger.info("Using CDSE client credentials from credentials file: %s", creds_path)
-            return _create_cdse_client_session(
-                client_id=file_client_id,
-                client_secret=file_client_secret,
+            sess = _try_cdse_credential_source(
+                f"client credentials from {creds_path}",
+                lambda: _create_cdse_client_session(
+                    client_id=file_client_id,
+                    client_secret=file_client_secret,
+                ),
             )
-        if file_client_id or file_client_secret:
+            if sess is not None:
+                return sess
+        elif file_client_id or file_client_secret:
             logger.warning(
                 _fmt_issue(
                     "AUTH",
@@ -673,7 +729,9 @@ def _create_cdse_session_from_environment() -> Optional[requests.Session]:
             "cdse_access_token",
             "token",
         )
-        if file_access_token:
+        if file_access_token and _static_cdse_token_is_usable(
+            file_access_token, f"access_token in {creds_path}"
+        ):
             logger.info(
                 "Using non-renewable CDSE bearer token from credentials file: %s",
                 creds_path,
@@ -977,7 +1035,13 @@ def _create_cdse_session_with_retry(
     allow_gui_prompt: bool = False,
     prompt_userpass_fn: Optional[PromptUserpassFn] = None,
 ) -> requests.Session:
-    env_session = _create_cdse_session_from_environment()
+    try:
+        env_session = _create_cdse_session_from_environment()
+    except Exception as exc:
+        logger.warning(
+            _fmt_issue("AUTH", f"Configured CDSE credentials could not be used ({exc}); asking for login.")
+        )
+        env_session = None
     if env_session is not None:
         return env_session
 

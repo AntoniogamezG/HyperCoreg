@@ -288,6 +288,29 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         ),
     )
     coreg_group.add_argument(
+        "--warp-model",
+        choices=["auto", "affine", "polynomial2", "tps"],
+        default=None,
+        dest="transform_model",
+        help=(
+            "Transform model for the final warp: auto (chosen from the tie points), affine "
+            "(shift/rotation/scale, most stable), polynomial2 (order-2 polynomial, corrects smooth "
+            "bending, unstable near edges with few tie points) or tps (thin-plate spline, follows "
+            f"local distortions, can fold where tie points are sparse) (default: {DEFAULT_CONFIG['transform_model']})"
+        ),
+    )
+    coreg_group.add_argument(
+        "--resampling",
+        choices=["nearest", "bilinear", "cubic"],
+        default=None,
+        dest="warp_resampling",
+        help=(
+            "Resampling for the main image warps: nearest (keeps original values, blocky), bilinear "
+            "(smooth, never overshoots, slight blur), cubic (sharper, can overshoot and create negatives) "
+            f"(default: {DEFAULT_CONFIG['warp_resampling']})"
+        ),
+    )
+    coreg_group.add_argument(
         "--psf-fwhm-factor",
         type=float,
         default=None,
@@ -830,6 +853,26 @@ def _add_common_arguments(parser: argparse.ArgumentParser):
         ),
     )
     output_group.add_argument(
+        "--output-crs",
+        default=None,
+        metavar="CRS",
+        help=(
+            "CRS of the final output: auto (keep the Sentinel-2 matching CRS) or an EPSG code / WKT, "
+            "e.g. EPSG:32633. Matching always runs in the Sentinel-2 CRS; the result is resampled once "
+            f"at the end (default: {DEFAULT_CONFIG['output_crs']})"
+        ),
+    )
+    output_group.add_argument(
+        "--master-grid",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Snap the final cube to the pixel grid of a master image (same CRS, pixel size and pixel "
+            "edges; the whole scene is kept): a coregistered GeoTIFF or a PRISMA .he5 (its north-up "
+            "30 m UTM grid). Overrides --output-crs."
+        ),
+    )
+    output_group.add_argument(
         "--build-overviews",
         action="store_true",
         default=None,
@@ -1102,6 +1145,10 @@ def build_config_from_args(args: argparse.Namespace) -> dict:
         ),
         'prisma_radiometric_mode': _arg_value("prisma_radiometric_mode"),
         'normalization_mode': _arg_value("normalization_mode"),
+        'output_crs': _arg_value("output_crs"),
+        'master_grid': _arg_value("master_grid"),
+        'warp_resampling': _arg_value("warp_resampling"),
+        'transform_model': _arg_value("transform_model"),
         'norm_p_low': base_config['norm_p_low'],
         'norm_p_high': base_config['norm_p_high'],
         'norm_clip': base_config['norm_clip'],
@@ -1192,6 +1239,9 @@ def main(args: Optional[list] = None) -> int:
         if parsed_args.mode == "single":
             hyp_type = detect_hyp_type(config['input_path'])
             logger.info(f"Detected sensor type: {hyp_type}")
+            from hypercoreg.scene_listing import log_scene_table
+
+            log_scene_table([config['input_path']])
             result = run_coregistration(
                 config['input_path'],
                 hyp_type,

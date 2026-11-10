@@ -356,6 +356,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # scene-dependent normalization below.
     'prisma_radiometric_mode': "reflectance",
     'normalization_mode': "none",
+    # Image resampling for the main warps: nearest, bilinear, cubic.
+    'warp_resampling': "bilinear",
+    # Transform model: auto (selected from tie points), affine, polynomial2, tps.
+    'transform_model': "auto",
+    # Final output grid. output_crs: "auto" keeps the matching (Sentinel-2) CRS,
+    # otherwise an EPSG code or WKT. master_grid: optional PRISMA .he5 or
+    # GeoTIFF whose pixel grid the final cube is snapped to, keeping the whole
+    # scene (overrides output_crs).
+    'output_crs': "auto",
+    'master_grid': None,
     'norm_p_low': 2.0,
     'norm_p_high': 98.0,
     'norm_clip': True,
@@ -630,6 +640,10 @@ class CoregConfig:
     remove_detector_overlap_bands: bool = False
     prisma_radiometric_mode: str = "reflectance"
     normalization_mode: str = "none"
+    warp_resampling: str = "bilinear"
+    transform_model: str = "auto"
+    output_crs: str = "auto"
+    master_grid: Optional[str] = None
     norm_p_low: float = 2.0
     norm_p_high: float = 98.0
     norm_clip: bool = True
@@ -764,6 +778,10 @@ class CoregConfig:
             'remove_detector_overlap_bands': self.remove_detector_overlap_bands,
             'prisma_radiometric_mode': self.prisma_radiometric_mode,
             'normalization_mode': self.normalization_mode,
+            'warp_resampling': self.warp_resampling,
+            'transform_model': self.transform_model,
+            'output_crs': self.output_crs,
+            'master_grid': self.master_grid,
             'norm_p_low': self.norm_p_low,
             'norm_p_high': self.norm_p_high,
             'norm_clip': self.norm_clip,

@@ -25,6 +25,7 @@ import tempfile
 import threading
 import warnings
 import getpass
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from time import perf_counter, sleep
@@ -70,6 +71,7 @@ from hypercoreg.config import (
     apply_cpu_oversubscription_guard,
 )
 from hypercoreg.spectral import build_prisma_band_table, build_enmap_band_table
+from hypercoreg.scene_listing import find_hyperspectral_inputs, log_scene_table
 from hypercoreg.normalization import (
     filter_band_tags_for_raster_copy,
     filter_dataset_tags_for_raster_copy,
@@ -728,6 +730,32 @@ def _raster_dtype_or_none(path: Any) -> Optional[str]:
 
 
 _ACTIVE_AROSICS_RESAMP_CALC: Optional[str] = None
+
+# Resampling for every warp that moves image values (spectral cube and PAN);
+# categorical quality masks always use nearest.  Set per scene from config.
+WARP_RESAMPLING_CHOICES = ("nearest", "bilinear", "cubic")
+_ACTIVE_WARP_RESAMPLING: Optional[str] = None
+
+
+def _normalize_warp_resampling(value: Any) -> str:
+    alg = str(value or "").strip().lower()
+    alg = {"near": "nearest"}.get(alg, alg)
+    if alg not in WARP_RESAMPLING_CHOICES:
+        raise ValueError(
+            f"Invalid warp_resampling '{value}'. Expected one of: {', '.join(WARP_RESAMPLING_CHOICES)}."
+        )
+    return alg
+
+
+def _warp_resampling() -> str:
+    """Return the active image resampling name (HyperCoreg/AROSICS spelling)."""
+    return _ACTIVE_WARP_RESAMPLING or str(DEFAULT_CONFIG.get("warp_resampling", "bilinear"))
+
+
+def _gdal_warp_resampling() -> str:
+    """Return the active image resampling name as gdalwarp spells it."""
+    alg = _warp_resampling()
+    return "near" if alg == "nearest" else alg
 
 
 def _add_arosics_calc_resampling(target_cls: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -1464,7 +1492,13 @@ def _create_cdse_session_with_retry(
     """
     Create CDSE session preferring non-interactive env credentials, then prompt fallback.
     """
-    env_session = _create_cdse_session_from_environment()
+    try:
+        env_session = _create_cdse_session_from_environment()
+    except Exception as exc:
+        logger.warning(
+            _fmt_issue("AUTH", f"Configured CDSE credentials could not be used ({exc}); asking for login.")
+        )
+        env_session = None
     if env_session is not None:
         return env_session
 
@@ -5093,7 +5127,7 @@ def _collect_multiband_tiepoints(
                 "r_b4match": s2_stack_idx,
                 "s_b4match": 1,
                 "max_shift": float(profile.get("local_max_shift", 50.0)),
-                "resamp_alg_deshift": 'cubic',
+                "resamp_alg_deshift": _warp_resampling(),
                 "align_grids": bool(profile.get("local_align_grids", True)),
                 "tieP_filter_level": int(profile.get("local_tieP_filter_level", 1)),
                 "outFillVal": hs_nodata,
@@ -5571,6 +5605,391 @@ def _decide_polynomial_order(
     return decision
 
 
+def _warp_rotated_grid_north_up(
+    source_path: str,
+    output_path: str,
+    nodata: float,
+    resolution: float,
+) -> None:
+    """Resample a raster with a rotated geotransform onto a north-up grid.
+
+    NoData is excluded from the resampling kernel and the corners outside the
+    rotated frame are written as NoData.  The source file is removed.
+    """
+    tmp_output = _make_gdal_temp_path(output_path, ".northup.tif")
+    cmd = [
+        resolve_gdalwarp_exe(),
+        "-r", _gdal_warp_resampling(),
+        "-tr", str(float(resolution)), str(float(resolution)), "-tap",
+        "-srcnodata", str(nodata), "-dstnodata", str(nodata),
+        "-of", "GTiff", "-co", "BIGTIFF=YES", "-co", "TILED=YES",
+        "-multi", "-wo", "NUM_THREADS=ALL_CPUS",
+    ]
+    for co in _gtiff_compression_options(_raster_dtype_or_none(source_path), for_cli=True):
+        cmd.extend(["-co", co])
+    cmd.extend([source_path, tmp_output])
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        _validate_warp_output(tmp_output)
+        os.replace(tmp_output, output_path)
+        logger.info("Resampled rotated PRISMA grid to north-up (%s, NoData-aware).", _warp_resampling())
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(_fmt_issue("HS_PREP", f"North-up resampling failed: {exc.stderr}")) from exc
+    finally:
+        _cleanup_raster_temp_outputs(tmp_output)
+        _cleanup_raster_temp_outputs(source_path)
+
+
+def _utm_crs_for_lonlat(lon: float, lat: float) -> CRS:
+    """WGS84 UTM zone containing a lon/lat point."""
+    zone = int(np.floor((float(lon) + 180.0) / 6.0)) % 60 + 1
+    return CRS.from_epsg((32600 if float(lat) >= 0 else 32700) + zone)
+
+
+def _resolve_master_grid(master_path: str) -> Dict[str, Any]:
+    """Return the target grid (crs, transform, width, height) of a master image.
+
+    A GeoTIFF master (e.g. an earlier coregistered output) gives its exact grid.
+    A PRISMA L2D .he5 master has no map grid of its own, so the north-up 30 m
+    grid that HyperCoreg would produce for it is used: its UTM zone and the
+    bounds of its geolocation grid, snapped to 30 m.
+    """
+    path = str(master_path).strip()
+    if not os.path.isfile(path):
+        raise ValueError(f"Master grid image not found: {path}")
+    if Path(path).suffix.lower() in {".he5", ".h5"}:
+        import h5py
+
+        with h5py.File(path, "r") as f:
+            lat = f["HDFEOS/SWATHS/PRS_L2D_HCO/Geolocation Fields/Latitude"][:]
+            lon = f["HDFEOS/SWATHS/PRS_L2D_HCO/Geolocation Fields/Longitude"][:]
+        crs = _utm_crs_for_lonlat(float(np.nanmean(lon)), float(np.nanmean(lat)))
+        tr = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        xs, ys = tr.transform(lon.ravel(), lat.ravel())
+        res = float(PRISMA_OUTPUT_RESOLUTION)
+        minx = np.floor(np.nanmin(xs) / res) * res
+        maxx = np.ceil(np.nanmax(xs) / res) * res
+        miny = np.floor(np.nanmin(ys) / res) * res
+        maxy = np.ceil(np.nanmax(ys) / res) * res
+        width = int(round((maxx - minx) / res))
+        height = int(round((maxy - miny) / res))
+        return {
+            "crs": crs,
+            "transform": Affine(res, 0.0, minx, 0.0, -res, maxy),
+            "width": width,
+            "height": height,
+            "source": f"PRISMA master {os.path.basename(path)} (derived UTM grid, 30 m)",
+        }
+    with rasterio.open(path) as src:
+        if src.crs is None:
+            raise ValueError(f"Master grid image has no CRS: {path}")
+        if abs(src.transform.b) > 1e-9 or abs(src.transform.d) > 1e-9:
+            raise ValueError(f"Master grid image has a rotated geotransform: {path}")
+        return {
+            "crs": src.crs,
+            "transform": src.transform,
+            "width": int(src.width),
+            "height": int(src.height),
+            "source": f"master {os.path.basename(path)}",
+        }
+
+
+def _resolve_final_grid(config: Dict[str, Any], matching_crs: Any) -> Optional[Dict[str, Any]]:
+    """Return the requested final output grid, or None to keep the matching grid."""
+    master = str(config.get("master_grid") or "").strip()
+    output_crs = str(config.get("output_crs") or "auto").strip()
+    if master:
+        if output_crs.lower() != "auto":
+            logger.warning("Both master_grid and output_crs are set; the master grid's CRS is used.")
+        return _resolve_master_grid(master)
+    if output_crs.lower() == "auto":
+        return None
+    try:
+        crs = CRS.from_user_input(output_crs)
+    except Exception as exc:
+        raise ValueError(f"Invalid output_crs '{output_crs}': {exc}") from exc
+    if matching_crs is not None and CRS.from_user_input(matching_crs) == crs:
+        return None
+    return {"crs": crs, "transform": None, "width": None, "height": None, "source": f"output_crs {output_crs}"}
+
+
+def _warp_to_final_grid(
+    source_path: str,
+    output_path: str,
+    grid: Dict[str, Any],
+    *,
+    categorical: bool = False,
+    resolution: Optional[float] = None,
+) -> None:
+    """Warp a raster onto the final grid, NoData-aware.
+
+    With a master grid (transform) the whole scene is kept: the output extent
+    is the scene footprint in the master CRS, snapped outwards to the master's
+    pixel edges, at the master pixel size (or ``resolution``).  Without one the
+    output keeps ``resolution`` (or the source resolution) in the target CRS.
+    """
+    with rasterio.open(source_path) as src:
+        nodata = src.nodata
+        src_res = float(abs(src.transform.a)) or float(PRISMA_OUTPUT_RESOLUTION)
+        src_crs = src.crs
+        src_bounds = src.bounds
+    crs_wkt = grid["crs"].to_wkt() if hasattr(grid["crs"], "to_wkt") else str(grid["crs"])
+    cmd = [
+        resolve_gdalwarp_exe(),
+        "-t_srs", crs_wkt,
+        "-r", "near" if categorical else _gdal_warp_resampling(),
+        "-of", "GTiff", "-co", "BIGTIFF=YES", "-co", "TILED=YES",
+        "-multi", "-wo", "NUM_THREADS=ALL_CPUS",
+    ]
+    if nodata is not None:
+        cmd.extend(["-srcnodata", str(nodata), "-dstnodata", str(nodata)])
+    transform = grid.get("transform")
+    if transform is not None:
+        resx = float(resolution or abs(transform.a))
+        resy = float(resolution or abs(transform.e))
+        ox, oy = float(transform.c), float(transform.f)
+        bminx, bminy, bmaxx, bmaxy = warp.transform_bounds(src_crs, grid["crs"], *src_bounds, densify_pts=21)
+        minx = ox + np.floor((bminx - ox) / resx) * resx
+        maxx = ox + np.ceil((bmaxx - ox) / resx) * resx
+        miny = oy + np.floor((bminy - oy) / resy) * resy
+        maxy = oy + np.ceil((bmaxy - oy) / resy) * resy
+        cmd.extend(["-te", *(repr(float(v)) for v in (minx, miny, maxx, maxy))])
+        cmd.extend(["-tr", repr(resx), repr(resy)])
+    else:
+        res = float(resolution or src_res)
+        cmd.extend(["-tr", str(res), str(res), "-tap"])
+    for co in _gtiff_compression_options(_raster_dtype_or_none(source_path), for_cli=True):
+        cmd.extend(["-co", co])
+    tmp_output = _make_gdal_temp_path(output_path, ".grid.tif")
+    cmd.extend([source_path, tmp_output])
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        _validate_warp_output(tmp_output)
+        os.replace(tmp_output, output_path)
+        # A sidecar left from the old grid would override the new georeferencing.
+        stale_aux = f"{output_path}.aux.xml"
+        if os.path.exists(f"{tmp_output}.aux.xml"):
+            os.replace(f"{tmp_output}.aux.xml", stale_aux)
+        elif os.path.exists(stale_aux):
+            os.remove(stale_aux)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(_fmt_issue("FINAL_GRID", f"gdalwarp to final grid failed: {exc.stderr}")) from exc
+    finally:
+        _cleanup_raster_temp_outputs(tmp_output)
+
+
+def _regrid_ancillary_outputs(ancillary_outputs: Dict[str, Any], grid: Dict[str, Any], sensor: str) -> List[str]:
+    """Move PAN, quality and EnMAP auxiliary rasters onto the final grid in place.
+
+    PAN keeps its 5 m pixels; every other auxiliary is categorical and uses
+    nearest.  Returns the regridded paths.
+    """
+    done: List[str] = []
+    items: List[Tuple[str, str]] = []
+    for key, value in (ancillary_outputs or {}).items():
+        if isinstance(value, dict):
+            items.extend((str(k), str(v)) for k, v in value.items() if v)
+        elif value:
+            items.append((str(key), str(value)))
+    for key, path in items:
+        if not str(path).lower().endswith((".tif", ".tiff")) or not os.path.exists(path):
+            continue
+        is_pan_image = key == "pan"
+        resolution = None
+        if key in {"pan", "quality_pan"}:
+            with rasterio.open(path) as src:
+                resolution = float(abs(src.transform.a))
+        _warp_to_final_grid(path, path, grid, categorical=not is_pan_image, resolution=resolution)
+        hdr_path = str(Path(path).with_suffix(".hdr"))
+        if os.path.exists(hdr_path):
+            _finalize_pipeline_sidecars(
+                tif_path=path,
+                sensor_type=sensor,
+                artifact_role=ARTIFACT_ROLE_QUALITY_MASK,
+                wl=None,
+                fwhm=None,
+                band_names=None,
+                band_detectors=None,
+                strict_metadata=False,
+            )
+        done.append(path)
+    return done
+
+
+TRANSFORM_MODEL_CHOICES = ("auto", "affine", "polynomial2", "tps")
+
+
+def _normalize_transform_model(value: Any) -> str:
+    model = str(value or "auto").strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    aliases = {
+        "auto": "auto", "cv": "auto",
+        "affine": "affine", "polynomial1": "affine", "order1": "affine",
+        "polynomial2": "polynomial2", "polynomial": "polynomial2", "order2": "polynomial2", "poly2": "polynomial2",
+        "tps": "tps", "thinplatespline": "tps",
+    }
+    if model not in aliases:
+        raise ValueError(
+            f"Invalid transform_model '{value}'. Expected one of: {', '.join(TRANSFORM_MODEL_CHOICES)}."
+        )
+    return aliases[model]
+
+
+def _apply_forced_transform_model(decision: Dict[str, Any], model: Any, candidate_idx: int) -> Dict[str, Any]:
+    """Override the automatic transform choice when the user fixed the model.
+
+    The automatic decision is kept under ``auto_decision`` for the reports.  If
+    the forced model then fails (too few GCPs, warp error) the usual TPS and
+    AROSICS fallbacks still run.
+    """
+    forced = _normalize_transform_model(model)
+    if forced == "auto":
+        return decision
+    out = {k: v for k, v in decision.items()}
+    out["auto_decision"] = {k: v for k, v in decision.items()}
+    out["forced_transform_model"] = forced
+    out["use_tps"] = forced == "tps"
+    if forced != "tps":
+        out["order_used"] = 1 if forced == "affine" else 2
+    out["reason"] = f"transform_model={forced} (user setting)"
+    logger.info(
+        "Candidate %d [joint]: transform model forced to %s (automatic choice was %s).",
+        candidate_idx + 1,
+        forced,
+        "tps" if decision.get("use_tps") else f"order {decision.get('order_used')}",
+    )
+    return out
+
+
+def _gcp_warp_footprint_cutline(
+    gcp_vrt: str,
+    transformer_options: List[str],
+    crs_wkt: str,
+    nodata: Optional[float],
+    x_res: float,
+    y_res: float,
+    target_extent: Optional[Sequence[float]],
+    output_raster: str,
+    margin_px: float = 2.0,
+) -> Optional[Dict[str, Any]]:
+    """Forward-transform the valid source outline through a GCP model.
+
+    gdalwarp fills each output pixel by inverting the GCP transform.  Far
+    outside the tie-point hull an order-2 polynomial or TPS folds back into the
+    source and copies scene fragments across the target extent.  Returning the
+    forward image of the real footprint (as a cutline and a tight, grid-snapped
+    extent) keeps the warp to where the model is meaningful.
+
+    Returns {"cutline": path, "extent": (minx, miny, maxx, maxy)} or None.
+    """
+    from osgeo import gdal, ogr, osr
+    from rasterio import features
+    from shapely.geometry import mapping
+
+    with rasterio.open(gcp_vrt) as src:
+        rows, cols = int(src.height), int(src.width)
+        step = max(1, int(np.ceil(max(rows, cols) / 1024.0)))
+        out_shape = (int(np.ceil(rows / step)), int(np.ceil(cols / step)))
+        band = src.read(1, out_shape=out_shape, resampling=Resampling.nearest)
+    valid = np.isfinite(band)
+    if nodata is not None:
+        valid &= band != nodata
+    if not np.any(valid):
+        return None
+
+    # Pixel/line coordinates of the decimated grid in full-resolution units.
+    scale = Affine.scale(cols / out_shape[1], rows / out_shape[0])
+    polys = [
+        shape(geom)
+        for geom, val in features.shapes(valid.astype(np.uint8), mask=valid, transform=scale)
+        if val == 1
+    ]
+    outline = Polygon(max(polys, key=lambda p: p.area).exterior)
+    outline = outline.simplify(step, preserve_topology=True)
+    outline = outline.segmentize(max(8.0, 8.0 * step))
+    pts = [(float(x), float(y)) for x, y in outline.exterior.coords]
+
+    ds = gdal.Open(gcp_vrt)
+    tr = gdal.Transformer(ds, None, list(transformer_options))
+    mapped, ok = tr.TransformPoints(0, pts)
+    ds = None
+    mapped = [(p[0], p[1]) for p, good in zip(mapped, ok) if good]
+    if len(mapped) < 4:
+        return None
+    footprint = Polygon(mapped).buffer(0)
+    if footprint.is_empty or footprint.area <= 0:
+        return None
+    footprint = footprint.buffer(float(margin_px) * max(abs(x_res), abs(y_res)))
+
+    minx, miny, maxx, maxy = footprint.bounds
+    xr, yr = abs(float(x_res)), abs(float(y_res))
+    if target_extent is not None and len(target_extent) == 4:
+        tminx, tminy, tmaxx, tmaxy = [float(v) for v in target_extent]
+        minx, miny = max(minx, tminx), max(miny, tminy)
+        maxx, maxy = min(maxx, tmaxx), min(maxy, tmaxy)
+        if minx >= maxx or miny >= maxy:
+            return None
+        ox, oy = tminx, tmaxy
+    else:
+        ox, oy = 0.0, 0.0
+    # Snap outward to the target grid so pixels stay aligned with it.
+    minx = ox + np.floor((minx - ox) / xr) * xr
+    maxx = ox + np.ceil((maxx - ox) / xr) * xr
+    maxy = oy - np.floor((oy - maxy) / yr) * yr
+    miny = oy - np.ceil((oy - miny) / yr) * yr
+
+    cutline_path = _make_gdal_temp_path(output_raster, ".cutline.gpkg")
+    drv = ogr.GetDriverByName("GPKG")
+    vds = drv.CreateDataSource(cutline_path)
+    srs = osr.SpatialReference()
+    srs.SetFromUserInput(crs_wkt)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    layer = vds.CreateLayer("footprint", srs, ogr.wkbMultiPolygon)
+    feat = ogr.Feature(layer.GetLayerDefn())
+    feat.SetGeometry(ogr.CreateGeometryFromJson(json.dumps(mapping(footprint))))
+    layer.CreateFeature(feat)
+    feat = None
+    vds = None
+    return {"cutline": cutline_path, "extent": (minx, miny, maxx, maxy)}
+
+
+def _footprint_warp_args(
+    gcp_vrt: str,
+    transformer_options: List[str],
+    crs_wkt: str,
+    nodata: Optional[float],
+    x_res: float,
+    y_res: float,
+    target_extent: Optional[Sequence[float]],
+    output_raster: str,
+) -> Tuple[List[str], Optional[str]]:
+    """Return gdalwarp extent/cutline args for a GCP warp and the cutline path.
+
+    Falls back to the caller's target extent when the footprint cannot be
+    derived, so a failure here never blocks the warp itself.  Without a target
+    extent gdalwarp sizes the output from the forward transform already, so
+    nothing is added.
+    """
+    if target_extent is None or len(target_extent) != 4:
+        return [], None
+    try:
+        fp = _gcp_warp_footprint_cutline(
+            gcp_vrt, transformer_options, crs_wkt, nodata, x_res, y_res, target_extent, output_raster
+        )
+    except Exception as exc:
+        logger.warning("Could not derive warp footprint; using the full target extent: %s", exc)
+        fp = None
+    if fp is None:
+        minx, miny, maxx, maxy = [float(v) for v in target_extent]
+        return ["-te", str(minx), str(miny), str(maxx), str(maxy)], None
+    minx, miny, maxx, maxy = fp["extent"]
+    logger.debug(
+        "GCP warp limited to source footprint: extent %.1f,%.1f,%.1f,%.1f (cutline %s).",
+        minx, miny, maxx, maxy, fp["cutline"],
+    )
+    args = ["-cutline", fp["cutline"], "-te", str(minx), str(miny), str(maxx), str(maxy)]
+    return args, fp["cutline"]
+
+
 def _apply_polynomial_warp(
     input_raster,
     output_raster,
@@ -5602,6 +6021,7 @@ def _apply_polynomial_warp(
 
     temp_vrt = None
     tmp_output = None
+    cutline_path = None
     try:
         from osgeo import gdal
         gdal.UseExceptions()
@@ -5623,7 +6043,8 @@ def _apply_polynomial_warp(
 
         gdalwarp_exe = resolve_gdalwarp_exe()
         resampling_alg = str(resampling or "cubic").strip().lower()
-        if resampling_alg not in {"near", "bilinear", "cubic", "cubicspline", "lanczos"}:
+        resampling_alg = {"nearest": "near"}.get(resampling_alg, resampling_alg)
+        if resampling_alg not in {"near", "bilinear", "cubic", "cubicspline", "lanczos", "average"}:
             resampling_alg = "cubic"
         threads_token = _normalize_gdalwarp_num_threads(gdalwarp_num_threads)
 
@@ -5642,9 +6063,17 @@ def _apply_polynomial_warp(
             cmd.append("-multi")
         if threads_token:
             cmd.extend(["-wo", f"NUM_THREADS={threads_token}"])
-        if s2_bounds is not None:
-            minx, miny, maxx, maxy = s2_bounds
-            cmd.extend(["-te", str(minx), str(miny), str(maxx), str(maxy)])
+        extent_args, cutline_path = _footprint_warp_args(
+            temp_vrt,
+            ["METHOD=GCP_POLYNOMIAL", f"MAX_GCP_ORDER={order}"],
+            crs_wkt,
+            nodata,
+            float(output_resolution),
+            float(output_resolution),
+            s2_bounds,
+            output_raster,
+        )
+        cmd.extend(extent_args)
         cmd.extend([temp_vrt, tmp_output])
 
         subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -5661,11 +6090,12 @@ def _apply_polynomial_warp(
     except Exception as e:
         result['error_message'] = f"Polynomial warp failed: {e}"
     finally:
-        if temp_vrt and os.path.exists(temp_vrt):
-            try:
-                os.remove(temp_vrt)
-            except Exception:
-                pass
+        for temp_path in (temp_vrt, cutline_path):
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
         _cleanup_raster_temp_outputs(tmp_output)
     return result
 
@@ -6027,7 +6457,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
             "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
             "max_shift": float(max(5.0, max_shift)),
             "ws": tuple(ws),
-            "resamp_alg_deshift": "cubic",
+            "resamp_alg_deshift": _warp_resampling(),
             "nodata": (float(reference_nodata), float(source_nodata)),
             "progress": False,
             "ignore_errors": True,
@@ -6073,7 +6503,7 @@ def _collect_pan_tiepoints_with_synthetic_reference(
         "r_b4match": 1,
         "s_b4match": 1,
         "max_shift": float(max(5.0, max_shift)),
-        "resamp_alg_deshift": "cubic",
+        "resamp_alg_deshift": _warp_resampling(),
         "tieP_filter_level": int(max(0, int(tiep_filter_level))),
         "outFillVal": float(source_nodata),
         "CPUs": int(effective_arosics_cpus),
@@ -6358,6 +6788,7 @@ def _apply_tps_warp_from_gcps(
 
     temp_vrt = None
     tmp_output = None
+    cutline_path = None
     try:
         from osgeo import gdal
 
@@ -6378,6 +6809,16 @@ def _apply_tps_warp_from_gcps(
         ds_in = None
 
         gdalwarp_exe = resolve_gdalwarp_exe()
+        extent_args, cutline_path = _footprint_warp_args(
+            temp_vrt,
+            ["METHOD=GCP_TPS"],
+            crs_wkt,
+            nodata,
+            float(x_res),
+            float(y_res),
+            target_extent,
+            output_raster,
+        )
         cmd = _build_gdalwarp_tps_command(
             gdalwarp_exe=gdalwarp_exe,
             temp_vrt=temp_vrt,
@@ -6388,10 +6829,12 @@ def _apply_tps_warp_from_gcps(
             resampling=resampling,
             nodata=nodata,
             target_aligned_pixels=target_aligned_pixels,
-            target_extent=target_extent,
+            target_extent=None if extent_args else target_extent,
             gdalwarp_multi=bool(gdalwarp_multi),
             gdalwarp_num_threads=_normalize_gdalwarp_num_threads(gdalwarp_num_threads),
         )
+        # Source and destination paths are always the last two arguments.
+        cmd[-2:-2] = extent_args
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_s)
 
         if os.path.exists(tmp_output):
@@ -6411,11 +6854,12 @@ def _apply_tps_warp_from_gcps(
     except Exception as e:
         result["error_message"] = f"TPS warp failed: {e}"
     finally:
-        if temp_vrt and os.path.exists(temp_vrt):
-            try:
-                os.remove(temp_vrt)
-            except Exception:
-                pass
+        for temp_path in (temp_vrt, cutline_path):
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
         _cleanup_raster_temp_outputs(tmp_output)
 
     return result
@@ -6794,6 +7238,62 @@ def _sanitize_raster_nonfinite_inplace(path: str, nodata: float = PROCESSING_NOD
     except Exception as e:
         result["error"] = str(e)
         return result
+
+
+def _count_negative_values(
+    path: str,
+    nodata: float = PROCESSING_NODATA,
+) -> Dict[str, Any]:
+    """Count negative valid samples per band; negatives are never changed.
+
+    Negatives are genuine L2 reflectance over dark targets (water, shadows,
+    absorption bands), so they are kept and only reported.
+
+    Samples that are the fill value blurred by resampling (e.g. -9998.999 in a
+    band that is empty in the source, such as EnMAP water-vapour bands) are
+    snapped back to the exact fill value in-place first.
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "negative_pixels_per_band": [],
+        "negative_band_pixels_total": 0,
+        "bands_with_negatives": 0,
+        "min_value": None,
+        "fill_snapped": 0,
+    }
+    try:
+        with rasterio.open(path, "r+") as dst:
+            fill = dst.nodata if dst.nodata is not None else nodata
+            counts: List[int] = []
+            min_value: Optional[float] = None
+            n_snapped = 0
+            for bidx in range(1, int(dst.count) + 1):
+                n_neg = 0
+                for _, window in dst.block_windows(bidx):
+                    band = dst.read(bidx, window=window)
+                    if fill != 0:
+                        near_fill = np.isfinite(band) & (band != fill) & (np.abs(band - fill) <= 0.5 * abs(fill))
+                        if np.any(near_fill):
+                            n_snapped += int(np.count_nonzero(near_fill))
+                            band[near_fill] = fill
+                            dst.write(band, bidx, window=window)
+                    neg = np.isfinite(band) & (band != fill) & (band < 0)
+                    if not np.any(neg):
+                        continue
+                    n_neg += int(np.count_nonzero(neg))
+                    band_min = float(band[neg].min())
+                    min_value = band_min if min_value is None else min(min_value, band_min)
+                counts.append(n_neg)
+        result["negative_pixels_per_band"] = counts
+        result["negative_band_pixels_total"] = int(sum(counts))
+        result["bands_with_negatives"] = int(sum(1 for c in counts if c))
+        result["min_value"] = min_value
+        result["fill_snapped"] = int(n_snapped)
+        result["ok"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
 
 def _resolve_enmap_band_selection(
@@ -8552,6 +9052,14 @@ def _process_detector_branch_candidate(
     out["temp_local_path"]["JOINT"] = joint_local_out
 
     joint_geo = GeoArray(joint_input)
+    # geoarray parses numeric-looking band tags (e.g. RADIOMETRIC_UNITS=1) into ints and
+    # then fails writing them next to the same global tag kept as text (pandas >= 3 string
+    # dtype), so AROSICS could not save the shifted cube. Keep band tags as text
+    # (except the per-band nodata, which GDAL needs as a number).
+    joint_geo.metadata.band_meta = OrderedDict(
+        (key, values if key == "nodata" else [str(v) for v in values])
+        for key, values in joint_geo.metadata.band_meta.items()
+    )
     joint_nodata = joint_geo.nodata if joint_geo.nodata is not None else PROCESSING_NODATA
 
     # --- Global: one shift for the whole cube; VNIR (10 m B08) first, SWIR (B11) as fallback.
@@ -8602,7 +9110,7 @@ def _process_detector_branch_candidate(
                             "out_crea_options": _gtiff_compression_options() + ["BIGTIFF=YES", "TILED=YES"],
                             "max_shift": g_cfg["max_shift"],
                             "ws": g_cfg["ws"],
-                            "resamp_alg_deshift": "cubic",
+                            "resamp_alg_deshift": _warp_resampling(),
                             "nodata": (0, joint_nodata),
                             "progress": True,
                             "ignore_errors": True,
@@ -8932,6 +9440,11 @@ def _process_detector_branch_candidate(
                         grid_cols=spatial_grid_cols,
                         stratification_extent=joint_extent_xy,
                     )
+                polynomial_order_decision = _apply_forced_transform_model(
+                    polynomial_order_decision,
+                    config.get("transform_model", DEFAULT_CONFIG.get("transform_model", "auto")),
+                    candidate_idx,
+                )
                 checkpoint_kind = (
                     "tps"
                     if bool(polynomial_order_decision.get("use_tps", False))
@@ -8984,7 +9497,7 @@ def _process_detector_branch_candidate(
                         polynomial_order=int(polynomial_order_decision.get("order_used", 2)),
                         output_resolution=PRISMA_OUTPUT_RESOLUTION,
                         nodata=PROCESSING_NODATA,
-                        resampling="cubic",
+                        resampling=_gdal_warp_resampling(),
                         s2_bounds=s2_extent,
                         gdalwarp_multi=bool(gdalwarp_multi),
                         gdalwarp_num_threads=gdalwarp_num_threads,
@@ -9025,7 +9538,7 @@ def _process_detector_branch_candidate(
                             target_crs=s2_crs,
                             x_res=float(PRISMA_OUTPUT_RESOLUTION),
                             y_res=float(PRISMA_OUTPUT_RESOLUTION),
-                            resampling="cubic",
+                            resampling=_gdal_warp_resampling(),
                             nodata=PROCESSING_NODATA,
                             target_aligned_pixels=False,
                             target_extent=s2_extent,
@@ -9102,7 +9615,7 @@ def _process_detector_branch_candidate(
                 "r_b4match": ref_bidx_by_detector["VNIR"],
                 "s_b4match": match_bidx_by_detector["VNIR"],
                 "max_shift": float(matcher_profile.get("local_max_shift", 50.0)),
-                "resamp_alg_deshift": "cubic",
+                "resamp_alg_deshift": _warp_resampling(),
                 "align_grids": fallback_align_grids,
                 "tieP_filter_level": int(matcher_profile.get("local_tieP_filter_level", 1)),
                 "outFillVal": joint_nodata,
@@ -12221,6 +12734,9 @@ def _coregister_prisma_ancillary_outputs(
             if pan_arr.ndim != 2:
                 raise RuntimeError(f"PAN array must be 2D; got shape {tuple(pan_arr.shape)}.")
             rows, cols = pan_arr.shape
+            # The reader marks the L2D swath fill as NaN; it stays NoData and is
+            # never hole-filled.
+            pan_fill = ~np.isfinite(pan_arr)
             pan_quality_arr: Optional[np.ndarray] = None
             if pan_quality_data is None:
                 result["status"] = "degraded"
@@ -12255,7 +12771,7 @@ def _coregister_prisma_ancillary_outputs(
                         )
                     )
                 else:
-                    pan_quality_arr = quality_candidate.astype(np.uint8, copy=False)
+                    pan_quality_arr = quality_candidate.astype(np.uint8, copy=True)
                     flag_counts = {
                         str(flag): int(np.count_nonzero(pan_quality_arr == flag))
                         for flag in range(5)
@@ -12282,6 +12798,9 @@ def _coregister_prisma_ancillary_outputs(
                             f"{unexpected_values}; expected 0, 1, 2, 3, 4, or 255."
                         )
                     del unexpected_mask
+                    # Swath fill becomes categorical NoData as well, so the final
+                    # categorical restore writes numeric NoData there.
+                    pan_quality_arr[pan_fill] = 255
                     flag_counts["255"] = source_nodata_count
                     flag4_count = int(flag_counts["4"])
                     result["pan_quality_evidence"] = {
@@ -12330,8 +12849,9 @@ def _coregister_prisma_ancillary_outputs(
                     max_search_distance=100.0,
                     smoothing_iterations=0,
                 ).astype(np.float32, copy=False)
+                pan_for_warp[pan_fill] = np.nan
                 unfilled_source_pixels = int(
-                    np.count_nonzero(invalid_source_mask & ~np.isfinite(pan_for_warp))
+                    np.count_nonzero(invalid_source_mask & ~pan_fill & ~np.isfinite(pan_for_warp))
                 )
                 result["pan_quality_evidence"].update(
                     {
@@ -12587,7 +13107,7 @@ def _coregister_prisma_ancillary_outputs(
                 polynomial_order=pan_order,
                 output_resolution=pan_res,
                 nodata=PROCESSING_NODATA,
-                resampling="cubic",
+                resampling=_gdal_warp_resampling(),
                 gdalwarp_multi=bool(gdalwarp_multi),
                 gdalwarp_num_threads=gdal_threads,
             )
@@ -12605,7 +13125,7 @@ def _coregister_prisma_ancillary_outputs(
                     polynomial_order=1,
                     output_resolution=pan_res,
                     nodata=PROCESSING_NODATA,
-                    resampling="cubic",
+                    resampling=_gdal_warp_resampling(),
                     gdalwarp_multi=bool(gdalwarp_multi),
                     gdalwarp_num_threads=gdal_threads,
                 )
@@ -12845,7 +13365,7 @@ def _coregister_prisma_ancillary_outputs(
                 result["warnings"].append(
                     _fmt_issue(
                         "ANCILLARY",
-                        "PAN cubic-resampling overshoots were preserved and observed in checked "
+                        f"PAN {_warp_resampling()}-resampling overshoots were preserved and observed in checked "
                         "blocks "
                         f"(sampled_below_band_pixels="
                         f"{int(pan_range_validation.get('sampled_below_range_band_pixels', 0))}, "
@@ -14379,6 +14899,9 @@ def _write_pam_aux_xml(
                 pam_band = ET.SubElement(pam_dataset, "PAMRasterBand", {"band": str(bidx)})
                 desc = ET.SubElement(pam_band, "Description")
                 desc.text = band_label
+                if nodata is not None:
+                    # Keeps NoData declared for readers that consult the PAM sidecar.
+                    ET.SubElement(pam_band, "NoDataValue").text = f"{float(nodata):.10g}"
                 band_meta = ET.SubElement(pam_band, "Metadata")
                 _append_pam_mdi(band_meta, "SENSOR", str(sensor_type))
                 _append_pam_mdi(band_meta, "DETECTOR", detector)
@@ -15967,6 +16490,32 @@ def _finalize_coreg_output(
         band_stats = list(rewrite_result.get("band_statistics", []))
         output_validation = dict(rewrite_result.get("output_validation", {}))
         raster_passes = int(rewrite_result.get("raster_passes", 0))
+        negative_result = _count_negative_values(output_path, PROCESSING_NODATA)
+        raster_passes += 1
+        if not negative_result.get("ok", False):
+            raise RuntimeError(
+                _fmt_issue(
+                    "FINALIZE",
+                    f"Negative value check failed: {negative_result.get('error', 'unknown error')}",
+                )
+            )
+        if int(negative_result["negative_band_pixels_total"]) > 0:
+            logger.info(
+                "Negative values (kept): %d band-pixels in %d/%d bands (min %.6g).",
+                int(negative_result["negative_band_pixels_total"]),
+                int(negative_result["bands_with_negatives"]),
+                len(negative_result["negative_pixels_per_band"]),
+                float(negative_result["min_value"]),
+            )
+        if int(negative_result["fill_snapped"]) > 0:
+            logger.info(
+                "Reset %d band-pixels holding a resampled NoData fill (e.g. empty source bands) to NoData.",
+                int(negative_result["fill_snapped"]),
+            )
+        if int(negative_result["fill_snapped"]) > 0:
+            # Statistics gathered during the copy no longer match the pixels.
+            band_stats = []
+            output_validation = {}
         if str(hyp_type).upper() == "PRISMA" and radiometric_contract:
             range_validation = _assess_prisma_radiometric_range(
                 output_path,
@@ -15990,7 +16539,7 @@ def _finalize_coreg_output(
                 logger.warning(
                     _fmt_issue(
                         "RADIOMETRY",
-                        "Preserved cubic-resampling overshoots were observed outside the source "
+                        f"Preserved {_warp_resampling()}-resampling overshoots were observed outside the source "
                         "detector range in checked blocks "
                         f"(sampled_below_band_pixels="
                         f"{int(range_validation.get('sampled_below_range_band_pixels', 0))}, "
@@ -16154,6 +16703,7 @@ def _finalize_coreg_output(
             "normalization_params": normalization_cfg,
             "band_statistics": band_stats,
             "output_validation": output_validation,
+            "negative_values": negative_result,
             "raster_passes": int(raster_passes),
             "timings": {
                 "prepare_source_s": t_prepare,
@@ -16536,11 +17086,26 @@ def run_coregistration(
         config = _SessionForwardingConfig(config, parent=caller_config)
     for warning_msg in cpu_guard_warnings:
         logger.warning(warning_msg)
-    global _ACTIVE_AROSICS_RESAMP_CALC
+    global _ACTIVE_AROSICS_RESAMP_CALC, _ACTIVE_WARP_RESAMPLING
     _ACTIVE_AROSICS_RESAMP_CALC = (
         str(config.get("arosics_resamp_alg_calc", DEFAULT_CONFIG.get("arosics_resamp_alg_calc")) or "")
         or None
     )
+    _ACTIVE_WARP_RESAMPLING = _normalize_warp_resampling(
+        config.get("warp_resampling", DEFAULT_CONFIG.get("warp_resampling", "bilinear"))
+    )
+    # Fail before any download when an option value is invalid.
+    _normalize_transform_model(config.get("transform_model", DEFAULT_CONFIG.get("transform_model", "auto")))
+    _output_crs_setting = str(config.get("output_crs") or "auto").strip()
+    if _output_crs_setting.lower() != "auto":
+        try:
+            CRS.from_user_input(_output_crs_setting)
+        except Exception as exc:
+            raise ValueError(f"Invalid output_crs '{_output_crs_setting}': {exc}") from exc
+    _master_grid_setting = str(config.get("master_grid") or "").strip()
+    if _master_grid_setting:
+        _resolve_master_grid(_master_grid_setting)
+    logger.info("Warp resampling: %s", _ACTIVE_WARP_RESAMPLING)
 
     # Extract config parameters with defaults
     days_window = config.get('days_window', 30)
@@ -16972,7 +17537,7 @@ def run_coregistration(
             prisma_radiometric_mode,
             normalization_mode=normalization_mode,
             normalization_clip=bool(normalization_params.clip),
-            spatial_resampling_kernel="cubic;bilinear_if_detector_grid_harmonization",
+            spatial_resampling_kernel=f"{_warp_resampling()};bilinear_if_detector_grid_harmonization",
             require_pan=bool(save_pan),
         )
         prisma_source_radiometric_contract = build_prisma_radiometric_contract(
@@ -16987,7 +17552,7 @@ def run_coregistration(
                 extended_meta,
                 prisma_radiometric_mode,
                 normalization_mode="none",
-                spatial_resampling_kernel="cubic",
+                spatial_resampling_kernel=_warp_resampling(),
                 require_pan=True,
             )
 
@@ -17513,6 +18078,10 @@ def run_coregistration(
     displacement_vectors_written_path: Optional[str] = None
     enmap_source_cache_by_crs: Dict[str, Dict[str, Any]] = {}
     s2_cache_events: List[Dict[str, Any]] = []
+    negative_values_result: Dict[str, Any] = {}
+    final_grid: Optional[Dict[str, Any]] = None
+    final_grid_source_path: Optional[str] = None
+    final_grid_info: Dict[str, Any] = {}
     final_output_validation: Dict[str, Any] = {
         "ok": False,
         "valid_pixels": 0,
@@ -17679,9 +18248,26 @@ def run_coregistration(
                     'transform': hs_transform, 'tiled': True, 'BIGTIFF': 'YES', 'nodata': PROCESSING_NODATA
                 }
 
-                with rasterio.open(temp_hs_path, 'w', **profile) as dst:
+                rotated_grid = abs(hs_transform.b) > 1e-9 or abs(hs_transform.d) > 1e-9
+                write_path = (
+                    _make_gdal_temp_path(temp_hs_path, ".rotated.tif") if rotated_grid else temp_hs_path
+                )
+                with rasterio.open(write_path, 'w', **profile) as dst:
                     cube_bip = np.transpose(cube, (2, 0, 1)).astype(PROCESSING_DTYPE)
+                    # The reader marks L2D swath fill as NaN; tag it as NoData.
+                    cube_bip[~np.isfinite(cube_bip)] = PROCESSING_NODATA
                     dst.write(cube_bip, indexes=list(range(1, cube.shape[2] + 1)))
+                    del cube_bip
+                if rotated_grid:
+                    # AROSICS would de-rotate this grid itself with cubic and no
+                    # NoData handling, blending -9999 into the swath edge.
+                    _warp_rotated_grid_north_up(
+                        write_path,
+                        temp_hs_path,
+                        nodata=PROCESSING_NODATA,
+                        resolution=PRISMA_OUTPUT_RESOLUTION,
+                    )
+                with rasterio.open(temp_hs_path, 'r+') as dst:
                     _apply_prisma_radiometric_tags(
                         dst,
                         prisma_source_radiometric_contract,
@@ -18157,39 +18743,54 @@ def run_coregistration(
                 substage="Writing final raster and metadata",
                 interval_s=progress_heartbeat_interval_s,
             ):
+                finalize_kwargs = dict(
+                    hyp_type=hyp_type,
+                    wl=wl,
+                    fwhm=fwhm,
+                    band_names=band_names,
+                    band_detectors=band_detectors,
+                    source_bands_1based=(
+                        best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
+                    ),
+                    remove_source=True,
+                    normalization_params=normalization_params,
+                    build_overviews=bool(build_overviews),
+                    remove_detector_overlap=remove_detector_overlap_bands,
+                    strict_metadata=bool(strict_metadata),
+                    metadata_extension_level=metadata_extension_level,
+                    metadata_stats_mode=metadata_stats_mode,
+                    metadata_stats_sample_windows=metadata_stats_sample_windows,
+                    metadata_stats_seed=metadata_stats_seed,
+                    metadata_histogram_buckets=metadata_histogram_buckets,
+                    metadata_label_precision=metadata_label_precision,
+                    timing_logs=timing_logs,
+                    radiometric_contract=prisma_radiometric_contract,
+                    radiometric_validation_max_windows=validation_max_windows,
+                )
                 try:
-                    finalize_result = _finalize_coreg_output(
-                        final_source_path,
-                        coreg_out,
-                        hyp_type,
-                        wl,
-                        fwhm,
-                        band_names,
-                        band_detectors,
-                        source_bands_1based=(
-                            best_candidate.get("source_bands_1based") if isinstance(best_candidate, dict) else None
-                        ),
-                        remove_source=True,
-                        normalization_params=normalization_params,
-                        build_overviews=bool(build_overviews),
-                        remove_detector_overlap=remove_detector_overlap_bands,
-                        strict_metadata=bool(strict_metadata),
-                        metadata_extension_level=metadata_extension_level,
-                        metadata_stats_mode=metadata_stats_mode,
-                        metadata_stats_sample_windows=metadata_stats_sample_windows,
-                        metadata_stats_seed=metadata_stats_seed,
-                        metadata_histogram_buckets=metadata_histogram_buckets,
-                        metadata_label_precision=metadata_label_precision,
-                        timing_logs=timing_logs,
-                        radiometric_contract=prisma_radiometric_contract,
-                        radiometric_validation_max_windows=validation_max_windows,
-                    )
+                    final_grid = _resolve_final_grid(config, s2_crs)
+                    if final_grid is not None:
+                        # Matching, PAN alignment and quicklooks keep the
+                        # matching grid; the product is rebuilt on the final
+                        # grid from this copy once they are done.
+                        logger.info("Final output grid: %s (CRS %s).", final_grid["source"], final_grid["crs"])
+                        final_grid_source_path = _make_gdal_temp_path(final_source_path, ".final_grid.tif")
+                        _warp_to_final_grid(final_source_path, final_grid_source_path, final_grid)
+                        if hyp_type == "PRISMA":
+                            with rasterio.open(final_grid_source_path, "r+") as grid_dst:
+                                _apply_prisma_radiometric_tags(
+                                    grid_dst,
+                                    prisma_source_radiometric_contract,
+                                    band_detectors,
+                                )
+                    finalize_result = _finalize_coreg_output(final_source_path, coreg_out, **finalize_kwargs)
                 except Exception as exc:
                     _raise_scene_failure(str(exc))
             finalize_elapsed_s = perf_counter() - t0_finalize
             post_accept_stage_timings["finalize_write_metadata_s"] = float(finalize_elapsed_s)
             timed_stages["finalize"] = float(finalize_elapsed_s)
             if isinstance(finalize_result, dict):
+                negative_values_result = dict(finalize_result.get("negative_values") or {})
                 metadata_status = finalize_result.get("metadata_status", metadata_status)
                 metadata_warnings = list(finalize_result.get("metadata_warnings", []))
                 metadata_schema_version = _safe_parse_int(
@@ -18457,6 +19058,43 @@ def run_coregistration(
                 for anc_warning in ancillary_result.get("warnings", []):
                     logger.warning(anc_warning)
             post_accept_stage_timings["ancillary_generation_s"] = float(perf_counter() - t0_ancillary)
+
+            if final_grid is not None:
+                t0_final_grid = perf_counter()
+                with _ProgressHeartbeat(
+                    progress_callback,
+                    "Finalizing output",
+                    scene_idx=scene_idx,
+                    scene_total=scene_total,
+                    substage="Writing output on the final grid",
+                    interval_s=progress_heartbeat_interval_s,
+                ):
+                    grid_result = _finalize_coreg_output(final_grid_source_path, coreg_out, **finalize_kwargs)
+                    regridded = _regrid_ancillary_outputs(
+                        ancillary_result.get("outputs", {}), final_grid, str(hyp_type).upper()
+                    )
+                negative_values_result = dict(grid_result.get("negative_values") or negative_values_result)
+                metadata_status = grid_result.get("metadata_status", metadata_status)
+                metadata_warnings = list(grid_result.get("metadata_warnings", metadata_warnings))
+                if grid_result.get("output_validation"):
+                    final_output_validation = dict(grid_result["output_validation"])
+                with rasterio.open(coreg_out) as grid_check:
+                    final_grid_info = {
+                        "source": final_grid["source"],
+                        "crs": str(grid_check.crs),
+                        "width": int(grid_check.width),
+                        "height": int(grid_check.height),
+                        "transform": list(grid_check.transform)[:6],
+                        "ancillaries_regridded": regridded,
+                    }
+                logger.info(
+                    "Output written on final grid %s: %dx%d px; %d auxiliary raster(s) regridded.",
+                    final_grid_info["crs"],
+                    final_grid_info["width"],
+                    final_grid_info["height"],
+                    len(regridded),
+                )
+                post_accept_stage_timings["final_grid_s"] = float(perf_counter() - t0_final_grid)
         except SceneProcessingError:
             _remove_partial_coreg_output(coreg_out)
             raise
@@ -18613,6 +19251,11 @@ def run_coregistration(
         'output_valid_fraction': final_output_validation.get("valid_fraction"),
         'output_validation_windows_scanned': final_output_validation.get("windows_scanned"),
         'output_validation_truncated': bool(final_output_validation.get("truncated", False)),
+        'final_grid': final_grid_info,
+        'negative_band_pixels_total': negative_values_result.get("negative_band_pixels_total"),
+        'negative_bands_count': negative_values_result.get("bands_with_negatives"),
+        'negative_min_value': negative_values_result.get("min_value"),
+        'negative_pixels_per_band': negative_values_result.get("negative_pixels_per_band"),
         'pre_coreg_output': pre_coreg_output_path,
         'quicklook_status': quicklook_status,
         'quicklook_outputs': dict(quicklook_outputs),
@@ -18913,21 +19556,7 @@ def run_batch_coregistration(
         logger.warning(warning_msg)
 
     # Find all hyperspectral files (recursive)
-    all_files = []
-    for pattern in [
-        "*.he5",
-        "*.HE5",
-        "*-SPECTRAL_IMAGE.tif",
-        "*-SPECTRAL_IMAGE.TIF",
-        "*-SPECTRAL_IMAGE.tiff",
-        "*-SPECTRAL_IMAGE.TIFF",
-        "*-SPECTRAL_IMAGE.bsq",
-        "*-SPECTRAL_IMAGE.BSQ",
-    ]:
-        all_files.extend(glob.glob(os.path.join(input_dir, "**", pattern), recursive=True))
-
-    # Normalize and deduplicate
-    all_files = list(dict.fromkeys(os.path.normcase(os.path.normpath(f)) for f in all_files))
+    all_files = find_hyperspectral_inputs(input_dir)
 
     if not all_files:
         logger.error("No valid hyperspectral files found.")
@@ -18938,6 +19567,7 @@ def run_batch_coregistration(
         }
 
     logger.info(f"Found {len(all_files)} files")
+    log_scene_table(all_files)
     _emit_progress(progress_callback, "Starting batch processing", scene_idx=1, scene_total=len(all_files))
 
     results = {
